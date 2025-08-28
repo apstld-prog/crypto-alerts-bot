@@ -1,4 +1,4 @@
-python-telegram-bot==20.3
+python-telegram-bot==22.3
 requests==2.31.0
 Flask==3.0.0
 waitress==3.0.0
