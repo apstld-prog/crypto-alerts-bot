@@ -1,3 +1,9 @@
+import os, logging, requests
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN or ":" not in BOT_TOKEN:
+    raise RuntimeError("Missing or invalid BOT_TOKEN env var")
+
 #!/usr/bin/env python3
 import logging, asyncio, os, sqlite3
 from datetime import datetime, timedelta
