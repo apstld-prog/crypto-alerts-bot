@@ -6,8 +6,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==== CONFIG ====
-BOT_TOKEN = os.getenv("8290365345:AAE1bjU7nJtvWzc4uyovji5zNm8Tjz_WJ0g
-")
+BOT_TOKEN = os.getenv("8290365345:AAE1bjU7nJtvWzc4uyovji5zNm8Tjz_WJ0g")
 COINGECKO_API = "https://api.coingecko.com/api/v3/simple/price"
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
 PAYPAL_SUBSCRIBE_PAGE = os.getenv("PAYPAL_SUBSCRIBE_PAGE", "https://crypto-alerts-bot-k8i7.onrender.com/subscribe.html")
