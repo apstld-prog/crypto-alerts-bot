@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Subscribe - Crypto Alerts Premium</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- LIVE PayPal SDK with your Client ID -->
+    <script src="https://www.paypal.com/sdk/js?client-id=ATnYBfQz1Yx63YFWJ5R3lrpG-pErhpEmkHU-hkFMlE9xnIhhbbz1U_egGBK7ace5B_lpPETV7uMe20fB&vault=true&intent=subscription&currency=EUR"></script>
+    <style>
+      body { font-family: system-ui, Arial; max-width: 520px; margin: 30px auto; padding: 0 16px; }
+      .box { border: 1px solid #ddd; border-radius: 12px; padding: 18px; }
+      .note { color: #555; font-size: 14px; }
+    </style>
+  </head>
+  <body>
+    <h2>Crypto Alerts Premium — €7/month</h2>
+    <div class="box">
+      <p>Multiple alerts, 3 daily setups, weekly recap.</p>
+      <div id="paypal-button-container"></div>
+      <p class="note">
+        After approval, your Premium activates automatically within 1–2 minutes.  
+        Back in Telegram, use <code>/premium</code> to check status.
+      </p>
+    </div>
+
+    <script>
+      // Read Telegram user id from query string ?uid=123
+      const params = new URLSearchParams(location.search);
+      const tg_uid = params.get("uid") || "0";
+
+      paypal.Buttons({
+        style: {
+          shape: 'rect',
+          color: 'gold',
+          layout: 'vertical',
+          label: 'subscribe'
+        },
+        createSubscription: function(data, actions) {
+          return actions.subscription.create({
+            plan_id: 'P-3WF931792H799382YNCYB2OQ', // your EUR Plan ID
+            custom_id: tg_uid                     // pass Telegram user id to webhook
+          });
+        },
+        onApprove: function(data, actions) {
+          alert("✅ Subscription approved! You will get Premium shortly.");
+        }
+      }).render('#paypal-button-container');
+    </script>
+  </body>
+</html>
