@@ -42,7 +42,7 @@ SYMBOL_TO_ID = {
     "usdt": "tether", "usdc": "usd-coin", "dai": "dai",
 }
 
-# Normalize (Greek → Latin lookalikes)
+# Normalize (Greek → Latin lookalikes + strip)
 GREEK_TO_LATIN = str.maketrans({
     "Α":"A","Β":"B","Ε":"E","Ζ":"Z","Η":"H","Ι":"I","Κ":"K","Μ":"M","Ν":"N","Ο":"O","Ρ":"P","Τ":"T","Υ":"Y","Χ":"X",
     "α":"a","β":"b","ε":"e","ζ":"z","η":"h","ι":"i","κ":"k","μ":"m","ν":"n","ο":"o","ρ":"p","τ":"t","υ":"y","χ":"x",
@@ -52,7 +52,7 @@ def normalize_symbol(s: str) -> str:
     s = re.sub(r"[^0-9A-Za-z\-]", "", s)
     return s.lower()
 
-# ========== DB ==========
+# ========== DB (users + leader lock) ==========
 def db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("""CREATE TABLE IF NOT EXISTS users(
@@ -60,7 +60,6 @@ def db():
         premium_active INTEGER DEFAULT 0,
         premium_until TEXT
     )""")
-    # Leader lock table (single row with lock=1)
     conn.execute("""CREATE TABLE IF NOT EXISTS leader(
         lock INTEGER PRIMARY KEY CHECK(lock=1),
         run_id TEXT,
@@ -68,13 +67,11 @@ def db():
     )""")
     conn.commit()
     return conn
-
 CONN = db()
 
 RUN_ID = os.getenv("RENDER_INSTANCE_ID") or f"pid-{os.getpid()}"
 
 def acquire_leader_lock(max_stale=600.0) -> bool:
-    """Try to become the single polling runner. If a stale lock exists (>10m), take it over."""
     now = time.time()
     try:
         CONN.execute("INSERT INTO leader(lock, run_id, ts) VALUES(1, ?, ?)", (RUN_ID, now))
@@ -82,7 +79,6 @@ def acquire_leader_lock(max_stale=600.0) -> bool:
         logging.info("Leader lock acquired by %s", RUN_ID)
         return True
     except sqlite3.IntegrityError:
-        # Row exists -> check staleness
         row = CONN.execute("SELECT run_id, ts FROM leader WHERE lock=1").fetchone()
         if not row:
             return False
@@ -96,7 +92,6 @@ def acquire_leader_lock(max_stale=600.0) -> bool:
         return False
 
 def heartbeat_leader():
-    """Refresh lock timestamp periodically."""
     try:
         CONN.execute("UPDATE leader SET ts=? WHERE lock=1 AND run_id=?", (time.time(), RUN_ID))
         CONN.commit()
@@ -182,6 +177,8 @@ def cryptocompare_price(symbol_or_id: str):
     return None
 
 # ========== RESOLVER ==========
+PRICE_CACHE = {}  # (moved here to be above resolve if needed by linters)
+
 def resolve_price_usd(symbol: str):
     cg_id = SYMBOL_TO_ID.get(symbol.lower(), symbol.lower())
 
@@ -221,24 +218,39 @@ def resolve_price_usd(symbol: str):
 
     return None
 
+# ========== HELP TEXT ==========
+HELP_TEXT = (
+    "👋 *Welcome to Crypto Alerts Bot!*\n\n"
+    "Here’s how to use me:\n"
+    "• `/price BTC` — Get the current price in USD (e.g., `/price ETH`).\n"
+    "• `/diagprice BTC` — Diagnostic: shows which data providers responded and cache info.\n\n"
+    "Tips:\n"
+    "• Symbols are case-insensitive (`btc`, `ETH`, etc.).\n"
+    "• If you see the label `(stale)`, a fresh quote wasn’t available; I showed the last known price (≤5 min old).\n"
+    "• Supported majors include: BTC, ETH, SOL, BNB, XRP, ADA, DOGE, MATIC, TRX, AVAX, DOT, LTC, USDT, USDC, DAI.\n\n"
+    "Premium (optional):\n"
+    "• Tap *Upgrade with PayPal* to support development & unlock upcoming features.\n"
+    "• Roadmap: multi-coin alerts, daily signals, weekly recap.\n"
+)
+
+def help_keyboard(user_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Upgrade with PayPal", url=f"{PAYPAL_SUBSCRIBE_PAGE}?uid={user_id}")],
+    ])
+
 # ========== HANDLERS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    # Ensure user row exists (lightweight)
     try:
         CONN.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
         CONN.commit()
     except Exception:
         pass
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=help_keyboard(uid))
 
-    kb = [[InlineKeyboardButton("Upgrade with PayPal", url=f"{PAYPAL_SUBSCRIBE_PAGE}?uid={uid}")]]
-    await update.message.reply_text(
-        "👋 Welcome to *Crypto Alerts Bot!*\n"
-        "Use `/price BTC` to get prices.\n"
-        "If you see errors, try `/diagprice BTC`.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=help_keyboard(uid))
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -292,15 +304,19 @@ async def diagprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== BOOT ==========
 def run_bot():
     async def _post_init(application):
-        # Always clear webhook to ensure polling mode & drop old updates
         try:
             await application.bot.delete_webhook(drop_pending_updates=True)
         except Exception as e:
             logging.warning("delete_webhook failed %s", e)
 
-    # Try to become the single runner
-    if not acquire_leader_lock():
-        logging.warning("Another instance holds the leader lock. Exiting bot startup to avoid conflicts.")
+    # Single-runner protection
+    def try_leader():
+        if not acquire_leader_lock():
+            logging.warning("Another instance holds the leader lock. Exiting bot startup to avoid conflicts.")
+            return False
+        return True
+
+    if not try_leader():
         return
 
     app = (
@@ -312,18 +328,18 @@ def run_bot():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("diagprice", diagprice))
 
     logging.info("🤖 Bot running… (leader: %s)", RUN_ID)
 
-    # Lightweight heartbeat of the leader lock
+    # Heartbeat leader lock
+    import threading
     def _hb():
         while True:
             heartbeat_leader()
             time.sleep(30)
-
-    import threading
     threading.Thread(target=_hb, daemon=True).start()
 
     app.run_polling(drop_pending_updates=True)
