@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 import logging, os, sqlite3, re, time, random
-from datetime import datetime
 import requests
 from collections import deque
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -13,9 +11,7 @@ if not BOT_TOKEN or ":" not in BOT_TOKEN:
     raise RuntimeError("Missing or invalid BOT_TOKEN env var")
 
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
-PAYPAL_SUBSCRIBE_PAGE = os.getenv(
-    "PAYPAL_SUBSCRIBE_PAGE", "https://crypto-alerts-bot-k8i7.onrender.com/subscribe.html"
-)
+PAYPAL_SUBSCRIBE_PAGE = os.getenv("PAYPAL_SUBSCRIBE_PAGE", "https://crypto-alerts-bot-k8i7.onrender.com/subscribe.html")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
 logging.basicConfig(level=logging.INFO)
@@ -40,30 +36,16 @@ def _sleep_jitter(base):
 
 # ========== SYMBOL → COINGECKO ID ==========
 SYMBOL_TO_ID = {
-    "btc": "bitcoin",
-    "eth": "ethereum",
-    "sol": "solana",
-    "bnb": "binancecoin",
-    "xrp": "ripple",
-    "ada": "cardano",
-    "doge": "dogecoin",
-    "matic": "polygon",
-    "trx": "tron",
-    "avax": "avalanche-2",
-    "dot": "polkadot",
-    "ltc": "litecoin",
-    "usdt": "tether",
-    "usdc": "usd-coin",
-    "dai": "dai",
+    "btc": "bitcoin", "eth": "ethereum", "sol": "solana", "bnb": "binancecoin",
+    "xrp": "ripple", "ada": "cardano", "doge": "dogecoin", "matic": "polygon",
+    "trx": "tron", "avax": "avalanche-2", "dot": "polkadot", "ltc": "litecoin",
+    "usdt": "tether", "usdc": "usd-coin", "dai": "dai",
 }
-_SYMBOL_CACHE = {}
 
-# Normalize
+# Normalize (Greek → Latin lookalikes)
 GREEK_TO_LATIN = str.maketrans({
-    "Α":"A","Β":"B","Ε":"E","Ζ":"Z","Η":"H","Ι":"I","Κ":"K",
-    "Μ":"M","Ν":"N","Ο":"O","Ρ":"P","Τ":"T","Υ":"Y","Χ":"X",
-    "α":"a","β":"b","ε":"e","ζ":"z","η":"h","ι":"i","κ":"k",
-    "μ":"m","ν":"n","ο":"o","ρ":"p","τ":"t","υ":"y","χ":"x",
+    "Α":"A","Β":"B","Ε":"E","Ζ":"Z","Η":"H","Ι":"I","Κ":"K","Μ":"M","Ν":"N","Ο":"O","Ρ":"P","Τ":"T","Υ":"Y","Χ":"X",
+    "α":"a","β":"b","ε":"e","ζ":"z","η":"h","ι":"i","κ":"k","μ":"m","ν":"n","ο":"o","ρ":"p","τ":"t","υ":"y","χ":"x",
 })
 def normalize_symbol(s: str) -> str:
     s = s.strip().translate(GREEK_TO_LATIN)
@@ -78,17 +60,55 @@ def db():
         premium_active INTEGER DEFAULT 0,
         premium_until TEXT
     )""")
+    # Leader lock table (single row with lock=1)
+    conn.execute("""CREATE TABLE IF NOT EXISTS leader(
+        lock INTEGER PRIMARY KEY CHECK(lock=1),
+        run_id TEXT,
+        ts REAL
+    )""")
     conn.commit()
     return conn
+
 CONN = db()
+
+RUN_ID = os.getenv("RENDER_INSTANCE_ID") or f"pid-{os.getpid()}"
+
+def acquire_leader_lock(max_stale=600.0) -> bool:
+    """Try to become the single polling runner. If a stale lock exists (>10m), take it over."""
+    now = time.time()
+    try:
+        CONN.execute("INSERT INTO leader(lock, run_id, ts) VALUES(1, ?, ?)", (RUN_ID, now))
+        CONN.commit()
+        logging.info("Leader lock acquired by %s", RUN_ID)
+        return True
+    except sqlite3.IntegrityError:
+        # Row exists -> check staleness
+        row = CONN.execute("SELECT run_id, ts FROM leader WHERE lock=1").fetchone()
+        if not row:
+            return False
+        old_run, ts = row
+        if now - float(ts or 0) > max_stale:
+            logging.warning("Leader lock stale (owner=%s, age=%.0fs). Taking over.", old_run, now - float(ts or 0))
+            CONN.execute("UPDATE leader SET run_id=?, ts=?", (RUN_ID, now))
+            CONN.commit()
+            return True
+        logging.info("Leader lock held by %s (age %.0fs). Not starting polling.", old_run, now - float(ts or 0))
+        return False
+
+def heartbeat_leader():
+    """Refresh lock timestamp periodically."""
+    try:
+        CONN.execute("UPDATE leader SET ts=? WHERE lock=1 AND run_id=?", (time.time(), RUN_ID))
+        CONN.commit()
+    except Exception as e:
+        logging.warning("Leader heartbeat failed: %s", e)
 
 # ========== PROVIDERS ==========
 def binance_price_for_symbol(symbol_or_id: str):
     sym = symbol_or_id.upper()
     cg_map = {
-        "bitcoin":"BTC", "ethereum":"ETH", "solana":"SOL", "ripple":"XRP",
-        "cardano":"ADA", "dogecoin":"DOGE", "polygon":"MATIC", "tron":"TRX",
-        "avalanche-2":"AVAX", "polkadot":"DOT", "litecoin":"LTC"
+        "bitcoin":"BTC","ethereum":"ETH","solana":"SOL","ripple":"XRP","cardano":"ADA",
+        "dogecoin":"DOGE","polygon":"MATIC","tron":"TRX","avalanche-2":"AVAX","polkadot":"DOT","litecoin":"LTC"
     }
     if sym not in cg_map.values():
         sym = cg_map.get(symbol_or_id.lower(), sym)
@@ -105,11 +125,7 @@ def binance_price_for_symbol(symbol_or_id: str):
         _throttle()
         host = hosts[attempt % len(hosts)]
         try:
-            r = requests.get(
-                f"{host}/api/v3/ticker/price",
-                params={"symbol": pair},
-                timeout=8
-            )
+            r = requests.get(f"{host}/api/v3/ticker/price", params={"symbol": pair}, timeout=8)
             if r.status_code == 200:
                 data = r.json()
                 if "price" in data:
@@ -123,11 +139,7 @@ def cg_simple_price(ids_csv: str) -> dict:
     for _ in range(RETRY_MAX):
         _throttle()
         try:
-            r = requests.get(
-                COINGECKO_SIMPLE,
-                params={"ids": ids_csv, "vs_currencies": "usd"},
-                timeout=8
-            )
+            r = requests.get(COINGECKO_SIMPLE, params={"ids": ids_csv, "vs_currencies": "usd"}, timeout=8)
             if r.status_code == 200:
                 return r.json() or {}
         except Exception:
@@ -139,10 +151,7 @@ def coincap_price(cg_id: str):
     for _ in range(RETRY_MAX):
         _throttle()
         try:
-            r = requests.get(
-                f"https://api.coincap.io/v2/assets/{cg_id}",
-                timeout=8
-            )
+            r = requests.get(f"https://api.coincap.io/v2/assets/{cg_id}", timeout=8)
             if r.status_code == 200:
                 data = r.json()
                 price = data.get("data", {}).get("priceUsd")
@@ -215,16 +224,18 @@ def resolve_price_usd(symbol: str):
 # ========== HANDLERS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    CONN.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
-    CONN.commit()
-    kb = [[InlineKeyboardButton(
-        "Upgrade with PayPal",
-        url=f"{PAYPAL_SUBSCRIBE_PAGE}?uid={uid}"
-    )]]
+    # Ensure user row exists (lightweight)
+    try:
+        CONN.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
+        CONN.commit()
+    except Exception:
+        pass
+
+    kb = [[InlineKeyboardButton("Upgrade with PayPal", url=f"{PAYPAL_SUBSCRIBE_PAGE}?uid={uid}")]]
     await update.message.reply_text(
         "👋 Welcome to *Crypto Alerts Bot!*\n"
         "Use `/price BTC` to get prices.\n"
-        "Try `/diagprice BTC` if you see errors.",
+        "If you see errors, try `/diagprice BTC`.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
@@ -281,10 +292,16 @@ async def diagprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== BOOT ==========
 def run_bot():
     async def _post_init(application):
+        # Always clear webhook to ensure polling mode & drop old updates
         try:
             await application.bot.delete_webhook(drop_pending_updates=True)
         except Exception as e:
             logging.warning("delete_webhook failed %s", e)
+
+    # Try to become the single runner
+    if not acquire_leader_lock():
+        logging.warning("Another instance holds the leader lock. Exiting bot startup to avoid conflicts.")
+        return
 
     app = (
         Application
@@ -298,7 +315,17 @@ def run_bot():
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("diagprice", diagprice))
 
-    logging.info("🤖 Bot running…")
+    logging.info("🤖 Bot running… (leader: %s)", RUN_ID)
+
+    # Lightweight heartbeat of the leader lock
+    def _hb():
+        while True:
+            heartbeat_leader()
+            time.sleep(30)
+
+    import threading
+    threading.Thread(target=_hb, daemon=True).start()
+
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
