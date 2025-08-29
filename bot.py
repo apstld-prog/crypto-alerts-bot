@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import logging, os, sqlite3, re, time, random
-from datetime import datetime, timedelta
+from datetime import datetime
 import requests
 from collections import deque
 
@@ -25,9 +25,9 @@ PRICE_CACHE = {}            # key: cg_id, value: (price_float, ts)
 CACHE_TTL = 60.0            # live cache window (seconds)
 STALE_TTL = 300.0           # allow stale (seconds)
 RETRY_MAX = 3
-RETRY_SLEEP = 0.35          # base backoff between retries
+RETRY_SLEEP = 0.35
 
-_LAST_CALLS = deque(maxlen=12)  # soft rate-limit
+_LAST_CALLS = deque(maxlen=12)
 
 def _throttle():
     now = time.time()
@@ -58,7 +58,7 @@ SYMBOL_TO_ID = {
 }
 _SYMBOL_CACHE = {}
 
-# Normalize (Greek → Latin lookalikes)
+# Normalize
 GREEK_TO_LATIN = str.maketrans({
     "Α":"A","Β":"B","Ε":"E","Ζ":"Z","Η":"H","Ι":"I","Κ":"K",
     "Μ":"M","Ν":"N","Ο":"O","Ρ":"P","Τ":"T","Υ":"Y","Χ":"X",
@@ -70,7 +70,7 @@ def normalize_symbol(s: str) -> str:
     s = re.sub(r"[^0-9A-Za-z\-]", "", s)
     return s.lower()
 
-# ========== DB (light touch) ==========
+# ========== DB ==========
 def db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("""CREATE TABLE IF NOT EXISTS users(
@@ -82,7 +82,7 @@ def db():
     return conn
 CONN = db()
 
-# ========== PROVIDERS (with retries) ==========
+# ========== PROVIDERS ==========
 def binance_price_for_symbol(symbol_or_id: str):
     sym = symbol_or_id.upper()
     cg_map = {
@@ -108,15 +108,12 @@ def binance_price_for_symbol(symbol_or_id: str):
             r = requests.get(
                 f"{host}/api/v3/ticker/price",
                 params={"symbol": pair},
-                headers={"Accept":"application/json",
-                         "User-Agent":"CryptoAlertsBot/1.0"},
                 timeout=8
             )
             if r.status_code == 200:
                 data = r.json()
-                price = data.get("price")
-                if price is not None:
-                    return float(price)
+                if "price" in data:
+                    return float(data["price"])
         except Exception:
             pass
         _sleep_jitter(RETRY_SLEEP)
@@ -129,8 +126,6 @@ def cg_simple_price(ids_csv: str) -> dict:
             r = requests.get(
                 COINGECKO_SIMPLE,
                 params={"ids": ids_csv, "vs_currencies": "usd"},
-                headers={"Accept":"application/json",
-                         "User-Agent":"CryptoAlertsBot/1.0"},
                 timeout=8
             )
             if r.status_code == 200:
@@ -146,8 +141,6 @@ def coincap_price(cg_id: str):
         try:
             r = requests.get(
                 f"https://api.coincap.io/v2/assets/{cg_id}",
-                headers={"Accept":"application/json",
-                         "User-Agent":"CryptoAlertsBot/1.0"},
                 timeout=8
             )
             if r.status_code == 200:
@@ -155,6 +148,25 @@ def coincap_price(cg_id: str):
                 price = data.get("data", {}).get("priceUsd")
                 if price is not None:
                     return float(price)
+        except Exception:
+            pass
+        _sleep_jitter(RETRY_SLEEP)
+    return None
+
+def cryptocompare_price(symbol_or_id: str):
+    sym = symbol_or_id.upper()
+    for _ in range(RETRY_MAX):
+        _throttle()
+        try:
+            r = requests.get(
+                "https://min-api.cryptocompare.com/data/price",
+                params={"fsym": sym, "tsyms": "USD"},
+                timeout=8
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if "USD" in data:
+                    return float(data["USD"])
         except Exception:
             pass
         _sleep_jitter(RETRY_SLEEP)
@@ -188,7 +200,13 @@ def resolve_price_usd(symbol: str):
         PRICE_CACHE[cg_id] = (p3, now)
         return p3
 
-    # 4) Stale cache fallback
+    # 4) CryptoCompare
+    p4 = cryptocompare_price(symbol)
+    if p4 is not None:
+        PRICE_CACHE[cg_id] = (p4, now)
+        return p4
+
+    # 5) Stale cache fallback
     if cached and now - cached[1] <= STALE_TTL:
         return cached[0]
 
@@ -235,28 +253,28 @@ async def diagprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     coin = normalize_symbol(context.args[0])
     cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
 
-    # cache
     cached = PRICE_CACHE.get(cg_id)
     cache_line = "Cache: none"
     if cached:
         age = int(time.time() - cached[1])
         cache_line = f"Cache: {cached[0]} (age {age}s)"
 
-    # live providers
     b = binance_price_for_symbol(coin)
     cg = cg_simple_price(cg_id)
     cg_price = None
     if cg and cg_id in cg and "usd" in cg[cg_id]:
         cg_price = cg[cg_id]["usd"]
     cc = coincap_price(cg_id)
+    ccx = cryptocompare_price(coin)
 
     text = (
         "🔎 Diagnostic\n"
-        f"Coin: {coin}  (cg_id: {cg_id})\n"
+        f"Coin: {coin} (cg_id: {cg_id})\n"
         f"{cache_line}\n"
         f"Binance: {b}\n"
         f"CoinGecko: {cg_price}\n"
-        f"CoinCap: {cc}"
+        f"CoinCap: {cc}\n"
+        f"CryptoCompare: {ccx}"
     )
     await update.message.reply_text(text)
 
