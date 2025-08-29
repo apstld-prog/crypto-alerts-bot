@@ -10,7 +10,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ---------------------- CONFIG ----------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PUBLIC_URL = os.getenv("PUBLIC_URL")  # e.g., https://your-app.onrender.com
+PUBLIC_URL = os.getenv("PUBLIC_URL")  # e.g., https://crypto-alerts-bot-k8i7.onrender.com
 PORT = int(os.getenv("PORT", "8000"))
 HOST = os.getenv("HOST", "0.0.0.0")
 
