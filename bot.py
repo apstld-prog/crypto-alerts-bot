@@ -17,6 +17,9 @@ CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
 PAYPAL_SUBSCRIBE_PAGE = os.getenv("PAYPAL_SUBSCRIBE_PAGE", "https://crypto-alerts-bot-k8i7.onrender.com/subscribe.html")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
+# Admins: comma-separated Telegram user IDs, e.g. "8290365345"
+ADMIN_IDS = set(int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit())
+
 logging.basicConfig(level=logging.INFO)
 
 # ========== SYMBOL → COINGECKO ID (extended base set) ==========
@@ -29,31 +32,29 @@ SYMBOL_TO_ID = {
     "icp":"internet-computer","egld":"multiversx","fil":"filecoin","hbar":"hedera-hashgraph","algo":"algorand",
     "vet":"vechain","theta":"theta-token","grt":"the-graph","ftm":"fantom","stx":"stacks","inj":"injective-protocol",
     "ldo":"lido-dao","rune":"thorchain","sei":"sei-network","tia":"celestia","rose":"oasis-network",
-    "xlq":"liquidlayer","one":"harmony","neo":"neo","ksm":"kusama","xdc":"xdce-crowd-sale","icx":"icon",
+    "one":"harmony","neo":"neo","ksm":"kusama","xdc":"xdce-crowd-sale","icx":"icon","ton":"the-open-network",
     # DeFi & DEX
     "uni":"uniswap","aave":"aave","comp":"compound-governance-token","snx":"synthetix-network-token",
     "crv":"curve-dao-token","sushi":"sushi","yfi":"yearn-finance","bal":"balancer","cake":"pancakeswap-token",
     "1inch":"1inch","cvx":"convex-finance","gmx":"gmx","dydx":"dydx","joe":"joe","kswap":"kyber-network-crystal",
-    "blur":"blur","pendle":"pendle","rndr":"render-token",
+    "blur":"blur","pendle":"pendle","rndr":"render-token","mpl":"maple","fxs":"frax-share",
     # NFT/Gaming/Metaverse
     "sand":"the-sandbox","mana":"decentraland","axs":"axie-infinity","enj":"enjincoin","ape":"apecoin",
-    "gmt":"stepn","imx":"immutable-x","beam":"beam-2","ron":"ronin",
+    "gmt":"stepn","beam":"beam-2","ron":"ronin",
     # Oracles, infra, AI
     "ocean":"ocean-protocol","fet":"fetch-ai","agix":"singularitynet","tao":"bittensor","phb":"phoenix-global",
-    "band":"band-protocol","api3":"api3",
-    # Payments & others
-    "xvg":"verge","dash":"dash","zec":"zcash","xdc":"xdce-crowd-sale","kas":"kaspa","wif":"dogwifcoin",
-    "bonk":"bonk","pepe":"pepe","shib":"shiba-inu","floki":"floki","safemoon":"safemoon",
-    "qnt":"quant-network","hnt":"helium","sfp":"safepal","rox":"retreeb",
+    "band":"band-protocol","api3":"api3","pyth":"pyth-network",
+    # Payments & others / memes
+    "xvg":"verge","dash":"dash","zec":"zcash","wif":"dogwifcoin","bonk":"bonk","pepe":"pepe","shib":"shiba-inu",
+    "floki":"floki","safemoon":"safemoon","qnt":"quant-network","hnt":"helium","sfp":"safepal",
     # Stablecoins (reference)
     "usdt":"tether","usdc":"usd-coin","dai":"dai","tusd":"true-usd","usdd":"usdd","frax":"frax",
     # Exchanges/CEXs
     "okb":"okb","gt":"gatechain-token","leo":"leo-token","cro":"crypto-com-chain",
-    # More popular requests
-    "arb":"arbitrum","op":"optimism","sui":"sui","apt":"aptos","kas":"kaspa","sei":"sei-network","ton":"the-open-network",
+    # Wrapped/lsd
     "wbtc":"wrapped-bitcoin","weeth":"wrapped-eeth","steth":"staked-ether","reth":"rocket-pool-eth","wbnb":"wbnb",
-    "opnx":"opnx","wld":"worldcoin-wld","pyth":"pyth-network","tomi":"tominet","core":"coredaoorg","ena":"ethena",
-    "aevo":"aevo","alt":"altlayer","sfrxeth":"staked-frax-ether","fxs":"frax-share","mpl":"maple",
+    # Newer/popular
+    "core":"coredaoorg","ena":"ethena","aevo":"aevo","alt":"altlayer","sfrxeth":"staked-frax-ether","wld":"worldcoin-wld"
 }
 _SYMBOL_CACHE = {}  # auto-filled via search
 
@@ -156,6 +157,38 @@ def parse_pairs(text_args):
         except: i+=1
     return out
 
+# ---------- Helpers for CoinGecko robustness ----------
+def cg_simple_price(ids_csv: str) -> dict:
+    try:
+        r = requests.get(
+            COINGECKO_SIMPLE,
+            params={"ids": ids_csv, "vs_currencies": "usd"},
+            headers={"Accept": "application/json"},
+            timeout=10
+        )
+        if r.status_code != 200:
+            return {}
+        return r.json() or {}
+    except Exception:
+        return {}
+
+def cg_market_price_single(cg_id: str):
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={"vs_currency": "usd", "ids": cg_id},
+            headers={"Accept": "application/json"},
+            timeout=10
+        )
+        if r.status_code != 200:
+            return None
+        arr = r.json()
+        if isinstance(arr, list) and arr:
+            return float(arr[0].get("current_price"))
+    except Exception:
+        return None
+    return None
+
 # ========== HANDLERS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -183,11 +216,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     syms = sorted(set(k.upper() for k in SYMBOL_TO_ID.keys()))
-    # format in rows of 16 for readability
-    rows=[]; line=[]
+    rows=[]; line=[]; per_row = 18
     for i,s in enumerate(syms,1):
         line.append(s)
-        if i%16==0: rows.append(" ".join(line)); line=[]
+        if i%per_row==0: rows.append(" ".join(line)); line=[]
     if line: rows.append(" ".join(line))
     text = "✅ Popular tickers you can use:\n" + "\n".join(rows) + \
            "\n\nTip: You can also try other symbols — I will auto-detect them."
@@ -198,15 +230,19 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: `/price BTC`", parse_mode="Markdown"); return
     coin = context.args[0].lower()
     cg_id = to_cg_id(coin)
-    try:
-        r = requests.get(COINGECKO_SIMPLE, params={"ids": cg_id, "vs_currencies": "usd"}, timeout=10)
-        data = r.json()
-        if cg_id not in data:
-            await update.message.reply_text("❌ Coin not found."); return
+
+    data = cg_simple_price(cg_id)
+    if cg_id in data and "usd" in data[cg_id]:
         p = data[cg_id]["usd"]
         await update.message.reply_text(f"💰 {coin.upper()} price: ${p}")
-    except Exception:
-        await update.message.reply_text("Error fetching price.")
+        return
+
+    p2 = cg_market_price_single(cg_id)
+    if p2 is not None:
+        await update.message.reply_text(f"💰 {coin.upper()} price: ${p2}")
+        return
+
+    await update.message.reply_text("❌ Coin not found or API unavailable. Please try again in a moment.")
 
 async def setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -289,16 +325,52 @@ async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = None if is_premium(uid) else [[InlineKeyboardButton("Upgrade with PayPal", url=f"{PAYPAL_SUBSCRIBE_PAGE}?uid={uid}")]]
     await update.message.reply_text(f"💎 Premium status: {status}", reply_markup=InlineKeyboardMarkup(kb) if kb else None)
 
+# ---------- ADMIN ----------
+def _is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+async def adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _is_admin(uid):
+        return  # silently ignore or you could reply "Not allowed"
+    now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    total_users = CONN.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    active_premium = CONN.execute(
+        "SELECT COUNT(*) FROM users WHERE premium_active=1 AND (premium_until IS NULL OR premium_until > ?)",
+        (datetime.utcnow().isoformat(),)
+    ).fetchone()[0]
+    total_alerts = CONN.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+    users_with_alerts = CONN.execute("SELECT COUNT(DISTINCT user_id) FROM alerts").fetchone()[0]
+    unique_coins = CONN.execute("SELECT COUNT(DISTINCT coin) FROM alerts").fetchone()[0]
+
+    msg = (
+        f"🛠️ Admin Stats ({now})\n"
+        f"• Users: {total_users}\n"
+        f"• Premium ACTIVE: {active_premium}\n"
+        f"• Alerts total: {total_alerts}\n"
+        f"• Users with alerts: {users_with_alerts}\n"
+        f"• Unique coins: {unique_coins}\n"
+        f"• Check interval: {CHECK_INTERVAL_SEC}s"
+    )
+    await update.message.reply_text(msg)
+
 # ========== PRICE FETCH & ALERTS ==========
 def fetch_prices(coins):
-    """Return dict keyed by CoinGecko IDs with USD prices."""
+    """Return dict keyed by CoinGecko IDs with USD prices (with fallback)."""
     if not coins: return {}
     ids = [to_cg_id(c) for c in coins]
-    try:
-        r = requests.get(COINGECKO_SIMPLE, params={"ids": ",".join(ids), "vs_currencies": "usd"}, timeout=10)
-        return r.json() or {}
-    except Exception:
-        return {}
+    batch = cg_simple_price(",".join(ids))
+    out = {}
+    for coin in coins:
+        key = to_cg_id(coin)
+        val = None
+        if key in batch and "usd" in batch[key]:
+            val = batch[key]["usd"]
+        else:
+            val = cg_market_price_single(key)
+        if val is not None:
+            out[key] = {"usd": val}
+    return out
 
 async def check_alerts_once(context):
     app = context.application
@@ -337,6 +409,7 @@ def run_bot():
     app.add_handler(CommandHandler("clearalerts", clearalerts))
     app.add_handler(CommandHandler("signals", signals))
     app.add_handler(CommandHandler("premium", premium))
+    app.add_handler(CommandHandler("adminstats", adminstats))
 
     # Ensure JobQueue exists (defensive) & schedule alert checks
     jq = app.job_queue
