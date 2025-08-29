@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-import logging, os, sqlite3
+import logging, os, sqlite3, re, time
 from datetime import datetime, timedelta
 import requests
+from collections import deque
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue
@@ -16,8 +17,6 @@ COINGECKO_SEARCH = "https://api.coingecko.com/api/v3/search"
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
 PAYPAL_SUBSCRIBE_PAGE = os.getenv("PAYPAL_SUBSCRIBE_PAGE", "https://crypto-alerts-bot-k8i7.onrender.com/subscribe.html")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
-
-# Admins: comma-separated Telegram user IDs, e.g. "8290365345"
 ADMIN_IDS = set(int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit())
 
 logging.basicConfig(level=logging.INFO)
@@ -58,16 +57,35 @@ SYMBOL_TO_ID = {
 }
 _SYMBOL_CACHE = {}  # auto-filled via search
 
+# Normalization (handles accidental Greek lookalikes, spaces, symbols)
+GREEK_TO_LATIN = str.maketrans({
+    "Α":"A","Β":"B","Ε":"E","Ζ":"Z","Η":"H","Ι":"I","Κ":"K","Μ":"M","Ν":"N","Ο":"O","Ρ":"P","Τ":"T","Υ":"Y","Χ":"X",
+    "α":"a","β":"b","ε":"e","ζ":"z","η":"h","ι":"i","κ":"k","μ":"m","ν":"n","ο":"o","ρ":"p","τ":"t","υ":"y","χ":"x",
+})
+def normalize_symbol(s: str) -> str:
+    s = s.strip().translate(GREEK_TO_LATIN)
+    s = re.sub(r"[^0-9A-Za-z\-]", "", s)
+    return s.lower()
+
+# Caching & throttling for external calls
+PRICE_CACHE = {}  # key: cg_id, value: (price_float, timestamp)
+CACHE_TTL = 30.0  # seconds
+_LAST_CALLS = deque(maxlen=10)
+
+def _throttle():
+    now = time.time()
+    if _LAST_CALLS and now - _LAST_CALLS[-1] < 0.4:
+        time.sleep(0.4 - (now - _LAST_CALLS[-1]))
+    _LAST_CALLS.append(time.time())
+
 def _search_coingecko_id(symbol: str) -> str | None:
-    """Query CoinGecko search API to resolve a symbol to an ID."""
     try:
-        r = requests.get(COINGECKO_SEARCH, params={"query": symbol}, timeout=8)
+        _throttle()
+        r = requests.get(COINGECKO_SEARCH, params={"query": symbol}, timeout=8, headers={"User-Agent":"CryptoAlertsBot/1.0"})
         data = r.json()
-        # Prefer exact symbol match
         for c in data.get("coins", []):
             if c.get("symbol","").lower() == symbol.lower():
                 return c["id"]
-        # Fallback: first hit
         if data.get("coins"):
             return data["coins"][0]["id"]
     except Exception:
@@ -75,18 +93,10 @@ def _search_coingecko_id(symbol: str) -> str | None:
     return None
 
 def to_cg_id(symbol_or_id: str) -> str:
-    """
-    Return CoinGecko ID for a given ticker. Priority:
-    1) extended static map, 2) runtime cache, 3) CoinGecko search, 4) fallback to input.
-    """
-    s = symbol_or_id.strip().lower()
-    if s in SYMBOL_TO_ID:
-        return SYMBOL_TO_ID[s]
-    if s in _SYMBOL_CACHE:
-        return _SYMBOL_CACHE[s]
-    # If it already looks like an id (has '-'), accept
-    if "-" in s or " " in s:
-        return s
+    s = normalize_symbol(symbol_or_id)
+    if s in SYMBOL_TO_ID: return SYMBOL_TO_ID[s]
+    if s in _SYMBOL_CACHE: return _SYMBOL_CACHE[s]
+    if "-" in s or " " in s: return s
     found = _search_coingecko_id(s)
     if found:
         _SYMBOL_CACHE[s] = found
@@ -144,7 +154,6 @@ def remove_alert(user_id: int, coin: str, target: float):
     CONN.execute("DELETE FROM alerts WHERE user_id=? AND coin=? AND target=?", (user_id, coin.lower(), float(target))); CONN.commit()
 
 def parse_pairs(text_args):
-    """Accepts: /bulkalerts BTC 30000, ETH 2000, SOL 50  (or space-separated)"""
     if not text_args: return []
     raw = text_args[0] if len(text_args)==1 else " ".join(text_args)
     raw = raw.replace(";", " ").replace(",", " ")
@@ -153,17 +162,18 @@ def parse_pairs(text_args):
     while i < len(toks)-1:
         coin=toks[i].strip().lower(); price_str=toks[i+1].strip().rstrip(",;")
         try:
-            out.append((coin, float(price_str))); i+=2
+            out.append((normalize_symbol(coin), float(price_str))); i+=2
         except: i+=1
     return out
 
-# ---------- Helpers for CoinGecko robustness ----------
+# ---------- Price providers (with throttle) ----------
 def cg_simple_price(ids_csv: str) -> dict:
+    _throttle()
     try:
         r = requests.get(
             COINGECKO_SIMPLE,
             params={"ids": ids_csv, "vs_currencies": "usd"},
-            headers={"Accept": "application/json"},
+            headers={"Accept": "application/json", "User-Agent": "CryptoAlertsBot/1.0"},
             timeout=10
         )
         if r.status_code != 200:
@@ -173,11 +183,12 @@ def cg_simple_price(ids_csv: str) -> dict:
         return {}
 
 def cg_market_price_single(cg_id: str):
+    _throttle()
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
             params={"vs_currency": "usd", "ids": cg_id},
-            headers={"Accept": "application/json"},
+            headers={"Accept": "application/json", "User-Agent": "CryptoAlertsBot/1.0"},
             timeout=10
         )
         if r.status_code != 200:
@@ -187,6 +198,77 @@ def cg_market_price_single(cg_id: str):
             return float(arr[0].get("current_price"))
     except Exception:
         return None
+    return None
+
+def coincap_price(cg_id: str):
+    _throttle()
+    try:
+        r = requests.get(
+            f"https://api.coincap.io/v2/assets/{cg_id}",
+            headers={"Accept": "application/json", "User-Agent": "CryptoAlertsBot/1.0"},
+            timeout=10
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        price = data.get("data", {}).get("priceUsd")
+        return float(price) if price is not None else None
+    except Exception:
+        return None
+
+def binance_price_for_symbol(symbol_or_id: str):
+    sym = symbol_or_id.upper()
+    cg_to_ticker = {
+        "bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL", "ripple": "XRP",
+        "cardano": "ADA", "dogecoin": "DOGE", "polygon": "MATIC", "tron": "TRX",
+        "avalanche-2": "AVAX", "polkadot": "DOT", "litecoin": "LTC"
+    }
+    if sym not in cg_to_ticker.values():
+        sym = cg_to_ticker.get(symbol_or_id.lower(), sym)
+    pair = sym + "USDT"
+    _throttle()
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": pair},
+            headers={"Accept": "application/json", "User-Agent": "CryptoAlertsBot/1.0"},
+            timeout=10
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        price = data.get("price")
+        return float(price) if price is not None else None
+    except Exception:
+        return None
+
+def resolve_price_usd(symbol_or_id: str):
+    cg_id = to_cg_id(symbol_or_id)
+    cached = PRICE_CACHE.get(cg_id)
+    if cached and (time.time() - cached[1] <= CACHE_TTL):
+        return cached[0]
+
+    data = cg_simple_price(cg_id)
+    if cg_id in data and "usd" in data[cg_id]:
+        p = float(data[cg_id]["usd"])
+        PRICE_CACHE[cg_id] = (p, time.time())
+        return p
+
+    p2 = cg_market_price_single(cg_id)
+    if p2 is not None:
+        PRICE_CACHE[cg_id] = (p2, time.time())
+        return p2
+
+    p3 = coincap_price(cg_id)
+    if p3 is not None:
+        PRICE_CACHE[cg_id] = (p3, time.time())
+        return p3
+
+    p4 = binance_price_for_symbol(symbol_or_id)
+    if p4 is not None:
+        PRICE_CACHE[cg_id] = (p4, time.time())
+        return p4
+
     return None
 
 # ========== HANDLERS ==========
@@ -227,28 +309,19 @@ async def coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: `/price BTC`", parse_mode="Markdown"); return
-    coin = context.args[0].lower()
-    cg_id = to_cg_id(coin)
-
-    data = cg_simple_price(cg_id)
-    if cg_id in data and "usd" in data[cg_id]:
-        p = data[cg_id]["usd"]
+        await update.message.reply_text("Usage: `/price ETH`", parse_mode="Markdown"); return
+    coin = context.args[0]
+    p = resolve_price_usd(coin)
+    if p is not None:
         await update.message.reply_text(f"💰 {coin.upper()} price: ${p}")
-        return
-
-    p2 = cg_market_price_single(cg_id)
-    if p2 is not None:
-        await update.message.reply_text(f"💰 {coin.upper()} price: ${p2}")
-        return
-
-    await update.message.reply_text("❌ Coin not found or API unavailable. Please try again in a moment.")
+    else:
+        await update.message.reply_text("❌ Coin not found or API unavailable. Please try again in a moment.")
 
 async def setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if len(context.args) < 2:
         await update.message.reply_text("Usage: `/setalert BTC 30000`", parse_mode="Markdown"); return
-    coin = context.args[0].lower()
+    coin = normalize_symbol(context.args[0])
     try: target = float(context.args[1])
     except: await update.message.reply_text("❌ Invalid price number."); return
 
@@ -292,7 +365,7 @@ async def delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if len(context.args) < 2:
         await update.message.reply_text("Usage: `/delalert BTC 30000`", parse_mode="Markdown"); return
-    coin = context.args[0].lower()
+    coin = normalize_symbol(context.args[0])
     try: target = float(context.args[1])
     except: await update.message.reply_text("❌ Invalid price number."); return
     remove_alert(uid, coin, target)
@@ -332,7 +405,7 @@ def _is_admin(user_id: int) -> bool:
 async def adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _is_admin(uid):
-        return  # silently ignore or you could reply "Not allowed"
+        return
     now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     total_users = CONN.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     active_premium = CONN.execute(
@@ -356,20 +429,13 @@ async def adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== PRICE FETCH & ALERTS ==========
 def fetch_prices(coins):
-    """Return dict keyed by CoinGecko IDs with USD prices (with fallback)."""
-    if not coins: return {}
-    ids = [to_cg_id(c) for c in coins]
-    batch = cg_simple_price(",".join(ids))
+    """Return dict keyed by CoinGecko IDs with USD prices using resolver + cache."""
     out = {}
-    for coin in coins:
-        key = to_cg_id(coin)
-        val = None
-        if key in batch and "usd" in batch[key]:
-            val = batch[key]["usd"]
-        else:
-            val = cg_market_price_single(key)
-        if val is not None:
-            out[key] = {"usd": val}
+    for c in coins:
+        cg_id = to_cg_id(c)
+        p = resolve_price_usd(c)
+        if p is not None:
+            out[cg_id] = {"usd": p}
     return out
 
 async def check_alerts_once(context):
