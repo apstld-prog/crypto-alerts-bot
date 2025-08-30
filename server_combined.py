@@ -3,11 +3,11 @@ import os, logging, threading, asyncio
 from flask import Flask, request, send_from_directory, Response
 from waitress import serve
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ============== CONFIG ==============
 BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
-PUBLIC_URL  = os.getenv("PUBLIC_URL", "")  # e.g. https://crypto-alerts-bot-k8i7.onrender.com
+PUBLIC_URL  = os.getenv("PUBLIC_URL", "")  # e.g. https://your-app.onrender.com
 HOST        = os.getenv("HOST", "0.0.0.0")
 PORT        = int(os.getenv("PORT", "8000"))
 
@@ -65,41 +65,65 @@ def webhook_get_probe():
     return "Telegram webhook endpoint (POST only).", 200
 
 # ============== TELEGRAM APP ==============
-# Φέρνουμε τους ΠΡΑΓΜΑΤΙΚΟΥΣ handlers από το bot.py σου
+# Φέρνουμε τους ΠΡΑΓΜΑΤΙΚΟΥΣ handlers από το bot.py
 from bot import start as start_cmd, help_cmd, price, diagprice
 
 application = Application.builder().token(BOT_TOKEN).build()
 
-# --- wrappers με logging για να δούμε ότι μπαίνουν οι handlers ---
+# --- wrappers με logging για να βεβαιωθούμε ότι φτάνει το update στους handlers ---
 async def start_wrap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log.info("→ handling /start (chat_id=%s)", getattr(update.effective_chat, "id", None))
+    log.info("→ handling /start (chat_id=%s, text=%r)", getattr(update.effective_chat, "id", None), getattr(update.message, "text", None))
     await start_cmd(update, context)
     log.info("← done /start")
 
 async def help_wrap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log.info("→ handling /help (chat_id=%s)", getattr(update.effective_chat, "id", None))
+    log.info("→ handling /help (chat_id=%s, text=%r)", getattr(update.effective_chat, "id", None), getattr(update.message, "text", None))
     await help_cmd(update, context)
     log.info("← done /help")
 
 async def price_wrap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log.info("→ handling /price %s (chat_id=%s)", " ".join(context.args or []), getattr(update.effective_chat, "id", None))
+    args = " ".join(context.args or [])
+    log.info("→ handling /price %s (chat_id=%s, text=%r)", args, getattr(update.effective_chat, "id", None), getattr(update.message, "text", None))
     await price(update, context)
     log.info("← done /price")
 
 async def diagprice_wrap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log.info("→ handling /diagprice %s (chat_id=%s)", " ".join(context.args or []), getattr(update.effective_chat, "id", None))
+    args = " ".join(context.args or [])
+    log.info("→ handling /diagprice %s (chat_id=%s, text=%r)", args, getattr(update.effective_chat, "id", None), getattr(update.message, "text", None))
     await diagprice(update, context)
     log.info("← done /diagprice")
 
-# Δένουμε τους handlers (στους wrappers)
+# Unknown command (οτιδήποτε ξεκινά με / και δεν ταιριάζει αλλού)
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = getattr(update.message, "text", "")
+    log.info("→ unknown command received: %r (chat_id=%s)", txt, getattr(update.effective_chat, "id", None))
+    await update.message.reply_text("Unknown command. Try /start or /help.")
+    log.info("← done unknown")
+
+# Catch-all text (για να βλέπουμε τι στέλνουν οι χρήστες)
+async def catch_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = getattr(update.message, "text", "")
+    log.info("→ catch-all text: %r (chat_id=%s)", txt, getattr(update.effective_chat, "id", None))
+    await update.message.reply_text("Hi! Use /start to see the instructions.")
+    log.info("← done catch-all")
+
+# Bind handlers (order matters: command wrappers πρώτα)
 application.add_handler(CommandHandler("start", start_wrap))
 application.add_handler(CommandHandler("help", help_wrap))
 application.add_handler(CommandHandler("price", price_wrap))
 application.add_handler(CommandHandler("diagprice", diagprice_wrap))
+# Unknown command must come after the known ones
+application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+# Catch all plain text (optional but useful for διάγνωση)
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catch_all_text))
 
-# Global error handler: λογκάρει ό,τι exception συμβεί μέσα σε handlers
+# Global error handler: λογκάρει exceptions μέσα στους handlers
 async def on_error(update: object, context):
-    log.exception("Handler error: %s (update=%s)", context.error, getattr(update, "to_dict", lambda: update)())
+    try:
+        upd = update.to_dict() if hasattr(update, "to_dict") else str(update)
+    except Exception:
+        upd = str(update)
+    log.exception("Handler error: %s (update=%s)", context.error, upd)
 
 application.add_error_handler(on_error)
 
@@ -138,7 +162,8 @@ def telegram_webhook():
         data = request.get_json(force=True, silent=False)
         # μικρό debug για να δούμε ότι φτάνει το update
         keys = list(data.keys()) if isinstance(data, dict) else [type(data)]
-        log.info("Webhook POST received: keys=%s", keys)
+        msg = data.get("message", {}) if isinstance(data, dict) else {}
+        log.info("Webhook POST received: keys=%s, text=%r", keys, msg.get("text"))
     except Exception:
         return "bad request", 400
 
