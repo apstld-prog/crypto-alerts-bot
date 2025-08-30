@@ -70,7 +70,7 @@ from bot import start as start_cmd, help_cmd, price, diagprice
 
 application = Application.builder().token(BOT_TOKEN).build()
 
-# --- wrappers με logging για να βεβαιωθούμε ότι φτάνει το update στους handlers ---
+# --- wrappers με logging για διάγνωση ---
 async def start_wrap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info("→ handling /start (chat_id=%s, text=%r)", getattr(update.effective_chat, "id", None), getattr(update.message, "text", None))
     await start_cmd(update, context)
@@ -93,31 +93,27 @@ async def diagprice_wrap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await diagprice(update, context)
     log.info("← done /diagprice")
 
-# Unknown command (οτιδήποτε ξεκινά με / και δεν ταιριάζει αλλού)
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = getattr(update.message, "text", "")
     log.info("→ unknown command received: %r (chat_id=%s)", txt, getattr(update.effective_chat, "id", None))
     await update.message.reply_text("Unknown command. Try /start or /help.")
     log.info("← done unknown")
 
-# Catch-all text (για να βλέπουμε τι στέλνουν οι χρήστες)
 async def catch_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = getattr(update.message, "text", "")
     log.info("→ catch-all text: %r (chat_id=%s)", txt, getattr(update.effective_chat, "id", None))
     await update.message.reply_text("Hi! Use /start to see the instructions.")
     log.info("← done catch-all")
 
-# Bind handlers (order matters: command wrappers πρώτα)
+# Bind handlers
 application.add_handler(CommandHandler("start", start_wrap))
 application.add_handler(CommandHandler("help", help_wrap))
 application.add_handler(CommandHandler("price", price_wrap))
 application.add_handler(CommandHandler("diagprice", diagprice_wrap))
-# Unknown command must come after the known ones
 application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
-# Catch all plain text (optional but useful for διάγνωση)
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catch_all_text))
 
-# Global error handler: λογκάρει exceptions μέσα στους handlers
+# Global error handler
 async def on_error(update: object, context):
     try:
         upd = update.to_dict() if hasattr(update, "to_dict") else str(update)
@@ -127,22 +123,19 @@ async def on_error(update: object, context):
 
 application.add_error_handler(on_error)
 
+# --- Async loop reference (για thread-safe dispatch) ---
+TG_LOOP = None  # θα οριστεί στο main
+
 # Init + set webhook (χωρίς polling)
 async def tg_init_and_set_webhook():
     await application.initialize()
-
-    # Καθάρισε παλιό webhook & pending updates
     try:
         await application.bot.delete_webhook(drop_pending_updates=True)
         log.info("deleteWebhook OK")
     except Exception as e:
         log.warning("deleteWebhook failed: %s", e)
-
-    # Θέσε νέο webhook
     await application.bot.set_webhook(url=WEBHOOK_URL)
     log.info("setWebhook OK → %s", WEBHOOK_URL)
-
-    # Start PTB (χωρίς polling, επεξεργασία μέσω update_queue)
     await application.start()
     log.info("Telegram application started (webhook mode).")
 
@@ -155,24 +148,25 @@ async def tg_shutdown():
     except Exception as e:
         log.warning("Telegram shutdown error: %s", e)
 
-# Το endpoint που δέχεται τα updates από Telegram (POST only)
+# Webhook endpoint: κάνουμε thread-safe dispatch στο PTB loop
 @app.post(WEBHOOK_PATH)
 def telegram_webhook():
     try:
         data = request.get_json(force=True, silent=False)
-        # μικρό debug για να δούμε ότι φτάνει το update
-        keys = list(data.keys()) if isinstance(data, dict) else [type(data)]
         msg = data.get("message", {}) if isinstance(data, dict) else {}
-        log.info("Webhook POST received: keys=%s, text=%r", keys, msg.get("text"))
+        log.info("Webhook POST received: keys=%s, text=%r",
+                 list(data.keys()) if isinstance(data, dict) else [type(data)],
+                 msg.get("text"))
     except Exception:
         return "bad request", 400
 
     try:
         update = Update.de_json(data, application.bot)
-        # push update στην PTB ουρά για async handling
-        application.update_queue.put_nowait(update)
+        # !!! ΣΗΜΑΝΤΙΚΟ: Εκτελούμε process_update πάνω στο σωστό asyncio loop
+        fut = asyncio.run_coroutine_threadsafe(application.process_update(update), TG_LOOP)
+        fut.result(timeout=5)  # optional: περιμένουμε λίγο για exceptions
     except Exception as e:
-        log.exception("Failed to enqueue update: %s", e)
+        log.exception("Failed to process update: %s", e)
         return "error", 500
 
     return "ok", 200
@@ -185,13 +179,12 @@ def run_flask():
 def run_asyncio_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_until_complete(tg_init_and_set_webhook())
-    # κρατάμε το loop ζωντανό, PTB διαβάζει από update_queue
     loop.run_forever()
 
 if __name__ == "__main__":
     # 1) Start Telegram async loop (webhook mode, no polling)
-    loop = asyncio.new_event_loop()
-    t = threading.Thread(target=run_asyncio_loop, args=(loop,), daemon=True, name="tg-loop")
+    TG_LOOP = asyncio.new_event_loop()
+    t = threading.Thread(target=run_asyncio_loop, args=(TG_LOOP,), daemon=True, name="tg-loop")
     t.start()
 
     # 2) Start Flask web server (health + webhook)
@@ -199,5 +192,5 @@ if __name__ == "__main__":
         run_flask()
     finally:
         # graceful shutdown
-        loop.call_soon_threadsafe(lambda: asyncio.create_task(tg_shutdown()))
-        loop.call_soon_threadsafe(loop.stop)
+        TG_LOOP.call_soon_threadsafe(lambda: asyncio.create_task(tg_shutdown()))
+        TG_LOOP.call_soon_threadsafe(TG_LOOP.stop)
