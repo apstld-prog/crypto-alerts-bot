@@ -1,50 +1,84 @@
 <!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Subscribe - Crypto Alerts Premium</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <!-- LIVE PayPal SDK with your Client ID -->
-    <script src="https://www.paypal.com/sdk/js?client-id=ATnYBfQz1Yx63YFWJ5R3lrpG-pErhpEmkHU-hkFMlE9xnIhhbbz1U_egGBK7ace5B_lpPETV7uMe20fB&vault=true&intent=subscription&currency=EUR"></script>
-    <style>
-      body { font-family: system-ui, Arial; max-width: 520px; margin: 30px auto; padding: 0 16px; }
-      .box { border: 1px solid #ddd; border-radius: 12px; padding: 18px; }
-      .note { color: #555; font-size: 14px; }
-    </style>
-  </head>
-  <body>
-    <h2>Crypto Alerts Premium — €7/month</h2>
-    <div class="box">
-      <p>Multiple alerts, 3 daily setups, weekly recap.</p>
-      <div id="paypal-button-container"></div>
-      <p class="note">
-        After approval, your Premium activates automatically within 1–2 minutes.  
-        Back in Telegram, use <code>/premium</code> to check status.
-      </p>
-    </div>
+<head>
+  <meta charset="utf-8" />
+  <title>Crypto Alerts Premium</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- LIVE PayPal SDK -->
+  <script src="https://www.paypal.com/sdk/js?intent=subscription&vault=true&components=buttons&currency=EUR&client-id=ATnYBfQz1Yx63YFWJ5R3lrpG-pErhpEmkHU-hkFMlE9xnIhhbbz1U_egGBK7ace5B_lpPETV7uMe20fB"></script>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; }
+    .card { border: 1px solid #e5e5e5; border-radius: 12px; padding: 16px 20px; }
+    .muted { color: #666; font-size: 14px; }
+    .ok { color: #0a7a3b; }
+    .err { color: #b00020; white-space: pre-wrap; }
+    .row { margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <h2>Crypto Alerts Premium</h2>
+  <div class="card">
+    <div class="row">Price: <b>€7.00 / month</b></div>
+    <div class="row muted">Unlimited alerts • Cancel anytime</div>
+    <div id="paypal-button-container" class="row"></div>
+    <div id="status" class="row muted">Waiting for approval…</div>
+    <div id="debug" class="row muted"></div>
+  </div>
 
-    <script>
-      // Read Telegram user id from query string ?uid=123
-      const params = new URLSearchParams(location.search);
-      const tg_uid = params.get("uid") || "0";
+  <script>
+    // === CONFIG ===
+    const planId = "P-3WF931792H799382YNCYB2OQ"; // <-- βάλε εδώ το LIVE Plan ID σου
+    const serverBase = https://crypto-alerts-bot-k8i7.onrender.com
+; // π.χ. https://crypto-alerts-bot-k8i7.onrender.com
+    const params = new URLSearchParams(window.location.search);
+    const uidParam = params.get("5254014824"); // πρέπει να είναι numeric user id από /whoami
 
-      paypal.Buttons({
-        style: {
-          shape: 'rect',
-          color: 'gold',
-          layout: 'vertical',
-          label: 'subscribe'
-        },
-        createSubscription: function(data, actions) {
-          return actions.subscription.create({
-            plan_id: 'P-3WF931792H799382YNCYB2OQ', // your EUR Plan ID
-            custom_id: tg_uid                     // pass Telegram user id to webhook
+    const statusEl = document.getElementById("status");
+    const debugEl = document.getElementById("debug");
+    function log(msg, cls){ statusEl.textContent = msg; if(cls){ statusEl.className = cls; } }
+    function dbg(obj){ debugEl.textContent = "[debug] " + JSON.stringify(obj, null, 2); }
+
+    if (!uidParam || !/^\d+$/.test(uidParam)) {
+      log("Missing or invalid uid. Άνοιξε αυτή τη σελίδα ως ?uid=5254014824  (πάρε το id από /whoami).", "err");
+      throw new Error("Invalid uid param");
+    }
+
+    paypal.Buttons({
+      style: { shape: 'rect', color: 'gold', layout: 'vertical', label: 'subscribe' },
+
+      createSubscription: function(data, actions) {
+        return actions.subscription.create({ plan_id: planId });
+      },
+
+      onApprove: async function(data, actions) {
+        try {
+          log("Approved in PayPal. Binding subscription…");
+          const payload = { uid: parseInt(uidParam, 10), subscription_id: data.subscriptionID };
+          dbg(payload);
+
+          const res = await fetch(serverBase + "/paypal/subscribe-bind", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
           });
-        },
-        onApprove: function(data, actions) {
-          alert("✅ Subscription approved! You will get Premium shortly.");
+
+          if (!res.ok) {
+            const txt = await res.text();
+            log("Failed to bind subscription. Server responded: " + txt, "err");
+            return;
+          }
+          const js = await res.json();
+          log("Subscription linked! Status: " + js.status, "ok");
+        } catch (e) {
+          log("Error during bind: " + e.message, "err");
         }
-      }).render('#paypal-button-container');
-    </script>
-  </body>
+      },
+
+      onError: function(err) {
+        log("PayPal error: " + String(err), "err");
+      }
+
+    }).render('#paypal-button-container');
+  </script>
+</body>
 </html>
