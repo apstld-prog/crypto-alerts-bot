@@ -104,7 +104,7 @@ def set_subscription_record(sub_id, user_id, status, payer_id=None, plan_id=None
     CONN.execute("""INSERT INTO subscriptions(subscription_id,user_id,status,payer_id,plan_id,last_event)
                     VALUES(?,?,?,?,?,?)
                     ON CONFLICT(subscription_id) DO UPDATE SET
-                      user_id=excluded.user_id,
+                      user_id=COALESCE(excluded.user_id, subscriptions.user_id),
                       status=excluded.status,
                       payer_id=COALESCE(excluded.payer_id, subscriptions.payer_id),
                       plan_id=COALESCE(excluded.plan_id, subscriptions.plan_id),
@@ -183,7 +183,6 @@ def resolve_price_usd(symbol: str):
     now = time.time()
     cached = PRICE_CACHE.get(cg_id)
     if cached and now - cached[1] <= CACHE_TTL: return cached[0]
-
     p = binance_price_for_symbol(symbol)
     if p is not None: PRICE_CACHE[cg_id] = (p, now); return p
     data = cg_simple_price(cg_id)
@@ -211,20 +210,16 @@ WELCOME_TEXT = (
 HELP_TEXT = (
     "📘 **Crypto Alerts Bot — Help**\n\n"
     "### 🔧 Commands\n"
-    "• **/price `<SYMBOL>`** — Current price in USD.  _Examples:_ `/price BTC`, `/price eth`, `/price sol`\n"
-    "• **/diagprice `<SYMBOL>`** — Diagnostics (providers & cache).\n"
-    "• **/setalert `<SYMBOL>` `< > | < >` `<PRICE>`** — Create a one-shot alert.\n"
-    "  _Examples:_ `/setalert BTC > 70000`, `/setalert ETH < 2300`\n"
-    "• **/myalerts** — Show your active alerts (IDs included).\n"
-    "• **/delalert `<ID>`** — Delete one alert.\n"
-    "• **/clearalerts** — Delete all active alerts.\n"
-    "• **/premium** — Check your plan & limits.\n"
+    "• **/price `<SYMBOL>`**, **/diagprice `<SYMBOL>`**\n"
+    "• **/setalert `<SYMBOL>` `< > | < >` `<PRICE>`**, **/myalerts**, **/delalert `<ID>`**, **/clearalerts**\n"
+    "• **/premium** — Check your plan & upgrade.\n"
     "• **/stats** — (admin) Bot statistics.\n"
-    "• **/help** — This help screen.\n\n"
-    "### ⏰ Alerts — How they work\n"
-    "• One-shot: once triggered, they deactivate and you get notified.\n"
-    "• Free users: **up to 3** active alerts.  Premium: **unlimited**.\n"
-    "• Check cadence: ~1 min via `/cron`.\n"
+    "• **/subs** — (admin) Recent subscriptions.\n"
+    "• **/bindsub `<SUB_ID>` `<USER_ID>`** — (admin) bind subscription to user.\n"
+    "• **/syncsub `<SUB_ID>`** — (admin) fetch status from PayPal and update premium.\n"
+    "• **/whoami** — shows your numeric Telegram user id.\n\n"
+    "### ⏰ Alerts\n"
+    "• One-shot, Free=3, Premium=unlimited. Checks ~1min via /cron.\n"
 )
 
 def help_keyboard(uid: int):
@@ -263,21 +258,74 @@ async def setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
+async def setpremiumme(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Not authorized."); return
+    if not context.args or context.args[0] not in ("0","1"):
+        await update.message.reply_text("Usage: /setpremiumme <0|1>"); return
+    set_premium(update.effective_user.id, context.args[0] == "1")
+    await update.message.reply_text(f"Your premium set to {context.args[0]=='1'}.")
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Your Telegram user id: {update.effective_user.id}")
+
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("Not authorized."); return
     total_users = CONN.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     premium_users = CONN.execute("SELECT COUNT(*) FROM users WHERE premium_active=1").fetchone()[0]
     active_alerts = CONN.execute("SELECT COUNT(*) FROM alerts WHERE active=1").fetchone()[0]
-    active_subs = CONN.execute("SELECT COUNT(*) FROM subscriptions WHERE status='ACTIVE'").fetchone()[0]
+    subs_total = CONN.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0]
+    subs_active = CONN.execute("SELECT COUNT(*) FROM subscriptions WHERE status='ACTIVE'").fetchone()[0]
     await update.message.reply_text(
         "📊 **Bot Stats**\n\n"
         f"👥 Users: {total_users}\n"
         f"💎 Premium users: {premium_users}\n"
         f"🔔 Active alerts: {active_alerts}\n"
-        f"🧾 Active subscriptions: {active_subs}",
+        f"🧾 Subscriptions: total={subs_total}, ACTIVE={subs_active}",
         parse_mode="Markdown"
     )
+
+async def subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Not authorized."); return
+    rows = CONN.execute("SELECT subscription_id,user_id,status,plan_id,last_event FROM subscriptions ORDER BY last_event DESC LIMIT 10").fetchall()
+    if not rows:
+        await update.message.reply_text("No subscriptions in DB."); return
+    lines = ["🧾 **Recent subscriptions**"]
+    for (sid, uid, st, plan, ts) in rows:
+        lines.append(f"• {sid} | user={uid} | {st} | plan={plan} | ts={int(ts)}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def bindsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Not authorized."); return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /bindsub <SUB_ID> <USER_ID>"); return
+    sub_id = context.args[0]; uid = int(context.args[1])
+    set_subscription_record(sub_id, uid, status="BIND_ONLY")
+    await update.message.reply_text(f"Bound {sub_id} → user {uid}. Now run /syncsub {sub_id}")
+
+async def syncsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Not authorized."); return
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /syncsub <SUB_ID>"); return
+    sub_id = context.args[0]
+    # ask server (server_combined has live helpers) via PayPal API? Not from bot (no secrets here)
+    # Here we only flip premium based on last known status
+    row = CONN.execute("SELECT user_id,status FROM subscriptions WHERE subscription_id=?", (sub_id,)).fetchone()
+    if not row:
+        await update.message.reply_text("Unknown subscription id in DB. Use /bindsub first."); return
+    uid, status = row
+    if not uid:
+        await update.message.reply_text("Subscription has no user bound. Use /bindsub."); return
+    # heuristic: mark premium if ACTIVE
+    if status == "ACTIVE":
+        set_premium(uid, True)
+        await update.message.reply_text(f"User {uid} set to Premium (status ACTIVE).")
+    else:
+        await update.message.reply_text(f"Subscription status is {status}. Waiting for webhook or bind+ACTIVE.")
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: await update.message.reply_text("Usage: `/price BTC`", parse_mode="Markdown"); return
@@ -357,7 +405,12 @@ def run_bot():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("premium", premium_cmd))
     app.add_handler(CommandHandler("setpremium", setpremium))
+    app.add_handler(CommandHandler("setpremiumme", setpremiumme))
+    app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("subs", subs))
+    app.add_handler(CommandHandler("bindsub", bindsub))
+    app.add_handler(CommandHandler("syncsub", syncsub))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("diagprice", diagprice))
     app.add_handler(CommandHandler("setalert", setalert))
@@ -370,9 +423,8 @@ def run_bot():
 def get_db_conn(): return CONN
 
 __all__ = [
-    "start","help_cmd","premium_cmd","setpremium","stats",
-    "price","diagprice",
-    "setalert","myalerts","delalert","clearalerts",
+    "start","help_cmd","premium_cmd","setpremium","setpremiumme","whoami","stats","subs","bindsub","syncsub",
+    "price","diagprice","setalert","myalerts","delalert","clearalerts",
     "resolve_price_usd","normalize_symbol","SYMBOL_TO_ID",
     "get_db_conn","is_premium","ensure_user","set_premium","set_subscription_record"
 ]
