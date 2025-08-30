@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, logging, threading, asyncio
+import os, logging, threading, asyncio, traceback
 from flask import Flask, request, send_from_directory, Response
 from waitress import serve
 from telegram import Update
@@ -16,8 +16,8 @@ if ":" not in BOT_TOKEN:
 if not (PUBLIC_URL.startswith("http://") or PUBLIC_URL.startswith("https://")):
     raise RuntimeError("PUBLIC_URL must be your full Render URL, e.g. https://<service>.onrender.com")
 
-WEBHOOK_PATH = f"/telegram/{BOT_TOKEN}"      # secret-ish path
-WEBHOOK_URL  = f"{PUBLIC_URL}{WEBHOOK_PATH}" # full webhook endpoint
+WEBHOOK_PATH = f"/telegram/{BOT_TOKEN}"
+WEBHOOK_URL  = f"{PUBLIC_URL}{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("server")
@@ -59,51 +59,59 @@ def subscribe_sandbox():
         return send_from_directory(".", "subscribe-sandbox.html")
     return ("<h3>Subscribe (SANDBOX)</h3><p>Place subscribe-sandbox.html in project root.</p>", 200)
 
-# Friendly GET probe (για να μη βλέπεις 405 όταν ανοίγεις το URL)
 @app.get(WEBHOOK_PATH)
 def webhook_get_probe():
     return "Telegram webhook endpoint (POST only).", 200
 
 # ============== TELEGRAM APP ==============
-# Φέρνουμε τους ΠΡΑΓΜΑΤΙΚΟΥΣ handlers από το bot.py
+# Import ΠΡΑΓΜΑΤΙΚΩΝ handlers από bot.py
 from bot import start as start_cmd, help_cmd, price, diagprice
 
 application = Application.builder().token(BOT_TOKEN).build()
 
-# --- wrappers με logging για διάγνωση ---
+# ---- Safe wrappers (reply on error + full logging) ----
+async def _safe_call(handler, update: Update, context: ContextTypes.DEFAULT_TYPE, tag: str):
+    chat_id = getattr(update.effective_chat, "id", None)
+    text = getattr(update.message, "text", None)
+    try:
+        log.info("→ handling %s (chat_id=%s, text=%r)", tag, chat_id, text)
+        await handler(update, context)
+        log.info("← done %s", tag)
+    except Exception as e:
+        log.error("Handler %s crashed: %s\n%s", tag, e, traceback.format_exc())
+        try:
+            if getattr(update, "message", None):
+                await update.message.reply_text("⚠️ Something went wrong while processing your request. Please try again.")
+        except Exception as e2:
+            log.warning("Failed to send error reply: %s", e2)
+
 async def start_wrap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log.info("→ handling /start (chat_id=%s, text=%r)", getattr(update.effective_chat, "id", None), getattr(update.message, "text", None))
-    await start_cmd(update, context)
-    log.info("← done /start")
+    await _safe_call(start_cmd, update, context, "/start")
 
 async def help_wrap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log.info("→ handling /help (chat_id=%s, text=%r)", getattr(update.effective_chat, "id", None), getattr(update.message, "text", None))
-    await help_cmd(update, context)
-    log.info("← done /help")
+    await _safe_call(help_cmd, update, context, "/help")
 
 async def price_wrap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = " ".join(context.args or [])
-    log.info("→ handling /price %s (chat_id=%s, text=%r)", args, getattr(update.effective_chat, "id", None), getattr(update.message, "text", None))
-    await price(update, context)
-    log.info("← done /price")
+    await _safe_call(price, update, context, f"/price {' '.join(context.args or [])}")
 
 async def diagprice_wrap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = " ".join(context.args or [])
-    log.info("→ handling /diagprice %s (chat_id=%s, text=%r)", args, getattr(update.effective_chat, "id", None), getattr(update.message, "text", None))
-    await diagprice(update, context)
-    log.info("← done /diagprice")
+    await _safe_call(diagprice, update, context, f"/diagprice {' '.join(context.args or [])}")
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = getattr(update.message, "text", "")
-    log.info("→ unknown command received: %r (chat_id=%s)", txt, getattr(update.effective_chat, "id", None))
-    await update.message.reply_text("Unknown command. Try /start or /help.")
-    log.info("← done unknown")
+    log.info("→ unknown command: %r (chat_id=%s)", txt, getattr(update.effective_chat, "id", None))
+    try:
+        await update.message.reply_text("Unknown command. Try /start or /help.")
+    except Exception:
+        log.warning("Failed to reply unknown command.")
 
 async def catch_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = getattr(update.message, "text", "")
     log.info("→ catch-all text: %r (chat_id=%s)", txt, getattr(update.effective_chat, "id", None))
-    await update.message.reply_text("Hi! Use /start to see the instructions.")
-    log.info("← done catch-all")
+    try:
+        await update.message.reply_text("Hi! Use /start to see the instructions.")
+    except Exception:
+        log.warning("Failed to reply catch-all.")
 
 # Bind handlers
 application.add_handler(CommandHandler("start", start_wrap))
@@ -113,20 +121,20 @@ application.add_handler(CommandHandler("diagprice", diagprice_wrap))
 application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catch_all_text))
 
-# Global error handler
+# Global error handler (PTB-level)
 async def on_error(update: object, context):
     try:
         upd = update.to_dict() if hasattr(update, "to_dict") else str(update)
     except Exception:
         upd = str(update)
-    log.exception("Handler error: %s (update=%s)", context.error, upd)
+    log.error("PTB error: %s\nUpdate: %s\nTraceback:\n%s", context.error, upd, traceback.format_exc())
 
 application.add_error_handler(on_error)
 
-# --- Async loop reference (για thread-safe dispatch) ---
-TG_LOOP = None  # θα οριστεί στο main
+# --- Async loop reference for thread-safe dispatch ---
+TG_LOOP = None
 
-# Init + set webhook (χωρίς polling)
+# Init + set webhook
 async def tg_init_and_set_webhook():
     await application.initialize()
     try:
@@ -139,7 +147,6 @@ async def tg_init_and_set_webhook():
     await application.start()
     log.info("Telegram application started (webhook mode).")
 
-# Graceful shutdown
 async def tg_shutdown():
     try:
         await application.stop()
@@ -148,7 +155,7 @@ async def tg_shutdown():
     except Exception as e:
         log.warning("Telegram shutdown error: %s", e)
 
-# Webhook endpoint: ΚΑΜΙΑ αναμονή (non-blocking), απλά dispatch μέσα στο PTB loop
+# Webhook endpoint — non-blocking dispatch
 @app.post(WEBHOOK_PATH)
 def telegram_webhook():
     try:
@@ -162,22 +169,20 @@ def telegram_webhook():
 
     try:
         update = Update.de_json(data, application.bot)
-        # non-blocking dispatch πάνω στο σωστό asyncio loop
         fut = asyncio.run_coroutine_threadsafe(application.process_update(update), TG_LOOP)
 
-        # optional: log τυχόν exceptions ασύγχρονα
+        # Optional: detailed error log if the handler crashes
         def _done_cb(f):
             try:
                 f.result()
             except Exception as e:
-                log.exception("process_update error: %s", e)
+                log.error("process_update error: %s\n%s", e, traceback.format_exc())
         fut.add_done_callback(_done_cb)
 
     except Exception as e:
-        log.exception("Failed to enqueue/process update: %s", e)
+        log.error("Failed to process update: %s\n%s", e, traceback.format_exc())
         return "error", 500
 
-    # ΕΠΙΣΤΡΕΦΟΥΜΕ 200 ΑΜΕΣΩΣ, ώστε το Telegram να μην κάνει retry
     return "ok", 200
 
 # ============== RUN LOOPS ==============
@@ -191,15 +196,11 @@ def run_asyncio_loop(loop):
     loop.run_forever()
 
 if __name__ == "__main__":
-    # 1) Start Telegram async loop (webhook mode, no polling)
     TG_LOOP = asyncio.new_event_loop()
     t = threading.Thread(target=run_asyncio_loop, args=(TG_LOOP,), daemon=True, name="tg-loop")
     t.start()
-
-    # 2) Start Flask web server (health + webhook)
     try:
         run_flask()
     finally:
-        # graceful shutdown
         TG_LOOP.call_soon_threadsafe(lambda: asyncio.create_task(tg_shutdown()))
         TG_LOOP.call_soon_threadsafe(TG_LOOP.stop)
