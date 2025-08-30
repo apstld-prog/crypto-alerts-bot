@@ -11,7 +11,7 @@ if not BOT_TOKEN or ":" not in BOT_TOKEN:
     raise RuntimeError("Missing or invalid BOT_TOKEN env var")
 
 PAYPAL_SUBSCRIBE_PAGE = os.getenv("PAYPAL_SUBSCRIBE_PAGE", "https://crypto-alerts-bot-k8i7.onrender.com/subscribe.html")
-DB_PATH = os.getenv("DB_PATH", "bot.db")  # stays local file (no Render Disk required)
+DB_PATH = os.getenv("DB_PATH", "bot.db")  # stays local file (no persistent disk required)
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
@@ -58,7 +58,7 @@ def normalize_symbol(s: str) -> str:
     s = re.sub(r"[^0-9A-Za-z\-]", "", s)
     return s.lower()
 
-# ================== DB (users + alerts + subscriptions) ==================
+# ================== DB ==================
 def db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("""CREATE TABLE IF NOT EXISTS users(
@@ -114,8 +114,8 @@ def set_subscription_record(sub_id, user_id, status, payer_id=None, plan_id=None
 
 # ================== Providers ==================
 def binance_price_for_symbol(symbol_or_id: str):
-    sym = symbol_or_id.upper()
-    cg_map = {
+    # Map common CoinGecko ids to Binance symbols where needed
+    sym_map = {
         "bitcoin":"BTC","ethereum":"ETH","solana":"SOL","ripple":"XRP","cardano":"ADA",
         "dogecoin":"DOGE","polygon":"MATIC","tron":"TRX","avalanche-2":"AVAX","polkadot":"DOT",
         "litecoin":"LTC","internet-computer":"ICP","chainlink":"LINK","cosmos":"ATOM","stellar":"XLM",
@@ -125,8 +125,9 @@ def binance_price_for_symbol(symbol_or_id: str):
         "the-graph":"GRT","axie-infinity":"AXS","the-sandbox":"SAND","decentraland":"MANA",
         "apecoin":"APE","stepn":"GMT","the-open-network":"TON","kaspa":"KAS","elrond-erd-2":"EGLD",
     }
-    if sym not in cg_map.values():
-        sym = cg_map.get(symbol_or_id.lower(), sym)
+    sym = symbol_or_id.upper()
+    if sym not in sym_map.values():
+        sym = sym_map.get(symbol_or_id.lower(), sym)
     pair = sym + "USDT"
     hosts = ["https://api.binance.com","https://api1.binance.com","https://api2.binance.com","https://api3.binance.com"]
     for attempt in range(RETRY_MAX):
@@ -137,7 +138,8 @@ def binance_price_for_symbol(symbol_or_id: str):
             if r.status_code == 200:
                 data = r.json(); price = data.get("price")
                 if price is not None: return float(price)
-        except Exception: pass
+        except Exception:
+            pass
         _sleep_jitter(RETRY_SLEEP)
     return None
 
@@ -146,8 +148,10 @@ def cg_simple_price(ids_csv: str) -> dict:
         _throttle()
         try:
             r = requests.get(COINGECKO_SIMPLE, params={"ids": ids_csv, "vs_currencies": "usd"}, timeout=8)
-            if r.status_code == 200: return r.json() or {}
-        except Exception: pass
+            if r.status_code == 200:
+                return r.json() or {}
+        except Exception:
+            pass
         _sleep_jitter(RETRY_SLEEP)
     return {}
 
@@ -157,9 +161,12 @@ def coincap_price(cg_id: str):
         try:
             r = requests.get(f"https://api.coincap.io/v2/assets/{cg_id}", timeout=8)
             if r.status_code == 200:
-                data = r.json(); price = data.get("data", {}).get("priceUsd")
-                if price is not None: return float(price)
-        except Exception: pass
+                data = r.json()
+                price = data.get("data", {}).get("priceUsd")
+                if price is not None:
+                    return float(price)
+        except Exception:
+            pass
         _sleep_jitter(RETRY_SLEEP)
     return None
 
@@ -172,8 +179,10 @@ def cryptocompare_price(symbol_or_id: str):
                              params={"fsym": sym, "tsyms": "USD"}, timeout=8)
             if r.status_code == 200:
                 data = r.json()
-                if "USD" in data: return float(data["USD"])
-        except Exception: pass
+                if "USD" in data:
+                    return float(data["USD"])
+        except Exception:
+            pass
         _sleep_jitter(RETRY_SLEEP)
     return None
 
@@ -182,17 +191,37 @@ def resolve_price_usd(symbol: str):
     cg_id = SYMBOL_TO_ID.get(symbol.lower(), symbol.lower())
     now = time.time()
     cached = PRICE_CACHE.get(cg_id)
-    if cached and now - cached[1] <= CACHE_TTL: return cached[0]
+    if cached and now - cached[1] <= CACHE_TTL:
+        return cached[0]
+
+    # 1) Binance by symbol
     p = binance_price_for_symbol(symbol)
-    if p is not None: PRICE_CACHE[cg_id] = (p, now); return p
+    if p is not None:
+        PRICE_CACHE[cg_id] = (p, now)
+        return p
+
+    # 2) CoinGecko by id
     data = cg_simple_price(cg_id)
     if cg_id in data and "usd" in data[cg_id]:
-        p = float(data[cg_id]["usd"]); PRICE_CACHE[cg_id] = (p, now); return p
+        p = float(data[cg_id]["usd"])
+        PRICE_CACHE[cg_id] = (p, now)
+        return p
+
+    # 3) CoinCap by id
     p3 = coincap_price(cg_id)
-    if p3 is not None: PRICE_CACHE[cg_id] = (p3, now); return p3
+    if p3 is not None:
+        PRICE_CACHE[cg_id] = (p3, now)
+        return p3
+
+    # 4) CryptoCompare by symbol
     p4 = cryptocompare_price(symbol)
-    if p4 is not None: PRICE_CACHE[cg_id] = (p4, now); return p4
-    if cached and now - cached[1] <= STALE_TTL: return cached[0]
+    if p4 is not None:
+        PRICE_CACHE[cg_id] = (p4, now)
+        return p4
+
+    # If we have a stale cached value, return it
+    if cached and now - cached[1] <= STALE_TTL:
+        return cached[0]
     return None
 
 # ================== UI TEXTS ==================
@@ -231,17 +260,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
     await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=help_keyboard(uid))
-    try: await update.message.reply_text("⌨️ Quick actions:", reply_markup=quick_reply_keyboard())
-    except Exception: pass
+    try:
+        await update.message.reply_text("⌨️ Quick actions:", reply_markup=quick_reply_keyboard())
+    except Exception:
+        pass
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id; ensure_user(uid)
+    uid = update.effective_user.id
+    ensure_user(uid)
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=help_keyboard(uid))
 
 async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id; ensure_user(uid)
+    uid = update.effective_user.id
+    ensure_user(uid)
     status = "🌟 **Premium** (unlimited alerts)" if is_premium(uid) else "🆓 **Free** (up to 3 active alerts)"
-    await update.message.reply_text(f"{status}\nUpgrade here: {PAYPAL_SUBSCRIBE_PAGE}", parse_mode="Markdown", reply_markup=help_keyboard(uid))
+    await update.message.reply_text(
+        f"{status}\nUpgrade here: {PAYPAL_SUBSCRIBE_PAGE}",
+        parse_mode="Markdown",
+        reply_markup=help_keyboard(uid)
+    )
 
 # --- Admin / Diagnostics ---
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -249,27 +286,44 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("Not authorized."); return
-    total_users = CONN.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    premium_users = CONN.execute("SELECT COUNT(*) FROM users WHERE premium_active=1").fetchone()[0]
-    active_alerts = CONN.execute("SELECT COUNT(*) FROM alerts WHERE active=1").fetchone()[0]
-    subs_total = CONN.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0]
-    subs_active = CONN.execute("SELECT COUNT(*) FROM subscriptions WHERE status='ACTIVE'").fetchone()[0]
+        await update.message.reply_text("Not authorized.")
+        return
+
+    total_users   = CONN.execute("SELECT COUNT(*) FROM users").fetchone()[0] or 0
+    premium_users = CONN.execute("SELECT COUNT(*) FROM users WHERE premium_active=1").fetchone()[0] or 0
+    active_alerts = CONN.execute("SELECT COUNT(*) FROM alerts WHERE active=1").fetchone()[0] or 0
+    subs_total    = CONN.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0] or 0
+
+    rows = CONN.execute("""
+        SELECT UPPER(TRIM(COALESCE(status,''))) AS s, COUNT(*)
+        FROM subscriptions
+        GROUP BY s
+    """).fetchall()
+    by_status = { (s or 'UNKNOWN') : c for (s,c) in rows }
+    subs_active = by_status.get('ACTIVE', 0)
+    breakdown_lines = "  • " + "\n  • ".join([f"{k}={v}" for k,v in sorted(by_status.items())]) if rows else "  • (none)"
+
     await update.message.reply_text(
         "📊 **Bot Stats**\n\n"
         f"👥 Users: {total_users}\n"
         f"💎 Premium users: {premium_users}\n"
         f"🔔 Active alerts: {active_alerts}\n"
-        f"🧾 Subscriptions: total={subs_total}, ACTIVE={subs_active}",
+        f"🧾 Subscriptions: total={subs_total}, ACTIVE={subs_active}\n"
+        f"{breakdown_lines}",
         parse_mode="Markdown"
     )
 
 async def subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("Not authorized."); return
-    rows = CONN.execute("SELECT subscription_id,user_id,status,plan_id,last_event FROM subscriptions ORDER BY last_event DESC LIMIT 15").fetchall()
+        await update.message.reply_text("Not authorized.")
+        return
+    rows = CONN.execute(
+        "SELECT subscription_id,user_id,status,plan_id,last_event "
+        "FROM subscriptions ORDER BY last_event DESC LIMIT 15"
+    ).fetchall()
     if not rows:
-        await update.message.reply_text("No subscriptions in DB."); return
+        await update.message.reply_text("No subscriptions in DB.")
+        return
     lines = ["🧾 **Recent subscriptions**"]
     for (sid, uid, st, plan, ts) in rows:
         when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
@@ -278,22 +332,28 @@ async def subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def bindsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("Not authorized."); return
+        await update.message.reply_text("Not authorized.")
+        return
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /bindsub <SUB_ID> <USER_ID>"); return
-    sub_id = context.args[0]; uid = int(context.args[1])
+        await update.message.reply_text("Usage: /bindsub <SUB_ID> <USER_ID>")
+        return
+    sub_id = context.args[0]
+    uid = int(context.args[1])
     set_subscription_record(sub_id, uid, status="BIND_ONLY")
     await update.message.reply_text(f"Bound {sub_id} → user {uid}. Now run /syncsub {sub_id}")
 
 async def syncsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("Not authorized."); return
+        await update.message.reply_text("Not authorized.")
+        return
     if len(context.args) < 1:
-        await update.message.reply_text("Usage: /syncsub <SUB_ID>"); return
+        await update.message.reply_text("Usage: /syncsub <SUB_ID>")
+        return
     sub_id = context.args[0]
     row = CONN.execute("SELECT user_id,status FROM subscriptions WHERE subscription_id=?", (sub_id,)).fetchone()
     if not row:
-        await update.message.reply_text("Unknown subscription id in DB. Use /bindsub first."); return
+        await update.message.reply_text("Unknown subscription id in DB. Use /bindsub first.")
+        return
     uid, status = row
     if status == "ACTIVE" and uid:
         set_premium(uid, True)
@@ -303,81 +363,138 @@ async def syncsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Prices ----------
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: await update.message.reply_text("Usage: `/price BTC`", parse_mode="Markdown"); return
-    coin = normalize_symbol(context.args[0]); cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
+    if not context.args:
+        await update.message.reply_text("Usage: `/price BTC`", parse_mode="Markdown")
+        return
+    coin = normalize_symbol(context.args[0])
+    cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
     p = resolve_price_usd(coin)
-    if p is None: await update.message.reply_text("❌ Coin not found or API unavailable. Please try again."); return
-    ts = PRICE_CACHE.get(cg_id, (None, 0))[1]; age = time.time() - ts; suffix = " *(stale)*" if age > CACHE_TTL else ""
+    if p is None:
+        await update.message.reply_text("❌ Coin not found or API unavailable. Please try again.")
+        return
+    ts = PRICE_CACHE.get(cg_id, (None, 0))[1]
+    age = time.time() - ts
+    suffix = " *(stale)*" if age > CACHE_TTL else ""
     await update.message.reply_text(f"💰 **{coin.upper()}** price: **${p:.6f}**{suffix}", parse_mode="Markdown")
 
 async def diagprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: await update.message.reply_text("Usage: `/diagprice ETH`", parse_mode="Markdown"); return
-    coin = normalize_symbol(context.args[0]); cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
-    cached = PRICE_CACHE.get(cg_id); cache_line = "Cache: none"
-    if cached: age = int(time.time() - cached[1]); cache_line = f"Cache: {cached[0]} (age {age}s)"
-    b = binance_price_for_symbol(coin); cg = cg_simple_price(cg_id); cg_price = None
-    if cg and cg_id in cg and "usd" in cg[cg_id]: cg_price = cg[cg_id]["usd"]
-    cc = coincap_price(cg_id); ccx = cryptocompare_price(coin)
-    text = ("🔎 **Diagnostic**\n"
-            f"Coin: **{coin.upper()}**  *(cg_id: {cg_id})*\n"
-            f"{cache_line}\n• Binance: {b}\n• CoinGecko: {cg_price}\n• CoinCap: {cc}\n• CryptoCompare: {ccx}\n")
+    if not context.args:
+        await update.message.reply_text("Usage: `/diagprice ETH`", parse_mode="Markdown")
+        return
+    coin = normalize_symbol(context.args[0])
+    cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
+    cached = PRICE_CACHE.get(cg_id)
+    cache_line = "Cache: none"
+    if cached:
+        age = int(time.time() - cached[1])
+        cache_line = f"Cache: {cached[0]} (age {age}s)"
+    b = binance_price_for_symbol(coin)
+    cg = cg_simple_price(cg_id); cg_price = None
+    if cg and cg_id in cg and "usd" in cg[cg_id]:
+        cg_price = cg[cg_id]["usd"]
+    cc = coincap_price(cg_id)
+    ccx = cryptocompare_price(coin)
+    text = (
+        "🔎 **Diagnostic**\n"
+        f"Coin: **{coin.upper()}**  *(cg_id: {cg_id})*\n"
+        f"{cache_line}\n"
+        f"• Binance: {b}\n"
+        f"• CoinGecko: {cg_price}\n"
+        f"• CoinCap: {cc}\n"
+        f"• CryptoCompare: {ccx}\n"
+    )
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# ---------- Alerts (Premium enforced) ----------
+# ---------- Alerts (Premium enforced: Free=3, Premium=∞) ----------
 ALERT_USAGE = "Usage: `/setalert BTC > 110000`  or  `/setalert ETH < 2300`"
+
 def parse_setalert(args):
-    if len(args) < 3: return None
-    sym = normalize_symbol(args[0]); op = args[1]
-    if op not in (">","<"): return None
-    try: thr = float(args[2].replace(",",""))
-    except Exception: return None
+    if len(args) < 3:
+        return None
+    sym = normalize_symbol(args[0])
+    op = args[1]
+    if op not in (">", "<"):
+        return None
+    try:
+        thr = float(args[2].replace(",", ""))
+    except Exception:
+        return None
     return (sym, op, thr)
 
 async def setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id; ensure_user(uid)
-    if len(context.args) < 3: await update.message.reply_text(ALERT_USAGE, parse_mode="Markdown"); return
+    uid = update.effective_user.id
+    ensure_user(uid)
+    if len(context.args) < 3:
+        await update.message.reply_text(ALERT_USAGE, parse_mode="Markdown")
+        return
     parsed = parse_setalert(context.args)
-    if not parsed: await update.message.reply_text(ALERT_USAGE, parse_mode="Markdown"); return
+    if not parsed:
+        await update.message.reply_text(ALERT_USAGE, parse_mode="Markdown")
+        return
     sym, op, thr = parsed
-    if sym.lower() not in SYMBOL_TO_ID: await update.message.reply_text("❌ Unknown symbol. Try BTC/ETH/SOL…"); return
+    if sym.lower() not in SYMBOL_TO_ID:
+        await update.message.reply_text("❌ Unknown symbol. Try BTC/ETH/SOL…")
+        return
 
     # Enforce free limit = 3
     if not is_premium(uid):
         cnt = CONN.execute("SELECT COUNT(*) FROM alerts WHERE user_id=? AND active=1", (uid,)).fetchone()[0]
         if cnt >= 3:
-            await update.message.reply_text("Free plan limit reached (3 alerts). Upgrade for unlimited alerts.", reply_markup=help_keyboard(uid)); return
+            await update.message.reply_text(
+                "Free plan limit reached (3 alerts). Upgrade for unlimited alerts.",
+                reply_markup=help_keyboard(uid)
+            )
+            return
 
-    CONN.execute("INSERT INTO alerts(user_id,symbol,op,threshold,active,created_at) VALUES(?,?,?,?,1,?)",
-                 (uid, sym.lower(), op, thr, time.time()))
+    CONN.execute(
+        "INSERT INTO alerts(user_id,symbol,op,threshold,active,created_at) VALUES(?,?,?,?,1,?)",
+        (uid, sym.lower(), op, thr, time.time())
+    )
     CONN.commit()
     await update.message.reply_text(f"✅ Alert saved: `{sym.upper()} {op} {thr}`", parse_mode="Markdown")
 
 async def myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id; ensure_user(uid)
-    rows = CONN.execute("SELECT id,symbol,op,threshold,active FROM alerts WHERE user_id=? AND active=1 ORDER BY id DESC",(uid,)).fetchall()
-    if not rows: await update.message.reply_text("You have no active alerts.\n`/setalert BTC > 110000`", parse_mode="Markdown"); return
+    uid = update.effective_user.id
+    ensure_user(uid)
+    rows = CONN.execute(
+        "SELECT id,symbol,op,threshold,active FROM alerts WHERE user_id=? AND active=1 ORDER BY id DESC",
+        (uid,)
+    ).fetchall()
+    if not rows:
+        await update.message.reply_text("You have no active alerts.\n`/setalert BTC > 110000`", parse_mode="Markdown")
+        return
     lines = ["🔔 **Your Alerts**"] + [f"• `{aid}` — **{s.upper()} {op} {thr}**" for (aid,s,op,thr,act) in rows]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id; ensure_user(uid)
-    if not context.args: await update.message.reply_text("Usage: `/delalert <ID>`", parse_mode="Markdown"); return
-    try: aid = int(context.args[0])
-    except Exception: await update.message.reply_text("Usage: `/delalert <ID>`", parse_mode="Markdown"); return
-    cur = CONN.execute("UPDATE alerts SET active=0 WHERE id=? AND user_id=?", (aid, uid)); CONN.commit()
+    uid = update.effective_user.id
+    ensure_user(uid)
+    if not context.args:
+        await update.message.reply_text("Usage: `/delalert <ID>`", parse_mode="Markdown")
+        return
+    try:
+        aid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Usage: `/delalert <ID>`", parse_mode="Markdown")
+        return
+    cur = CONN.execute("UPDATE alerts SET active=0 WHERE id=? AND user_id=?", (aid, uid))
+    CONN.commit()
     await update.message.reply_text("🗑️ Deleted." if cur.rowcount else "Alert not found.", parse_mode="Markdown")
 
 async def clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id; ensure_user(uid)
-    cur = CONN.execute("UPDATE alerts SET active=0 WHERE user_id=? AND active=1", (uid,)); CONN.commit()
+    uid = update.effective_user.id
+    ensure_user(uid)
+    cur = CONN.execute("UPDATE alerts SET active=0 WHERE user_id=? AND active=1", (uid,))
+    CONN.commit()
     await update.message.reply_text(f"🧹 Cleared {cur.rowcount} alert(s).")
 
-# =============== Polling helper (local) ===============
+# =============== Polling helper (for local use only) ===============
 def run_bot():
-    from telegram.ext import Application
     async def _post_init(application):
-        try: await application.bot.delete_webhook(drop_pending_updates=True)
-        except Exception as e: logging.warning("delete_webhook failed %s", e)
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            logging.warning("delete_webhook failed %s", e)
     app = (Application.builder().token(BOT_TOKEN).post_init(_post_init).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
