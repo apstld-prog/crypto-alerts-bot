@@ -13,12 +13,20 @@ HOST        = os.getenv("HOST", "0.0.0.0")
 PORT        = int(os.getenv("PORT", "8000"))
 ALERT_INTERVAL_SEC = int(os.getenv("ALERT_INTERVAL_SEC", "0"))
 
+# PayPal LIVE
+PAYPAL_MODE = os.getenv("PAYPAL_MODE", "live").lower()
+PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID", "")
+PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET", "")
+PAYPAL_WEBHOOK_ID = os.getenv("PAYPAL_WEBHOOK_ID", "")
+
 if ":" not in BOT_TOKEN: raise RuntimeError("Missing or invalid BOT_TOKEN")
 if not (PUBLIC_URL.startswith("http://") or PUBLIC_URL.startswith("https://")):
     raise RuntimeError("PUBLIC_URL must be full URL")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("server")
+
+API_BASE = "https://api-m.paypal.com" if PAYPAL_MODE == "live" else "https://api-m.sandbox.paypal.com"
 
 # ======== FLASK ========
 app = Flask(__name__)
@@ -42,12 +50,17 @@ def root():
 @app.get("/healthz")
 def healthz(): return "ok", 200
 
+@app.get("/subscribe.html")
+def subscribe_live():
+    if os.path.isfile("subscribe.html"):
+        return send_from_directory(".", "subscribe.html")
+    return ("<h3>Subscribe (LIVE)</h3><p>Place subscribe.html in project root.</p>", 200)
+
 # ======== TELEGRAM APP ========
 from bot import (
-    start as start_cmd, help_cmd, premium_cmd, setpremium, stats,
-    price, diagprice,
-    setalert, myalerts, delalert, clearalerts,
-    resolve_price_usd, get_db_conn
+    start as start_cmd, help_cmd, premium_cmd, setpremium, setpremiumme, whoami, stats, subs, bindsub, syncsub,
+    price, diagprice, setalert, myalerts, delalert, clearalerts,
+    resolve_price_usd, get_db_conn, set_premium, set_subscription_record
 )
 
 application = Application.builder().token(BOT_TOKEN).build()
@@ -71,7 +84,12 @@ async def start_wrap(u,c):       await _safe(start_cmd, "/start", u, c)
 async def help_wrap(u,c):        await _safe(help_cmd, "/help", u, c)
 async def premium_wrap(u,c):     await _safe(premium_cmd, "/premium", u, c)
 async def setpremium_wrap(u,c):  await _safe(setpremium, "/setpremium", u, c)
+async def setpremiumme_wrap(u,c):await _safe(setpremiumme, "/setpremiumme", u, c)
+async def whoami_wrap(u,c):      await _safe(whoami, "/whoami", u, c)
 async def stats_wrap(u,c):       await _safe(stats, "/stats", u, c)
+async def subs_wrap(u,c):        await _safe(subs, "/subs", u, c)
+async def bindsub_wrap(u,c):     await _safe(bindsub, "/bindsub", u, c)
+async def syncsub_wrap(u,c):     await _safe(syncsub, "/syncsub", u, c)
 async def price_wrap(u,c):       await _safe(price, "/price", u, c)
 async def diag_wrap(u,c):        await _safe(diagprice, "/diagprice", u, c)
 async def setalert_wrap(u,c):    await _safe(setalert, "/setalert", u, c)
@@ -89,7 +107,12 @@ application.add_handler(CommandHandler("start", start_wrap))
 application.add_handler(CommandHandler("help", help_wrap))
 application.add_handler(CommandHandler("premium", premium_wrap))
 application.add_handler(CommandHandler("setpremium", setpremium_wrap))
+application.add_handler(CommandHandler("setpremiumme", setpremiumme_wrap))
+application.add_handler(CommandHandler("whoami", whoami_wrap))
 application.add_handler(CommandHandler("stats", stats_wrap))
+application.add_handler(CommandHandler("subs", subs_wrap))
+application.add_handler(CommandHandler("bindsub", bindsub_wrap))
+application.add_handler(CommandHandler("syncsub", syncsub_wrap))
 application.add_handler(CommandHandler("price", price_wrap))
 application.add_handler(CommandHandler("diagprice", diag_wrap))
 application.add_handler(CommandHandler("setalert", setalert_wrap))
@@ -105,7 +128,7 @@ async def on_error(update: object, context):
     log.error("PTB error: %s\nUpdate: %s\nTraceback:\n%s", context.error, upd, traceback.format_exc())
 application.add_error_handler(on_error)
 
-# Async loop ref for thread-safe dispatch
+# Async loop ref
 TG_LOOP = None
 
 async def tg_init_and_set_webhook():
@@ -128,7 +151,7 @@ async def tg_shutdown():
     except Exception as e:
         log.warning("Telegram shutdown error: %s", e)
 
-@app.post(WEBHOOK_PATH)
+@app.post(f"/telegram/{BOT_TOKEN}")
 def telegram_webhook():
     try:
         data = request.get_json(force=True, silent=False)
@@ -193,6 +216,107 @@ def cron_tick():
         log.error("cron_tick error: %s\n%s", e, traceback.format_exc())
         return "cron error", 500
 
+# ======== PAYPAL HELPERS ========
+def paypal_access_token():
+    r = requests.post(f"{API_BASE}/v1/oauth2/token",
+                      auth=(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET),
+                      data={"grant_type":"client_credentials"}, timeout=15)
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+def paypal_get_subscription(sub_id, token=None):
+    token = token or paypal_access_token()
+    r = requests.get(f"{API_BASE}/v1/billing/subscriptions/{sub_id}",
+                     headers={"Authorization": f"Bearer {token}"}, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def paypal_verify_webhook(req_headers, body_bytes):
+    token = paypal_access_token()
+    verify_payload = {
+        "auth_algo": req_headers.get("PayPal-Auth-Algo"),
+        "cert_url": req_headers.get("PayPal-Cert-Url"),
+        "transmission_id": req_headers.get("PayPal-Transmission-Id"),
+        "transmission_sig": req_headers.get("PayPal-Transmission-Sig"),
+        "transmission_time": req_headers.get("PayPal-Transmission-Time"),
+        "webhook_id": PAYPAL_WEBHOOK_ID,
+        "webhook_event": json.loads(body_bytes.decode("utf-8"))
+    }
+    r = requests.post(f"{API_BASE}/v1/notifications/verify-webhook-signature",
+                      headers={"Authorization": f"Bearer {token}",
+                              "Content-Type": "application/json"},
+                      json=verify_payload, timeout=20)
+    r.raise_for_status()
+    ok = (r.json().get("verification_status") == "SUCCESS")
+    log.info("paypal_verify_webhook → %s", ok)
+    return ok
+
+# ======== PAYPAL ROUTES ========
+@app.post("/paypal/subscribe-bind")
+def paypal_subscribe_bind():
+    try:
+        data = request.get_json(force=True, silent=False)
+        uid = int(data["uid"])
+        sub_id = str(data["subscription_id"])
+    except Exception:
+        log.error("subscribe-bind bad request: %s", request.data)
+        return ("bad request", 400)
+
+    from bot import set_premium, set_subscription_record
+    try:
+        token = paypal_access_token()
+        sub = paypal_get_subscription(sub_id, token=token)
+        status = sub.get("status")
+        payer_id = (sub.get("subscriber") or {}).get("payer_id")
+        plan_id = sub.get("plan_id")
+        set_subscription_record(sub_id, uid, status, payer_id, plan_id)
+        log.info("subscribe-bind OK: sub_id=%s uid=%s status=%s plan=%s", sub_id, uid, status, plan_id)
+        if status == "ACTIVE":
+            set_premium(uid, True)
+        return {"ok": True, "status": status}, 200
+    except Exception as e:
+        log.error("subscribe-bind error: %s\n%s", e, traceback.format_exc())
+        return ("error", 500)
+
+@app.post("/paypal/webhook")
+def paypal_webhook():
+    raw = request.get_data()
+    try:
+        if not paypal_verify_webhook(request.headers, raw):
+            log.warning("PayPal webhook verification FAILED")
+            return "not verified", 400
+        event = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        log.error("webhook parse/verify error: %s\n%s", e, traceback.format_exc())
+        return "bad request", 400
+
+    et = event.get("event_type", "")
+    res = event.get("resource", {})
+    sub_id = res.get("id") or res.get("billing_agreement_id")
+    status = res.get("status") or ""
+    payer_id = (res.get("subscriber") or {}).get("payer_id") or (res.get("payer", {}) or {}).get("payer_info", {}).get("payer_id")
+    plan_id = res.get("plan_id")
+
+    from bot import get_db_conn, set_premium, set_subscription_record
+    conn = get_db_conn()
+
+    try:
+        # Update/insert subscription record
+        row = conn.execute("SELECT user_id FROM subscriptions WHERE subscription_id=?", (sub_id,)).fetchone()
+        uid = row[0] if row else None
+        set_subscription_record(sub_id, uid, status, payer_id, plan_id)
+        log.info("webhook %s: sub=%s status=%s uid=%s plan=%s", et, sub_id, status, uid, plan_id)
+
+        # Apply premium changes
+        if et in ("BILLING.SUBSCRIPTION.ACTIVATED", "PAYMENT.SALE.COMPLETED", "BILLING.SUBSCRIPTION.RE-ACTIVATED"):
+            if uid: set_premium(uid, True)
+        elif et in ("BILLING.SUBSCRIPTION.CANCELLED", "BILLING.SUBSCRIPTION.EXPIRED", "BILLING.SUBSCRIPTION.SUSPENDED"):
+            if uid: set_premium(uid, False)
+    except Exception as e:
+        log.error("webhook processing error: %s\n%s", e, traceback.format_exc())
+
+    return "ok", 200
+
 # ======== RUN LOOPS ========
 def run_flask():
     log.info("Starting Flask on %s:%s", HOST, PORT)
@@ -212,6 +336,7 @@ if __name__ == "__main__":
         def _worker():
             while True:
                 try:
+                    from __main__ import run_alert_tick
                     n = run_alert_tick()
                     log.info("Alert worker tick: triggered=%d", n)
                 except Exception as e:
