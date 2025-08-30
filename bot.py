@@ -10,9 +10,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN or ":" not in BOT_TOKEN:
     raise RuntimeError("Missing or invalid BOT_TOKEN env var")
 
-# Public subscribe page (live ή sandbox)
 PAYPAL_SUBSCRIBE_PAGE = os.getenv("PAYPAL_SUBSCRIBE_PAGE", "https://crypto-alerts-bot-k8i7.onrender.com/subscribe.html")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # your Telegram user id (admin)
 
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
 
@@ -20,8 +20,8 @@ logging.basicConfig(level=logging.INFO)
 
 # ================== CACHE / RETRIES ==================
 PRICE_CACHE = {}            # cg_id -> (price_float, timestamp)
-CACHE_TTL = 60.0            # fresh cache window (seconds)
-STALE_TTL = 300.0           # allow stale (seconds)
+CACHE_TTL = 60.0            # fresh cache
+STALE_TTL = 300.0           # stale up to 5 minutes
 RETRY_MAX = 3
 RETRY_SLEEP = 0.35
 _LAST_CALLS = deque(maxlen=12)
@@ -37,11 +37,22 @@ def _sleep_jitter(base):
 
 # ================== SYMBOL MAP & NORMALIZE ==================
 SYMBOL_TO_ID = {
-    "btc":"bitcoin","eth":"ethereum","sol":"solana","bnb":"binancecoin",
-    "xrp":"ripple","ada":"cardano","doge":"dogecoin","matic":"polygon",
-    "trx":"tron","avax":"avalanche-2","dot":"polkadot","ltc":"litecoin",
-    "usdt":"tether","usdc":"usd-coin","dai":"dai",
+    # L1 / Majors
+    "btc":"bitcoin","eth":"ethereum","sol":"solana","bnb":"binancecoin","xrp":"ripple",
+    "ada":"cardano","doge":"dogecoin","matic":"polygon","trx":"tron","avax":"avalanche-2",
+    "dot":"polkadot","ltc":"litecoin","atom":"cosmos","link":"chainlink","xlm":"stellar",
+    "etc":"ethereum-classic","cro":"cronos","near":"near","xtz":"tezos","algo":"algorand",
+    "icp":"internet-computer","hbar":"hedera","apt":"aptos","op":"optimism","arb":"arbitrum",
+    "fil":"filecoin","egld":"elrond-erd-2","vet":"vechain","kas":"kaspa","ton":"the-open-network",
+    "sei":"sei-network","tia":"celestia","inj":"injective","sui":"sui","mina":"mina-protocol",
+    "grt":"the-graph","axs":"axie-infinity","sand":"the-sandbox","mana":"decentraland",
+    "ape":"apecoin","ftm":"fantom","rose":"oasis-network","rune":"thorchain","qnt":"quant-network",
+    "aave":"aave","uni":"uniswap","cake":"pancakeswap-token","gmt":"stepn","pepe":"pepe",
+    "bonk":"bonk","shib":"shiba-inu",
+    # Stables
+    "usdt":"tether","usdc":"usd-coin","dai":"dai","tusd":"true-usd"
 }
+
 GREEK_TO_LATIN = str.maketrans({
     "Α":"A","Β":"B","Ε":"E","Ζ":"Z","Η":"H","Ι":"I","Κ":"K","Μ":"M","Ν":"N","Ο":"O","Ρ":"P","Τ":"T","Υ":"Y","Χ":"X",
     "α":"a","β":"b","ε":"e","ζ":"z","η":"h","ι":"i","κ":"k","μ":"m","ν":"n","ο":"o","ρ":"p","τ":"t","υ":"y","χ":"x",
@@ -51,7 +62,7 @@ def normalize_symbol(s: str) -> str:
     s = re.sub(r"[^0-9A-Za-z\-]", "", s)
     return s.lower()
 
-# ================== DB (users μόνο για τώρα) ==================
+# ================== DB (users + alerts) ==================
 def db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("""CREATE TABLE IF NOT EXISTS users(
@@ -59,16 +70,39 @@ def db():
         premium_active INTEGER DEFAULT 0,
         premium_until TEXT
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS alerts(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        symbol TEXT NOT NULL,
+        op TEXT NOT NULL,            -- '>' or '<'
+        threshold REAL NOT NULL,
+        active INTEGER DEFAULT 1,
+        created_at REAL
+    )""")
     conn.commit()
     return conn
 CONN = db()
 
-# ================== PROVIDERS (με retries) ==================
+def is_premium(user_id: int) -> bool:
+    row = CONN.execute("SELECT premium_active FROM users WHERE user_id=?", (user_id,)).fetchone()
+    return bool(row and row[0])
+
+def ensure_user(user_id: int):
+    CONN.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
+    CONN.commit()
+
+# ================== PROVIDERS ==================
 def binance_price_for_symbol(symbol_or_id: str):
     sym = symbol_or_id.upper()
     cg_map = {
         "bitcoin":"BTC","ethereum":"ETH","solana":"SOL","ripple":"XRP","cardano":"ADA",
-        "dogecoin":"DOGE","polygon":"MATIC","tron":"TRX","avalanche-2":"AVAX","polkadot":"DOT","litecoin":"LTC"
+        "dogecoin":"DOGE","polygon":"MATIC","tron":"TRX","avalanche-2":"AVAX","polkadot":"DOT",
+        "litecoin":"LTC","internet-computer":"ICP","chainlink":"LINK","cosmos":"ATOM","stellar":"XLM",
+        "algorand":"ALGO","hedera":"HBAR","aptos":"APT","optimism":"OP","arbitrum":"ARB",
+        "filecoin":"FIL","vechain":"VET","quant-network":"QNT","uniswap":"UNI","aave":"AAVE",
+        "injective":"INJ","fantom":"FTM","oasis-network":"ROSE","mina-protocol":"MINA","sui":"SUI",
+        "the-graph":"GRT","axie-infinity":"AXS","the-sandbox":"SAND","decentraland":"MANA",
+        "apecoin":"APE","stepn":"GMT","the-open-network":"TON","kaspa":"KAS","elrond-erd-2":"EGLD",
     }
     if sym not in cg_map.values():
         sym = cg_map.get(symbol_or_id.lower(), sym)
@@ -141,7 +175,7 @@ def cryptocompare_price(symbol_or_id: str):
         _sleep_jitter(RETRY_SLEEP)
     return None
 
-# ================== RESOLVER (4 πάροχοι + cache + stale) ==================
+# ================== PRICE RESOLVER ==================
 def resolve_price_usd(symbol: str):
     cg_id = SYMBOL_TO_ID.get(symbol.lower(), symbol.lower())
     now = time.time()
@@ -151,157 +185,139 @@ def resolve_price_usd(symbol: str):
 
     p = binance_price_for_symbol(symbol)
     if p is not None:
-        PRICE_CACHE[cg_id] = (p, now)
-        return p
+        PRICE_CACHE[cg_id] = (p, now); return p
 
     data = cg_simple_price(cg_id)
     if cg_id in data and "usd" in data[cg_id]:
         p = float(data[cg_id]["usd"])
-        PRICE_CACHE[cg_id] = (p, now)
-        return p
+        PRICE_CACHE[cg_id] = (p, now); return p
 
     p3 = coincap_price(cg_id)
     if p3 is not None:
-        PRICE_CACHE[cg_id] = (p3, now)
-        return p3
+        PRICE_CACHE[cg_id] = (p3, now); return p3
 
     p4 = cryptocompare_price(symbol)
     if p4 is not None:
-        PRICE_CACHE[cg_id] = (p4, now)
-        return p4
+        PRICE_CACHE[cg_id] = (p4, now); return p4
 
     if cached and now - cached[1] <= STALE_TTL:
         return cached[0]
     return None
 
-# ================== UI ELEMENTS ==================
+# ================== UI TEXTS ==================
 WELCOME_TEXT = (
     "🪙 **Crypto Alerts Bot**\n"
-    "_Fast prices • Diagnostics • (Upcoming) Alerts_\n\n"
+    "_Fast prices • Diagnostics • Alerts_\n\n"
     "### 🚀 Getting Started\n"
     "• **/price BTC** — current price in USD (e.g., `/price ETH`).\n"
-    "• **/diagprice BTC** — provider diagnostics & cache info.\n"
-    "• **/help** — full instructions & tips.\n\n"
-    "💎 Upgrade to support development & unlock upcoming premium features."
+    "• **/setalert BTC > 70000** — alert when condition is met.\n"
+    "• **/myalerts** — list your active alerts.\n"
+    "• **/help** — full instructions.\n\n"
+    "💎 Upgrade with PayPal for premium: unlimited alerts & tighter intervals."
 )
 
 HELP_TEXT = (
     "📘 **Crypto Alerts Bot — Help**\n\n"
     "### 🔧 Commands\n"
-    "• **/price `<SYMBOL>`** — Get current price in USD.\n"
-    "  _Examples:_ ` /price BTC`, ` /price eth`, ` /price sol`\n"
-    "• **/diagprice `<SYMBOL>`** — See diagnostic info per provider (Binance, CoinGecko, CoinCap, CryptoCompare) and cache status.\n"
-    "• **/help** — Show this help.\n\n"
+    "• **/price `<SYMBOL>`** — Current price in USD.  _Examples:_ `/price BTC`, `/price eth`, `/price sol`\n"
+    "• **/diagprice `<SYMBOL>`** — Diagnostics (providers & cache).\n"
+    "• **/setalert `<SYMBOL>` `< > | < >` `<PRICE>`** — Create a one-shot alert.\n"
+    "  _Examples:_ `/setalert BTC > 70000`, `/setalert ETH < 2300`\n"
+    "• **/myalerts** — Show your active alerts (IDs included).\n"
+    "• **/delalert `<ID>`** — Delete one alert.\n"
+    "• **/clearalerts** — Delete all active alerts.\n"
+    "• **/premium** — Check your plan & limits.\n"
+    "• **/help** — This help screen.\n\n"
+    "### ⏰ Alerts — How they work\n"
+    "• Alerts are **one-shot**: once triggered, they deactivate and you get notified.\n"
+    "• Free users: **up to 3** active alerts.  Premium: **unlimited**.\n"
+    "• Check cadence: ~1 min via `/cron` (external scheduler) to keep it always-on.\n"
+    "• If live quotes are down, cached values (≤5 min) may be used as fallback.\n\n"
     "### 🧠 Tips\n"
-    "• Symbols are case-insensitive: `btc`, `ETH`, `Sol` all work.\n"
-    "• If you see **(stale)**, live quotes were temporarily unavailable; I showed the last known price (≤ 5 min old).\n"
-    "• Supported majors (for now): BTC, ETH, SOL, BNB, XRP, ADA, DOGE, MATIC, TRX, AVAX, DOT, LTC, USDT, USDC, DAI.\n\n"
-    "### ⏰ Alerts (Overview)\n"
-    "You’ll be able to set alerts like:\n"
-    "• **Above price** — _Notify me when_ `BTC` **> 70,000 USD**\n"
-    "• **Below price** — _Notify me when_ `ETH` **< 2,300 USD**\n"
-    "• **Percent moves** — _Notify me if_ `SOL` **±5%** in 1h\n\n"
-    "**How it will work (UI):**\n"
-    "• Command: `/setalert BTC > 70000`  or  `/setalert ETH < 2300`\n"
-    "• List alerts: `/myalerts`\n"
-    "• Remove: `/delalert <id>`  or  `/clearalerts`\n\n"
-    "🟣 *Premium plan* will include multi-coin alerts, tighter intervals, daily/weekly summaries.\n\n"
+    "• Symbols are case-insensitive. Supported majors: BTC, ETH, SOL, BNB, XRP, ADA, DOGE, MATIC, TRX, AVAX, DOT, LTC, ATOM, LINK, XLM, etc.\n"
+    "• If you see **(stale)**, a fresh quote wasn’t available momentarily.\n\n"
     "### 🔐 Premium\n"
-    "Tap **Upgrade with PayPal** to support development & unlock upcoming premium features.\n"
-    "If you need help, just reply here with your question."
+    "Tap **Upgrade with PayPal** to support development & unlock unlimited alerts.\n"
 )
 
 def help_keyboard(uid: int):
-    # Inline buttons: Upgrade + Quick links
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💎 Upgrade with PayPal", url=f"{PAYPAL_SUBSCRIBE_PAGE}?uid={uid}")],
-        [
-            InlineKeyboardButton("ℹ️ Help", callback_data="noop_help"),
-            InlineKeyboardButton("🧪 Diagnostics", callback_data="noop_diag")
-        ]
     ])
 
 def quick_reply_keyboard():
-    # Optional: Reply keyboard with shortcuts (user can hide it)
     rows = [
         [KeyboardButton("/price BTC"), KeyboardButton("/price ETH")],
-        [KeyboardButton("/diagprice BTC"), KeyboardButton("/help")],
+        [KeyboardButton("/setalert BTC > 70000"), KeyboardButton("/myalerts")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, selective=True)
 
 # ================== HANDLERS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    ensure_user(uid)
+    await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=help_keyboard(uid))
     try:
-        CONN.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
-        CONN.commit()
-    except Exception:
-        pass
-    await update.message.reply_text(
-        WELCOME_TEXT,
-        parse_mode="Markdown",
-        reply_markup=help_keyboard(uid)
-    )
-    # Προαιρετικά δώσε και quick reply keyboard με βασικά commands
-    try:
-        await update.message.reply_text(
-            "⌨️ Quick actions:",
-            reply_markup=quick_reply_keyboard()
-        )
+        await update.message.reply_text("⌨️ Quick actions:", reply_markup=quick_reply_keyboard())
     except Exception:
         pass
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    ensure_user(uid)
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=help_keyboard(uid))
+
+async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ensure_user(uid)
+    status = "🌟 **Premium** (unlimited alerts)" if is_premium(uid) else "🆓 **Free** (up to 3 active alerts)"
     await update.message.reply_text(
-        HELP_TEXT,
+        f"{status}\nUpgrade here: {PAYPAL_SUBSCRIBE_PAGE}",
         parse_mode="Markdown",
         reply_markup=help_keyboard(uid)
     )
 
+# --- Admin-only: /setpremium <user_id> <0|1>
+async def setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Not authorized."); return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /setpremium <user_id> <0|1>"); return
+    try:
+        uid = int(context.args[0]); val = int(context.args[1])
+        ensure_user(uid)
+        CONN.execute("UPDATE users SET premium_active=? WHERE user_id=?", (1 if val else 0, uid))
+        CONN.commit()
+        await update.message.reply_text(f"Premium for {uid}: {bool(val)}")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: `/price BTC`", parse_mode="Markdown")
-        return
+        await update.message.reply_text("Usage: `/price BTC`", parse_mode="Markdown"); return
     coin = normalize_symbol(context.args[0])
     cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
-
     p = resolve_price_usd(coin)
     if p is None:
-        await update.message.reply_text("❌ Coin not found or API unavailable. Please try again shortly.")
-        return
-
+        await update.message.reply_text("❌ Coin not found or API unavailable. Please try again."); return
     ts = PRICE_CACHE.get(cg_id, (None, 0))[1]
     age = time.time() - ts
     suffix = " *(stale)*" if age > CACHE_TTL else ""
-    await update.message.reply_text(
-        f"💰 **{coin.upper()}** price: **${p:.6f}**{suffix}",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(f"💰 **{coin.upper()}** price: **${p:.6f}**{suffix}", parse_mode="Markdown")
 
 async def diagprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: `/diagprice ETH`", parse_mode="Markdown")
-        return
+        await update.message.reply_text("Usage: `/diagprice ETH`", parse_mode="Markdown"); return
     coin = normalize_symbol(context.args[0])
     cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
-
-    # cache
     cached = PRICE_CACHE.get(cg_id)
     cache_line = "Cache: none"
     if cached:
-        age = int(time.time() - cached[1])
-        cache_line = f"Cache: {cached[0]} (age {age}s)"
-
-    # live providers
+        age = int(time.time() - cached[1]); cache_line = f"Cache: {cached[0]} (age {age}s)"
     b = binance_price_for_symbol(coin)
-    cg = cg_simple_price(cg_id)
-    cg_price = None
-    if cg and cg_id in cg and "usd" in cg[cg_id]:
-        cg_price = cg[cg_id]["usd"]
-    cc = coincap_price(cg_id)
-    ccx = cryptocompare_price(coin)
-
+    cg = cg_simple_price(cg_id); cg_price = None
+    if cg and cg_id in cg and "usd" in cg[cg_id]: cg_price = cg[cg_id]["usd"]
+    cc = coincap_price(cg_id); ccx = cryptocompare_price(coin)
     text = (
         "🔎 **Diagnostic**\n"
         f"Coin: **{coin.upper()}**  *(cg_id: {cg_id})*\n"
@@ -310,16 +326,91 @@ async def diagprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• CoinGecko: {cg_price}\n"
         f"• CoinCap: {cc}\n"
         f"• CryptoCompare: {ccx}\n"
-        "\nTip: If all live providers fail intermittently, you’ll still see a **stale** value for up to 5 minutes."
+        "\nTip: If all live providers fail intermittently, stale cache covers ≤ 5 min."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# =============== (Optional) Standalone run ===============
+# ---------- Alerts Commands ----------
+ALERT_USAGE = "Usage: `/setalert BTC > 70000`  or  `/setalert ETH < 2300`"
+
+def parse_setalert(args):
+    if len(args) < 3: return None
+    sym = normalize_symbol(args[0])
+    op = args[1]
+    if op not in (">","<"): return None
+    try:
+        thr = float(args[2].replace(",",""))
+    except Exception:
+        return None
+    return (sym, op, thr)
+
+async def setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ensure_user(uid)
+    if len(context.args) < 3:
+        await update.message.reply_text(ALERT_USAGE, parse_mode="Markdown"); return
+    parsed = parse_setalert(context.args)
+    if not parsed:
+        await update.message.reply_text(ALERT_USAGE, parse_mode="Markdown"); return
+    sym, op, thr = parsed
+    if sym.lower() not in SYMBOL_TO_ID:
+        await update.message.reply_text("❌ Unknown symbol. Try majors like BTC/ETH/SOL…"); return
+
+    # enforce limits: free 3 active alerts, premium unlimited
+    if not is_premium(uid):
+        cnt = CONN.execute("SELECT COUNT(*) FROM alerts WHERE user_id=? AND active=1", (uid,)).fetchone()[0]
+        if cnt >= 3:
+            await update.message.reply_text(
+                "Free plan limit reached (3 active alerts). Upgrade for unlimited alerts.",
+                reply_markup=help_keyboard(uid)
+            ); return
+
+    CONN.execute(
+        "INSERT INTO alerts(user_id,symbol,op,threshold,active,created_at) VALUES(?,?,?,?,1,?)",
+        (uid, sym.lower(), op, thr, time.time())
+    )
+    CONN.commit()
+    await update.message.reply_text(f"✅ Alert saved: `{sym.upper()} {op} {thr}`", parse_mode="Markdown")
+
+async def myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ensure_user(uid)
+    rows = CONN.execute(
+        "SELECT id,symbol,op,threshold,active FROM alerts WHERE user_id=? AND active=1 ORDER BY id DESC",
+        (uid,)
+    ).fetchall()
+    if not rows:
+        await update.message.reply_text("You have no active alerts. Create one with:\n`/setalert BTC > 70000`", parse_mode="Markdown"); return
+    lines = [f"🔔 **Your Alerts**"]
+    for (aid,s,op,thr,act) in rows:
+        lines.append(f"• `{aid}` — **{s.upper()} {op} {thr}**")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ensure_user(uid)
+    if not context.args:
+        await update.message.reply_text("Usage: `/delalert <ID>`", parse_mode="Markdown"); return
+    try:
+        aid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Usage: `/delalert <ID>`", parse_mode="Markdown"); return
+    cur = CONN.execute("UPDATE alerts SET active=0 WHERE id=? AND user_id=?", (aid, uid))
+    CONN.commit()
+    if cur.rowcount:
+        await update.message.reply_text(f"🗑️ Deleted alert `{aid}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Alert not found.", parse_mode="Markdown")
+
+async def clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ensure_user(uid)
+    cur = CONN.execute("UPDATE alerts SET active=0 WHERE user_id=? AND active=1", (uid,))
+    CONN.commit()
+    await update.message.reply_text(f"🧹 Cleared {cur.rowcount} alert(s).")
+
+# =============== (Optional) Standalone polling runner ===============
 def run_bot():
-    """
-    Αν το τρέχεις μόνο του σε polling mode (π.χ. τοπικά).
-    Στο Render με webhook, το server_combined.py κάνει import τους handlers.
-    """
     from telegram.ext import Application
     async def _post_init(application):
         try:
@@ -327,19 +418,31 @@ def run_bot():
         except Exception as e:
             logging.warning("delete_webhook failed %s", e)
 
-    app = (
-        Application
-        .builder()
-        .token(BOT_TOKEN)
-        .post_init(_post_init)
-        .build()
-    )
+    app = (Application.builder().token(BOT_TOKEN).post_init(_post_init).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("premium", premium_cmd))
+    app.add_handler(CommandHandler("setpremium", setpremium))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("diagprice", diagprice))
+    app.add_handler(CommandHandler("setalert", setalert))
+    app.add_handler(CommandHandler("myalerts", myalerts))
+    app.add_handler(CommandHandler("delalert", delalert))
+    app.add_handler(CommandHandler("clearalerts", clearalerts))
     logging.info("🤖 Bot running (polling)…")
     app.run_polling(drop_pending_updates=True)
+
+# Helpers for server_combined
+def get_db_conn():
+    return CONN
+
+__all__ = [
+    "start","help_cmd","premium_cmd","setpremium",
+    "price","diagprice",
+    "setalert","myalerts","delalert","clearalerts",
+    "resolve_price_usd","normalize_symbol","SYMBOL_TO_ID",
+    "get_db_conn","is_premium","ensure_user"
+]
 
 if __name__ == "__main__":
     run_bot()
