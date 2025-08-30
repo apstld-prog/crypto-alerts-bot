@@ -11,7 +11,7 @@ if not BOT_TOKEN or ":" not in BOT_TOKEN:
     raise RuntimeError("Missing or invalid BOT_TOKEN env var")
 
 PAYPAL_SUBSCRIBE_PAGE = os.getenv("PAYPAL_SUBSCRIBE_PAGE", "https://crypto-alerts-bot-k8i7.onrender.com/subscribe.html")
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+DB_PATH = os.getenv("DB_PATH", "bot.db")  # stays local file (no Render Disk required)
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
@@ -213,13 +213,9 @@ HELP_TEXT = (
     "• **/price `<SYMBOL>`**, **/diagprice `<SYMBOL>`**\n"
     "• **/setalert `<SYMBOL>` `< > | < >` `<PRICE>`**, **/myalerts**, **/delalert `<ID>`**, **/clearalerts**\n"
     "• **/premium** — Check your plan & upgrade.\n"
-    "• **/stats** — (admin) Bot statistics.\n"
-    "• **/subs** — (admin) Recent subscriptions.\n"
-    "• **/bindsub `<SUB_ID>` `<USER_ID>`** — (admin) bind subscription to user.\n"
-    "• **/syncsub `<SUB_ID>`** — (admin) fetch status from PayPal and update premium.\n"
-    "• **/whoami** — shows your numeric Telegram user id.\n\n"
+    "• **/stats**, **/subs**, **/whoami**, **/bindsub**, **/syncsub** — admin/diagnostics.\n\n"
     "### ⏰ Alerts\n"
-    "• One-shot, Free=3, Premium=unlimited. Checks ~1min via /cron.\n"
+    "• One-shot, Free=3, Premium=unlimited. Checks ~1 min via /cron.\n"
 )
 
 def help_keyboard(uid: int):
@@ -247,25 +243,7 @@ async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = "🌟 **Premium** (unlimited alerts)" if is_premium(uid) else "🆓 **Free** (up to 3 active alerts)"
     await update.message.reply_text(f"{status}\nUpgrade here: {PAYPAL_SUBSCRIBE_PAGE}", parse_mode="Markdown", reply_markup=help_keyboard(uid))
 
-async def setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("Not authorized."); return
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /setpremium <user_id> <0|1>"); return
-    try:
-        uid = int(context.args[0]); val = int(context.args[1]); set_premium(uid, bool(val))
-        await update.message.reply_text(f"Premium for {uid}: {bool(val)}")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-async def setpremiumme(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("Not authorized."); return
-    if not context.args or context.args[0] not in ("0","1"):
-        await update.message.reply_text("Usage: /setpremiumme <0|1>"); return
-    set_premium(update.effective_user.id, context.args[0] == "1")
-    await update.message.reply_text(f"Your premium set to {context.args[0]=='1'}.")
-
+# --- Admin / Diagnostics ---
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Your Telegram user id: {update.effective_user.id}")
 
@@ -289,12 +267,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("Not authorized."); return
-    rows = CONN.execute("SELECT subscription_id,user_id,status,plan_id,last_event FROM subscriptions ORDER BY last_event DESC LIMIT 10").fetchall()
+    rows = CONN.execute("SELECT subscription_id,user_id,status,plan_id,last_event FROM subscriptions ORDER BY last_event DESC LIMIT 15").fetchall()
     if not rows:
         await update.message.reply_text("No subscriptions in DB."); return
     lines = ["🧾 **Recent subscriptions**"]
     for (sid, uid, st, plan, ts) in rows:
-        lines.append(f"• {sid} | user={uid} | {st} | plan={plan} | ts={int(ts)}")
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        lines.append(f"• {sid} | user={uid} | {st} | plan={plan} | {when}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def bindsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -312,21 +291,17 @@ async def syncsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 1:
         await update.message.reply_text("Usage: /syncsub <SUB_ID>"); return
     sub_id = context.args[0]
-    # ask server (server_combined has live helpers) via PayPal API? Not from bot (no secrets here)
-    # Here we only flip premium based on last known status
     row = CONN.execute("SELECT user_id,status FROM subscriptions WHERE subscription_id=?", (sub_id,)).fetchone()
     if not row:
         await update.message.reply_text("Unknown subscription id in DB. Use /bindsub first."); return
     uid, status = row
-    if not uid:
-        await update.message.reply_text("Subscription has no user bound. Use /bindsub."); return
-    # heuristic: mark premium if ACTIVE
-    if status == "ACTIVE":
+    if status == "ACTIVE" and uid:
         set_premium(uid, True)
         await update.message.reply_text(f"User {uid} set to Premium (status ACTIVE).")
     else:
-        await update.message.reply_text(f"Subscription status is {status}. Waiting for webhook or bind+ACTIVE.")
+        await update.message.reply_text(f"Sub {sub_id}: user={uid}, status={status}. If you paid, check subscribe-bind & webhook.")
 
+# ---------- Prices ----------
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: await update.message.reply_text("Usage: `/price BTC`", parse_mode="Markdown"); return
     coin = normalize_symbol(context.args[0]); cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
@@ -348,7 +323,7 @@ async def diagprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{cache_line}\n• Binance: {b}\n• CoinGecko: {cg_price}\n• CoinCap: {cc}\n• CryptoCompare: {ccx}\n")
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# ---------- Alerts ----------
+# ---------- Alerts (Premium enforced) ----------
 ALERT_USAGE = "Usage: `/setalert BTC > 70000`  or  `/setalert ETH < 2300`"
 def parse_setalert(args):
     if len(args) < 3: return None
@@ -365,10 +340,13 @@ async def setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not parsed: await update.message.reply_text(ALERT_USAGE, parse_mode="Markdown"); return
     sym, op, thr = parsed
     if sym.lower() not in SYMBOL_TO_ID: await update.message.reply_text("❌ Unknown symbol. Try BTC/ETH/SOL…"); return
+
+    # Enforce free limit = 3
     if not is_premium(uid):
         cnt = CONN.execute("SELECT COUNT(*) FROM alerts WHERE user_id=? AND active=1", (uid,)).fetchone()[0]
         if cnt >= 3:
             await update.message.reply_text("Free plan limit reached (3 alerts). Upgrade for unlimited alerts.", reply_markup=help_keyboard(uid)); return
+
     CONN.execute("INSERT INTO alerts(user_id,symbol,op,threshold,active,created_at) VALUES(?,?,?,?,1,?)",
                  (uid, sym.lower(), op, thr, time.time()))
     CONN.commit()
@@ -404,8 +382,6 @@ def run_bot():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("premium", premium_cmd))
-    app.add_handler(CommandHandler("setpremium", setpremium))
-    app.add_handler(CommandHandler("setpremiumme", setpremiumme))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("subs", subs))
@@ -423,7 +399,7 @@ def run_bot():
 def get_db_conn(): return CONN
 
 __all__ = [
-    "start","help_cmd","premium_cmd","setpremium","setpremiumme","whoami","stats","subs","bindsub","syncsub",
+    "start","help_cmd","premium_cmd","whoami","stats","subs","bindsub","syncsub",
     "price","diagprice","setalert","myalerts","delalert","clearalerts",
     "resolve_price_usd","normalize_symbol","SYMBOL_TO_ID",
     "get_db_conn","is_premium","ensure_user","set_premium","set_subscription_record"
