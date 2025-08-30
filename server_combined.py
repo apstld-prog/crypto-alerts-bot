@@ -11,9 +11,9 @@ BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
 PUBLIC_URL  = os.getenv("PUBLIC_URL", "")
 HOST        = os.getenv("HOST", "0.0.0.0")
 PORT        = int(os.getenv("PORT", "8000"))
-ALERT_INTERVAL_SEC = int(os.getenv("ALERT_INTERVAL_SEC", "0"))
+ALERT_INTERVAL_SEC = int(os.getenv("ALERT_INTERVAL_SEC", "60"))  # default 60s to keep it warm
 
-# PayPal LIVE (because you pay live)
+# PayPal LIVE
 PAYPAL_MODE = os.getenv("PAYPAL_MODE", "live").lower()
 PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID", "")
 PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET", "")
@@ -25,7 +25,6 @@ if not (PUBLIC_URL.startswith("http://") or PUBLIC_URL.startswith("https://")):
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("server")
-
 API_BASE = "https://api-m.paypal.com" if PAYPAL_MODE == "live" else "https://api-m.sandbox.paypal.com"
 
 # ======== FLASK ========
@@ -60,7 +59,8 @@ def subscribe_live():
 from bot import (
     start as start_cmd, help_cmd, premium_cmd, whoami, stats, subs, bindsub, syncsub,
     price, diagprice, setalert, myalerts, delalert, clearalerts,
-    resolve_price_usd, get_db_conn, set_premium, set_subscription_record
+    resolve_price_usd, get_db_conn, set_premium, set_premium_until, set_subscription_record,
+    check_premium_expirations_now
 )
 
 application = Application.builder().token(BOT_TOKEN).build()
@@ -100,7 +100,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def catch_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Hi! Use /start to see the instructions.")
 
-# Bind
+# Bind handlers
 application.add_handler(CommandHandler("start", start_wrap))
 application.add_handler(CommandHandler("help", help_wrap))
 application.add_handler(CommandHandler("premium", premium_wrap))
@@ -206,7 +206,10 @@ def run_alert_tick():
 @app.get("/cron")
 def cron_tick():
     try:
+        # alerts
         n = run_alert_tick()
+        # expire premium if needed
+        check_premium_expirations_now()
         return f"cron OK, triggered={n}", 200
     except Exception as e:
         log.error("cron_tick error: %s\n%s", e, traceback.format_exc())
@@ -251,8 +254,8 @@ def paypal_verify_webhook(req_headers, body_bytes):
 @app.post("/paypal/subscribe-bind")
 def paypal_subscribe_bind():
     """
-    Called from subscribe.html onApprove to bind subscription_id to Telegram user id
-    and fetch initial status from PayPal. If ACTIVE -> set premium immediately.
+    Called from subscribe.html onApprove to bind subscription_id to Telegram user id.
+    If status is ACTIVE at fetch-time, we mark premium immediately.
     """
     try:
         data = request.get_json(force=True, silent=False)
@@ -262,7 +265,7 @@ def paypal_subscribe_bind():
         log.error("subscribe-bind bad request: %s", request.data)
         return ("bad request", 400)
 
-    from bot import set_premium, set_subscription_record
+    from bot import set_subscription_record
     try:
         token = paypal_access_token()
         sub = paypal_get_subscription(sub_id, token=token)
@@ -281,8 +284,11 @@ def paypal_subscribe_bind():
 @app.post("/paypal/webhook")
 def paypal_webhook():
     """
-    PayPal calls this for subscription lifecycle events.
-    We verify signature, update DB, and toggle premium accordingly.
+    Webhook για events συνδρομών.
+    - Επαληθεύει το signature
+    - Ενημερώνει subscriptions table
+    - Premium ON/OFF
+    - Grace period για CANCELLED μέχρι paid-through (next_billing_time ή last_payment+30d)
     """
     raw = request.get_data()
     try:
@@ -301,20 +307,51 @@ def paypal_webhook():
     payer_id = (res.get("subscriber") or {}).get("payer_id") or (res.get("payer", {}) or {}).get("payer_info", {}).get("payer_id")
     plan_id = res.get("plan_id")
 
-    from bot import get_db_conn, set_premium, set_subscription_record
+    from bot import get_db_conn, set_subscription_record
     conn = get_db_conn()
 
+    # Update DB & apply premium changes (with grace on CANCELLED)
     try:
         row = conn.execute("SELECT user_id FROM subscriptions WHERE subscription_id=?", (sub_id,)).fetchone()
         uid = row[0] if row else None
         set_subscription_record(sub_id, uid, status, payer_id, plan_id)
         log.info("webhook %s: sub=%s status=%s uid=%s plan=%s", et, sub_id, status, uid, plan_id)
 
-        # Apply premium changes
-        if et in ("BILLING.SUBSCRIPTION.ACTIVATED", "PAYMENT.SALE.COMPLETED", "BILLING.SUBSCRIPTION.RE-ACTIVATED"):
-            if uid: set_premium(uid, True)
-        elif et in ("BILLING.SUBSCRIPTION.CANCELLED", "BILLING.SUBSCRIPTION.EXPIRED", "BILLING.SUBSCRIPTION.SUSPENDED"):
-            if uid: set_premium(uid, False)
+        if uid:
+            if et in ("BILLING.SUBSCRIPTION.ACTIVATED", "PAYMENT.SALE.COMPLETED", "BILLING.SUBSCRIPTION.RE-ACTIVATED"):
+                set_premium(uid, True)
+
+            elif et in ("BILLING.SUBSCRIPTION.CANCELLED",):
+                # Try to compute paid-through
+                paid_through_ts = None
+                try:
+                    bi = res.get("billing_info") or {}
+                    # Prefer next_billing_time
+                    nbt = bi.get("next_billing_time")
+                    if nbt:
+                        from datetime import datetime, timezone
+                        nbt_dt = datetime.fromisoformat(nbt.replace("Z","+00:00"))
+                        paid_through_ts = int(nbt_dt.timestamp())
+                    else:
+                        # Fallback: last_payment.time + 30 days
+                        last_pay = (bi.get("last_payment") or {}).get("time")
+                        if last_pay:
+                            from datetime import datetime, timedelta, timezone
+                            dt = datetime.fromisoformat(last_pay.replace("Z","+00:00"))
+                            paid_through_ts = int((dt + timedelta(days=30)).timestamp())
+                except Exception as e:
+                    log.warning("failed to compute paid_through: %s", e)
+
+                if paid_through_ts:
+                    set_premium_until(uid, paid_through_ts)
+                    log.info("CANCELLED with grace: user %s premium until %s", uid, paid_through_ts)
+                else:
+                    set_premium(uid, False)
+                    log.info("CANCELLED without grace info: user %s downgraded now", uid)
+
+            elif et in ("BILLING.SUBSCRIPTION.EXPIRED", "BILLING.SUBSCRIPTION.SUSPENDED"):
+                set_premium(uid, False)
+
     except Exception as e:
         log.error("webhook processing error: %s\n%s", e, traceback.format_exc())
 
@@ -341,6 +378,8 @@ if __name__ == "__main__":
                 try:
                     from __main__ import run_alert_tick
                     n = run_alert_tick()
+                    # also expire premium if needed
+                    check_premium_expirations_now()
                     log.info("Alert worker tick: triggered=%d", n)
                 except Exception as e:
                     log.error("Alert worker error: %s\n%s", e, traceback.format_exc())
