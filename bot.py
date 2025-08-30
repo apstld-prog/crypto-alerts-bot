@@ -2,7 +2,7 @@
 import logging, os, sqlite3, re, time, random
 import requests
 from collections import deque
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ================== CONFIG ==================
@@ -10,19 +10,18 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN or ":" not in BOT_TOKEN:
     raise RuntimeError("Missing or invalid BOT_TOKEN env var")
 
-COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
+# Public subscribe page (live ή sandbox)
 PAYPAL_SUBSCRIBE_PAGE = os.getenv("PAYPAL_SUBSCRIBE_PAGE", "https://crypto-alerts-bot-k8i7.onrender.com/subscribe.html")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# Leader lock staleness (default 60s to survive Render autosuspend)
-LOCK_STALE_SEC = float(os.getenv("LOCK_STALE_SEC", "60"))
+COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
 
 logging.basicConfig(level=logging.INFO)
 
 # ================== CACHE / RETRIES ==================
-PRICE_CACHE = {}            # cg_id -> (price, ts)
-CACHE_TTL = 60.0            # fresh cache window
-STALE_TTL = 300.0           # allow stale up to 5 min
+PRICE_CACHE = {}            # cg_id -> (price_float, timestamp)
+CACHE_TTL = 60.0            # fresh cache window (seconds)
+STALE_TTL = 300.0           # allow stale (seconds)
 RETRY_MAX = 3
 RETRY_SLEEP = 0.35
 _LAST_CALLS = deque(maxlen=12)
@@ -52,7 +51,7 @@ def normalize_symbol(s: str) -> str:
     s = re.sub(r"[^0-9A-Za-z\-]", "", s)
     return s.lower()
 
-# ================== DB + LEADER LOCK ==================
+# ================== DB (users μόνο για τώρα) ==================
 def db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("""CREATE TABLE IF NOT EXISTS users(
@@ -60,57 +59,11 @@ def db():
         premium_active INTEGER DEFAULT 0,
         premium_until TEXT
     )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS leader(
-        lock INTEGER PRIMARY KEY CHECK(lock=1),
-        run_id TEXT,
-        ts REAL
-    )""")
     conn.commit()
     return conn
 CONN = db()
 
-RUN_ID = os.getenv("RENDER_INSTANCE_ID") or f"pid-{os.getpid()}"
-
-def acquire_leader_lock(max_stale: float) -> bool:
-    """
-    Become the single polling runner.
-    If an old lock exists but ts is older than max_stale, take over.
-    """
-    now = time.time()
-    try:
-        CONN.execute("INSERT INTO leader(lock, run_id, ts) VALUES(1, ?, ?)", (RUN_ID, now))
-        CONN.commit()
-        logging.info("Leader lock acquired by %s", RUN_ID)
-        return True
-    except sqlite3.IntegrityError:
-        row = CONN.execute("SELECT run_id, ts FROM leader WHERE lock=1").fetchone()
-        if not row:
-            return False
-        old_run, ts = row
-        age = now - float(ts or 0)
-        # same RUN_ID (rare on restarts): just take it
-        if old_run == RUN_ID:
-            CONN.execute("UPDATE leader SET ts=? WHERE lock=1", (now,))
-            CONN.commit()
-            logging.info("Leader lock refreshed by same RUN_ID=%s", RUN_ID)
-            return True
-        # stale owner? take over
-        if age > max_stale:
-            logging.warning("Leader lock stale (owner=%s, age=%.0fs). Taking over.", old_run, age)
-            CONN.execute("UPDATE leader SET run_id=?, ts=?", (RUN_ID, now))
-            CONN.commit()
-            return True
-        logging.info("Leader lock held by %s (age %.0fs). Not starting polling.", old_run, age)
-        return False
-
-def heartbeat_leader():
-    try:
-        CONN.execute("UPDATE leader SET ts=? WHERE lock=1 AND run_id=?", (time.time(), RUN_ID))
-        CONN.commit()
-    except Exception as e:
-        logging.warning("Leader heartbeat failed: %s", e)
-
-# ================== PROVIDERS ==================
+# ================== PROVIDERS (με retries) ==================
 def binance_price_for_symbol(symbol_or_id: str):
     sym = symbol_or_id.upper()
     cg_map = {
@@ -174,8 +127,11 @@ def cryptocompare_price(symbol_or_id: str):
     for _ in range(RETRY_MAX):
         _throttle()
         try:
-            r = requests.get("https://min-api.cryptocompare.com/data/price",
-                             params={"fsym": sym, "tsyms": "USD"}, timeout=8)
+            r = requests.get(
+                "https://min-api.cryptocompare.com/data/price",
+                params={"fsym": sym, "tsyms": "USD"},
+                timeout=8
+            )
             if r.status_code == 200:
                 data = r.json()
                 if "USD" in data:
@@ -185,12 +141,11 @@ def cryptocompare_price(symbol_or_id: str):
         _sleep_jitter(RETRY_SLEEP)
     return None
 
-# ================== RESOLVER ==================
+# ================== RESOLVER (4 πάροχοι + cache + stale) ==================
 def resolve_price_usd(symbol: str):
     cg_id = SYMBOL_TO_ID.get(symbol.lower(), symbol.lower())
-    cached = PRICE_CACHE.get(cg_id)
     now = time.time()
-
+    cached = PRICE_CACHE.get(cg_id)
     if cached and now - cached[1] <= CACHE_TTL:
         return cached[0]
 
@@ -219,21 +174,60 @@ def resolve_price_usd(symbol: str):
         return cached[0]
     return None
 
-# ================== HELP TEXT ==================
+# ================== UI ELEMENTS ==================
+WELCOME_TEXT = (
+    "🪙 **Crypto Alerts Bot**\n"
+    "_Fast prices • Diagnostics • (Upcoming) Alerts_\n\n"
+    "### 🚀 Getting Started\n"
+    "• **/price BTC** — current price in USD (e.g., `/price ETH`).\n"
+    "• **/diagprice BTC** — provider diagnostics & cache info.\n"
+    "• **/help** — full instructions & tips.\n\n"
+    "💎 Upgrade to support development & unlock upcoming premium features."
+)
+
 HELP_TEXT = (
-    "👋 *Welcome to Crypto Alerts Bot!*\n\n"
-    "Commands:\n"
-    "• `/price BTC` — current price (USD)\n"
-    "• `/diagprice BTC` — diagnostics & cache info\n"
-    "• `/help` — this help\n"
-    "• `/ping` — quick check the bot is alive\n\n"
-    "Tip: `(stale)` means last known price (≤5 min)."
+    "📘 **Crypto Alerts Bot — Help**\n\n"
+    "### 🔧 Commands\n"
+    "• **/price `<SYMBOL>`** — Get current price in USD.\n"
+    "  _Examples:_ ` /price BTC`, ` /price eth`, ` /price sol`\n"
+    "• **/diagprice `<SYMBOL>`** — See diagnostic info per provider (Binance, CoinGecko, CoinCap, CryptoCompare) and cache status.\n"
+    "• **/help** — Show this help.\n\n"
+    "### 🧠 Tips\n"
+    "• Symbols are case-insensitive: `btc`, `ETH`, `Sol` all work.\n"
+    "• If you see **(stale)**, live quotes were temporarily unavailable; I showed the last known price (≤ 5 min old).\n"
+    "• Supported majors (for now): BTC, ETH, SOL, BNB, XRP, ADA, DOGE, MATIC, TRX, AVAX, DOT, LTC, USDT, USDC, DAI.\n\n"
+    "### ⏰ Alerts (Overview)\n"
+    "You’ll be able to set alerts like:\n"
+    "• **Above price** — _Notify me when_ `BTC` **> 70,000 USD**\n"
+    "• **Below price** — _Notify me when_ `ETH` **< 2,300 USD**\n"
+    "• **Percent moves** — _Notify me if_ `SOL` **±5%** in 1h\n\n"
+    "**How it will work (UI):**\n"
+    "• Command: `/setalert BTC > 70000`  or  `/setalert ETH < 2300`\n"
+    "• List alerts: `/myalerts`\n"
+    "• Remove: `/delalert <id>`  or  `/clearalerts`\n\n"
+    "🟣 *Premium plan* will include multi-coin alerts, tighter intervals, daily/weekly summaries.\n\n"
+    "### 🔐 Premium\n"
+    "Tap **Upgrade with PayPal** to support development & unlock upcoming premium features.\n"
+    "If you need help, just reply here with your question."
 )
 
 def help_keyboard(uid: int):
+    # Inline buttons: Upgrade + Quick links
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Upgrade with PayPal", url=f"{PAYPAL_SUBSCRIBE_PAGE}?uid={uid}")],
+        [InlineKeyboardButton("💎 Upgrade with PayPal", url=f"{PAYPAL_SUBSCRIBE_PAGE}?uid={uid}")],
+        [
+            InlineKeyboardButton("ℹ️ Help", callback_data="noop_help"),
+            InlineKeyboardButton("🧪 Diagnostics", callback_data="noop_diag")
+        ]
     ])
+
+def quick_reply_keyboard():
+    # Optional: Reply keyboard with shortcuts (user can hide it)
+    rows = [
+        [KeyboardButton("/price BTC"), KeyboardButton("/price ETH")],
+        [KeyboardButton("/diagprice BTC"), KeyboardButton("/help")],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, selective=True)
 
 # ================== HANDLERS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,42 +237,63 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CONN.commit()
     except Exception:
         pass
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=help_keyboard(uid))
+    await update.message.reply_text(
+        WELCOME_TEXT,
+        parse_mode="Markdown",
+        reply_markup=help_keyboard(uid)
+    )
+    # Προαιρετικά δώσε και quick reply keyboard με βασικά commands
+    try:
+        await update.message.reply_text(
+            "⌨️ Quick actions:",
+            reply_markup=quick_reply_keyboard()
+        )
+    except Exception:
+        pass
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
-
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong ✅")
+    uid = update.effective_user.id
+    await update.message.reply_text(
+        HELP_TEXT,
+        parse_mode="Markdown",
+        reply_markup=help_keyboard(uid)
+    )
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /price BTC")
+        await update.message.reply_text("Usage: `/price BTC`", parse_mode="Markdown")
         return
     coin = normalize_symbol(context.args[0])
     cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
+
     p = resolve_price_usd(coin)
     if p is None:
-        await update.message.reply_text("❌ Coin not found or API unavailable.")
+        await update.message.reply_text("❌ Coin not found or API unavailable. Please try again shortly.")
         return
+
     ts = PRICE_CACHE.get(cg_id, (None, 0))[1]
     age = time.time() - ts
-    suffix = " (stale)" if age > CACHE_TTL else ""
-    await update.message.reply_text(f"💰 {coin.upper()} price: ${p}{suffix}")
+    suffix = " *(stale)*" if age > CACHE_TTL else ""
+    await update.message.reply_text(
+        f"💰 **{coin.upper()}** price: **${p:.6f}**{suffix}",
+        parse_mode="Markdown"
+    )
 
 async def diagprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /diagprice ETH")
+        await update.message.reply_text("Usage: `/diagprice ETH`", parse_mode="Markdown")
         return
     coin = normalize_symbol(context.args[0])
     cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
 
+    # cache
     cached = PRICE_CACHE.get(cg_id)
     cache_line = "Cache: none"
     if cached:
         age = int(time.time() - cached[1])
         cache_line = f"Cache: {cached[0]} (age {age}s)"
 
+    # live providers
     b = binance_price_for_symbol(coin)
     cg = cg_simple_price(cg_id)
     cg_price = None
@@ -288,29 +303,29 @@ async def diagprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ccx = cryptocompare_price(coin)
 
     text = (
-        "🔎 Diagnostic\n"
-        f"Coin: {coin} (cg_id: {cg_id})\n"
+        "🔎 **Diagnostic**\n"
+        f"Coin: **{coin.upper()}**  *(cg_id: {cg_id})*\n"
         f"{cache_line}\n"
-        f"Binance: {b}\n"
-        f"CoinGecko: {cg_price}\n"
-        f"CoinCap: {cc}\n"
-        f"CryptoCompare: {ccx}"
+        f"• Binance: {b}\n"
+        f"• CoinGecko: {cg_price}\n"
+        f"• CoinCap: {cc}\n"
+        f"• CryptoCompare: {ccx}\n"
+        "\nTip: If all live providers fail intermittently, you’ll still see a **stale** value for up to 5 minutes."
     )
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-# ================== BOOT ==================
+# =============== (Optional) Standalone run ===============
 def run_bot():
+    """
+    Αν το τρέχεις μόνο του σε polling mode (π.χ. τοπικά).
+    Στο Render με webhook, το server_combined.py κάνει import τους handlers.
+    """
+    from telegram.ext import Application
     async def _post_init(application):
         try:
-            # Force polling mode, clear any stale webhooks
             await application.bot.delete_webhook(drop_pending_updates=True)
         except Exception as e:
             logging.warning("delete_webhook failed %s", e)
-
-    # Acquire leader (with short staleness to recover after autosuspend)
-    if not acquire_leader_lock(LOCK_STALE_SEC):
-        logging.warning("Another instance holds the leader lock. Not starting polling.")
-        return
 
     app = (
         Application
@@ -321,20 +336,9 @@ def run_bot():
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("diagprice", diagprice))
-
-    logging.info("🤖 Bot running… (leader: %s, lock_stale=%ss)", RUN_ID, LOCK_STALE_SEC)
-
-    # Heartbeat lock
-    import threading
-    def _hb():
-        while True:
-            heartbeat_leader()
-            time.sleep(20)  # refresh often; autosuspend gaps will age out
-    threading.Thread(target=_hb, daemon=True).start()
-
+    logging.info("🤖 Bot running (polling)…")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
