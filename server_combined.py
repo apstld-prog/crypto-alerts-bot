@@ -148,7 +148,7 @@ async def tg_shutdown():
     except Exception as e:
         log.warning("Telegram shutdown error: %s", e)
 
-# Webhook endpoint: κάνουμε thread-safe dispatch στο PTB loop
+# Webhook endpoint: ΚΑΜΙΑ αναμονή (non-blocking), απλά dispatch μέσα στο PTB loop
 @app.post(WEBHOOK_PATH)
 def telegram_webhook():
     try:
@@ -162,13 +162,22 @@ def telegram_webhook():
 
     try:
         update = Update.de_json(data, application.bot)
-        # !!! ΣΗΜΑΝΤΙΚΟ: Εκτελούμε process_update πάνω στο σωστό asyncio loop
+        # non-blocking dispatch πάνω στο σωστό asyncio loop
         fut = asyncio.run_coroutine_threadsafe(application.process_update(update), TG_LOOP)
-        fut.result(timeout=5)  # optional: περιμένουμε λίγο για exceptions
+
+        # optional: log τυχόν exceptions ασύγχρονα
+        def _done_cb(f):
+            try:
+                f.result()
+            except Exception as e:
+                log.exception("process_update error: %s", e)
+        fut.add_done_callback(_done_cb)
+
     except Exception as e:
-        log.exception("Failed to process update: %s", e)
+        log.exception("Failed to enqueue/process update: %s", e)
         return "error", 500
 
+    # ΕΠΙΣΤΡΕΦΟΥΜΕ 200 ΑΜΕΣΩΣ, ώστε το Telegram να μην κάνει retry
     return "ok", 200
 
 # ============== RUN LOOPS ==============
