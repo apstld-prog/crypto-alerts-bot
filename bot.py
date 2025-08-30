@@ -12,16 +12,15 @@ if not BOT_TOKEN or ":" not in BOT_TOKEN:
 
 PAYPAL_SUBSCRIBE_PAGE = os.getenv("PAYPAL_SUBSCRIBE_PAGE", "https://crypto-alerts-bot-k8i7.onrender.com/subscribe.html")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # your Telegram user id (admin)
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
-
 logging.basicConfig(level=logging.INFO)
 
 # ================== CACHE / RETRIES ==================
-PRICE_CACHE = {}            # cg_id -> (price_float, timestamp)
-CACHE_TTL = 60.0            # fresh cache
-STALE_TTL = 300.0           # stale up to 5 minutes
+PRICE_CACHE = {}
+CACHE_TTL = 60.0
+STALE_TTL = 300.0
 RETRY_MAX = 3
 RETRY_SLEEP = 0.35
 _LAST_CALLS = deque(maxlen=12)
@@ -32,12 +31,10 @@ def _throttle():
         time.sleep(0.35 - (now - _LAST_CALLS[-1]))
     _LAST_CALLS.append(time.time())
 
-def _sleep_jitter(base):
-    time.sleep(base + random.uniform(0, 0.15))
+def _sleep_jitter(base): time.sleep(base + random.uniform(0, 0.15))
 
 # ================== SYMBOL MAP & NORMALIZE ==================
 SYMBOL_TO_ID = {
-    # L1 / Majors
     "btc":"bitcoin","eth":"ethereum","sol":"solana","bnb":"binancecoin","xrp":"ripple",
     "ada":"cardano","doge":"dogecoin","matic":"polygon","trx":"tron","avax":"avalanche-2",
     "dot":"polkadot","ltc":"litecoin","atom":"cosmos","link":"chainlink","xlm":"stellar",
@@ -49,7 +46,6 @@ SYMBOL_TO_ID = {
     "ape":"apecoin","ftm":"fantom","rose":"oasis-network","rune":"thorchain","qnt":"quant-network",
     "aave":"aave","uni":"uniswap","cake":"pancakeswap-token","gmt":"stepn","pepe":"pepe",
     "bonk":"bonk","shib":"shiba-inu",
-    # Stables
     "usdt":"tether","usdc":"usd-coin","dai":"dai","tusd":"true-usd"
 }
 
@@ -62,7 +58,7 @@ def normalize_symbol(s: str) -> str:
     s = re.sub(r"[^0-9A-Za-z\-]", "", s)
     return s.lower()
 
-# ================== DB (users + alerts) ==================
+# ================== DB (users + alerts + subscriptions) ==================
 def db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("""CREATE TABLE IF NOT EXISTS users(
@@ -74,24 +70,49 @@ def db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
         symbol TEXT NOT NULL,
-        op TEXT NOT NULL,            -- '>' or '<'
+        op TEXT NOT NULL,
         threshold REAL NOT NULL,
         active INTEGER DEFAULT 1,
         created_at REAL
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS subscriptions(
+        subscription_id TEXT PRIMARY KEY,
+        user_id INTEGER,
+        status TEXT,
+        payer_id TEXT,
+        plan_id TEXT,
+        last_event REAL
     )""")
     conn.commit()
     return conn
 CONN = db()
 
-def is_premium(user_id: int) -> bool:
-    row = CONN.execute("SELECT premium_active FROM users WHERE user_id=?", (user_id,)).fetchone()
-    return bool(row and row[0])
-
 def ensure_user(user_id: int):
     CONN.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
     CONN.commit()
 
-# ================== PROVIDERS ==================
+def is_premium(user_id: int) -> bool:
+    row = CONN.execute("SELECT premium_active FROM users WHERE user_id=?", (user_id,)).fetchone()
+    return bool(row and row[0])
+
+def set_premium(user_id: int, active: bool):
+    ensure_user(user_id)
+    CONN.execute("UPDATE users SET premium_active=? WHERE user_id=?", (1 if active else 0, user_id))
+    CONN.commit()
+
+def set_subscription_record(sub_id, user_id, status, payer_id=None, plan_id=None):
+    CONN.execute("""INSERT INTO subscriptions(subscription_id,user_id,status,payer_id,plan_id,last_event)
+                    VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(subscription_id) DO UPDATE SET
+                      user_id=excluded.user_id,
+                      status=excluded.status,
+                      payer_id=COALESCE(excluded.payer_id, subscriptions.payer_id),
+                      plan_id=COALESCE(excluded.plan_id, subscriptions.plan_id),
+                      last_event=excluded.last_event""",
+                 (sub_id, user_id, status, payer_id, plan_id, time.time()))
+    CONN.commit()
+
+# ================== Providers (Binance + fallbacks) ==================
 def binance_price_for_symbol(symbol_or_id: str):
     sym = symbol_or_id.upper()
     cg_map = {
@@ -107,25 +128,16 @@ def binance_price_for_symbol(symbol_or_id: str):
     if sym not in cg_map.values():
         sym = cg_map.get(symbol_or_id.lower(), sym)
     pair = sym + "USDT"
-
-    hosts = [
-        "https://api.binance.com",
-        "https://api1.binance.com",
-        "https://api2.binance.com",
-        "https://api3.binance.com",
-    ]
+    hosts = ["https://api.binance.com","https://api1.binance.com","https://api2.binance.com","https://api3.binance.com"]
     for attempt in range(RETRY_MAX):
         _throttle()
         host = hosts[attempt % len(hosts)]
         try:
             r = requests.get(f"{host}/api/v3/ticker/price", params={"symbol": pair}, timeout=8)
             if r.status_code == 200:
-                data = r.json()
-                price = data.get("price")
-                if price is not None:
-                    return float(price)
-        except Exception:
-            pass
+                data = r.json(); price = data.get("price")
+                if price is not None: return float(price)
+        except Exception: pass
         _sleep_jitter(RETRY_SLEEP)
     return None
 
@@ -134,10 +146,8 @@ def cg_simple_price(ids_csv: str) -> dict:
         _throttle()
         try:
             r = requests.get(COINGECKO_SIMPLE, params={"ids": ids_csv, "vs_currencies": "usd"}, timeout=8)
-            if r.status_code == 200:
-                return r.json() or {}
-        except Exception:
-            pass
+            if r.status_code == 200: return r.json() or {}
+        except Exception: pass
         _sleep_jitter(RETRY_SLEEP)
     return {}
 
@@ -147,12 +157,9 @@ def coincap_price(cg_id: str):
         try:
             r = requests.get(f"https://api.coincap.io/v2/assets/{cg_id}", timeout=8)
             if r.status_code == 200:
-                data = r.json()
-                price = data.get("data", {}).get("priceUsd")
-                if price is not None:
-                    return float(price)
-        except Exception:
-            pass
+                data = r.json(); price = data.get("data", {}).get("priceUsd")
+                if price is not None: return float(price)
+        except Exception: pass
         _sleep_jitter(RETRY_SLEEP)
     return None
 
@@ -161,17 +168,12 @@ def cryptocompare_price(symbol_or_id: str):
     for _ in range(RETRY_MAX):
         _throttle()
         try:
-            r = requests.get(
-                "https://min-api.cryptocompare.com/data/price",
-                params={"fsym": sym, "tsyms": "USD"},
-                timeout=8
-            )
+            r = requests.get("https://min-api.cryptocompare.com/data/price",
+                             params={"fsym": sym, "tsyms": "USD"}, timeout=8)
             if r.status_code == 200:
                 data = r.json()
-                if "USD" in data:
-                    return float(data["USD"])
-        except Exception:
-            pass
+                if "USD" in data: return float(data["USD"])
+        except Exception: pass
         _sleep_jitter(RETRY_SLEEP)
     return None
 
@@ -180,28 +182,18 @@ def resolve_price_usd(symbol: str):
     cg_id = SYMBOL_TO_ID.get(symbol.lower(), symbol.lower())
     now = time.time()
     cached = PRICE_CACHE.get(cg_id)
-    if cached and now - cached[1] <= CACHE_TTL:
-        return cached[0]
+    if cached and now - cached[1] <= CACHE_TTL: return cached[0]
 
     p = binance_price_for_symbol(symbol)
-    if p is not None:
-        PRICE_CACHE[cg_id] = (p, now); return p
-
+    if p is not None: PRICE_CACHE[cg_id] = (p, now); return p
     data = cg_simple_price(cg_id)
     if cg_id in data and "usd" in data[cg_id]:
-        p = float(data[cg_id]["usd"])
-        PRICE_CACHE[cg_id] = (p, now); return p
-
+        p = float(data[cg_id]["usd"]); PRICE_CACHE[cg_id] = (p, now); return p
     p3 = coincap_price(cg_id)
-    if p3 is not None:
-        PRICE_CACHE[cg_id] = (p3, now); return p3
-
+    if p3 is not None: PRICE_CACHE[cg_id] = (p3, now); return p3
     p4 = cryptocompare_price(symbol)
-    if p4 is not None:
-        PRICE_CACHE[cg_id] = (p4, now); return p4
-
-    if cached and now - cached[1] <= STALE_TTL:
-        return cached[0]
+    if p4 is not None: PRICE_CACHE[cg_id] = (p4, now); return p4
+    if cached and now - cached[1] <= STALE_TTL: return cached[0]
     return None
 
 # ================== UI TEXTS ==================
@@ -213,7 +205,7 @@ WELCOME_TEXT = (
     "• **/setalert BTC > 70000** — alert when condition is met.\n"
     "• **/myalerts** — list your active alerts.\n"
     "• **/help** — full instructions.\n\n"
-    "💎 Upgrade with PayPal for premium: unlimited alerts & tighter intervals."
+    "💎 Premium: unlimited alerts. Free: up to 3."
 )
 
 HELP_TEXT = (
@@ -229,27 +221,17 @@ HELP_TEXT = (
     "• **/premium** — Check your plan & limits.\n"
     "• **/help** — This help screen.\n\n"
     "### ⏰ Alerts — How they work\n"
-    "• Alerts are **one-shot**: once triggered, they deactivate and you get notified.\n"
+    "• One-shot: once triggered, they deactivate and you get notified.\n"
     "• Free users: **up to 3** active alerts.  Premium: **unlimited**.\n"
-    "• Check cadence: ~1 min via `/cron` (external scheduler) to keep it always-on.\n"
-    "• If live quotes are down, cached values (≤5 min) may be used as fallback.\n\n"
-    "### 🧠 Tips\n"
-    "• Symbols are case-insensitive. Supported majors: BTC, ETH, SOL, BNB, XRP, ADA, DOGE, MATIC, TRX, AVAX, DOT, LTC, ATOM, LINK, XLM, etc.\n"
-    "• If you see **(stale)**, a fresh quote wasn’t available momentarily.\n\n"
-    "### 🔐 Premium\n"
-    "Tap **Upgrade with PayPal** to support development & unlock unlimited alerts.\n"
+    "• Check cadence: ~1 min via `/cron`.\n"
 )
 
 def help_keyboard(uid: int):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💎 Upgrade with PayPal", url=f"{PAYPAL_SUBSCRIBE_PAGE}?uid={uid}")],
-    ])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade with PayPal", url=f"{PAYPAL_SUBSCRIBE_PAGE}?uid={uid}")]])
 
 def quick_reply_keyboard():
-    rows = [
-        [KeyboardButton("/price BTC"), KeyboardButton("/price ETH")],
-        [KeyboardButton("/setalert BTC > 70000"), KeyboardButton("/myalerts")],
-    ]
+    rows = [[KeyboardButton("/price BTC"), KeyboardButton("/price ETH")],
+            [KeyboardButton("/setalert BTC > 70000"), KeyboardButton("/myalerts")]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, selective=True)
 
 # ================== HANDLERS ==================
@@ -257,167 +239,102 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
     await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=help_keyboard(uid))
-    try:
-        await update.message.reply_text("⌨️ Quick actions:", reply_markup=quick_reply_keyboard())
-    except Exception:
-        pass
+    try: await update.message.reply_text("⌨️ Quick actions:", reply_markup=quick_reply_keyboard())
+    except Exception: pass
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
+    uid = update.effective_user.id; ensure_user(uid)
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=help_keyboard(uid))
 
 async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
+    uid = update.effective_user.id; ensure_user(uid)
     status = "🌟 **Premium** (unlimited alerts)" if is_premium(uid) else "🆓 **Free** (up to 3 active alerts)"
-    await update.message.reply_text(
-        f"{status}\nUpgrade here: {PAYPAL_SUBSCRIBE_PAGE}",
-        parse_mode="Markdown",
-        reply_markup=help_keyboard(uid)
-    )
+    await update.message.reply_text(f"{status}\nUpgrade here: {PAYPAL_SUBSCRIBE_PAGE}", parse_mode="Markdown", reply_markup=help_keyboard(uid))
 
-# --- Admin-only: /setpremium <user_id> <0|1>
 async def setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("Not authorized."); return
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /setpremium <user_id> <0|1>"); return
     try:
-        uid = int(context.args[0]); val = int(context.args[1])
-        ensure_user(uid)
-        CONN.execute("UPDATE users SET premium_active=? WHERE user_id=?", (1 if val else 0, uid))
-        CONN.commit()
+        uid = int(context.args[0]); val = int(context.args[1]); set_premium(uid, bool(val))
         await update.message.reply_text(f"Premium for {uid}: {bool(val)}")
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: `/price BTC`", parse_mode="Markdown"); return
-    coin = normalize_symbol(context.args[0])
-    cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
+    if not context.args: await update.message.reply_text("Usage: `/price BTC`", parse_mode="Markdown"); return
+    coin = normalize_symbol(context.args[0]); cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
     p = resolve_price_usd(coin)
-    if p is None:
-        await update.message.reply_text("❌ Coin not found or API unavailable. Please try again."); return
-    ts = PRICE_CACHE.get(cg_id, (None, 0))[1]
-    age = time.time() - ts
-    suffix = " *(stale)*" if age > CACHE_TTL else ""
+    if p is None: await update.message.reply_text("❌ Coin not found or API unavailable. Please try again."); return
+    ts = PRICE_CACHE.get(cg_id, (None, 0))[1]; age = time.time() - ts; suffix = " *(stale)*" if age > CACHE_TTL else ""
     await update.message.reply_text(f"💰 **{coin.upper()}** price: **${p:.6f}**{suffix}", parse_mode="Markdown")
 
 async def diagprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: `/diagprice ETH`", parse_mode="Markdown"); return
-    coin = normalize_symbol(context.args[0])
-    cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
-    cached = PRICE_CACHE.get(cg_id)
-    cache_line = "Cache: none"
-    if cached:
-        age = int(time.time() - cached[1]); cache_line = f"Cache: {cached[0]} (age {age}s)"
-    b = binance_price_for_symbol(coin)
-    cg = cg_simple_price(cg_id); cg_price = None
+    if not context.args: await update.message.reply_text("Usage: `/diagprice ETH`", parse_mode="Markdown"); return
+    coin = normalize_symbol(context.args[0]); cg_id = SYMBOL_TO_ID.get(coin.lower(), coin.lower())
+    cached = PRICE_CACHE.get(cg_id); cache_line = "Cache: none"
+    if cached: age = int(time.time() - cached[1]); cache_line = f"Cache: {cached[0]} (age {age}s)"
+    b = binance_price_for_symbol(coin); cg = cg_simple_price(cg_id); cg_price = None
     if cg and cg_id in cg and "usd" in cg[cg_id]: cg_price = cg[cg_id]["usd"]
     cc = coincap_price(cg_id); ccx = cryptocompare_price(coin)
-    text = (
-        "🔎 **Diagnostic**\n"
-        f"Coin: **{coin.upper()}**  *(cg_id: {cg_id})*\n"
-        f"{cache_line}\n"
-        f"• Binance: {b}\n"
-        f"• CoinGecko: {cg_price}\n"
-        f"• CoinCap: {cc}\n"
-        f"• CryptoCompare: {ccx}\n"
-        "\nTip: If all live providers fail intermittently, stale cache covers ≤ 5 min."
-    )
+    text = ("🔎 **Diagnostic**\n"
+            f"Coin: **{coin.upper()}**  *(cg_id: {cg_id})*\n"
+            f"{cache_line}\n• Binance: {b}\n• CoinGecko: {cg_price}\n• CoinCap: {cc}\n• CryptoCompare: {ccx}\n")
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# ---------- Alerts Commands ----------
+# ---------- Alerts ----------
 ALERT_USAGE = "Usage: `/setalert BTC > 70000`  or  `/setalert ETH < 2300`"
-
 def parse_setalert(args):
     if len(args) < 3: return None
-    sym = normalize_symbol(args[0])
-    op = args[1]
+    sym = normalize_symbol(args[0]); op = args[1]
     if op not in (">","<"): return None
-    try:
-        thr = float(args[2].replace(",",""))
-    except Exception:
-        return None
+    try: thr = float(args[2].replace(",",""))
+    except Exception: return None
     return (sym, op, thr)
 
 async def setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-    if len(context.args) < 3:
-        await update.message.reply_text(ALERT_USAGE, parse_mode="Markdown"); return
+    uid = update.effective_user.id; ensure_user(uid)
+    if len(context.args) < 3: await update.message.reply_text(ALERT_USAGE, parse_mode="Markdown"); return
     parsed = parse_setalert(context.args)
-    if not parsed:
-        await update.message.reply_text(ALERT_USAGE, parse_mode="Markdown"); return
+    if not parsed: await update.message.reply_text(ALERT_USAGE, parse_mode="Markdown"); return
     sym, op, thr = parsed
-    if sym.lower() not in SYMBOL_TO_ID:
-        await update.message.reply_text("❌ Unknown symbol. Try majors like BTC/ETH/SOL…"); return
-
-    # enforce limits: free 3 active alerts, premium unlimited
+    if sym.lower() not in SYMBOL_TO_ID: await update.message.reply_text("❌ Unknown symbol. Try BTC/ETH/SOL…"); return
     if not is_premium(uid):
         cnt = CONN.execute("SELECT COUNT(*) FROM alerts WHERE user_id=? AND active=1", (uid,)).fetchone()[0]
         if cnt >= 3:
-            await update.message.reply_text(
-                "Free plan limit reached (3 active alerts). Upgrade for unlimited alerts.",
-                reply_markup=help_keyboard(uid)
-            ); return
-
-    CONN.execute(
-        "INSERT INTO alerts(user_id,symbol,op,threshold,active,created_at) VALUES(?,?,?,?,1,?)",
-        (uid, sym.lower(), op, thr, time.time())
-    )
+            await update.message.reply_text("Free plan limit reached (3 alerts). Upgrade for unlimited alerts.", reply_markup=help_keyboard(uid)); return
+    CONN.execute("INSERT INTO alerts(user_id,symbol,op,threshold,active,created_at) VALUES(?,?,?,?,1,?)",
+                 (uid, sym.lower(), op, thr, time.time()))
     CONN.commit()
     await update.message.reply_text(f"✅ Alert saved: `{sym.upper()} {op} {thr}`", parse_mode="Markdown")
 
 async def myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-    rows = CONN.execute(
-        "SELECT id,symbol,op,threshold,active FROM alerts WHERE user_id=? AND active=1 ORDER BY id DESC",
-        (uid,)
-    ).fetchall()
-    if not rows:
-        await update.message.reply_text("You have no active alerts. Create one with:\n`/setalert BTC > 70000`", parse_mode="Markdown"); return
-    lines = [f"🔔 **Your Alerts**"]
-    for (aid,s,op,thr,act) in rows:
-        lines.append(f"• `{aid}` — **{s.upper()} {op} {thr}**")
+    uid = update.effective_user.id; ensure_user(uid)
+    rows = CONN.execute("SELECT id,symbol,op,threshold,active FROM alerts WHERE user_id=? AND active=1 ORDER BY id DESC",(uid,)).fetchall()
+    if not rows: await update.message.reply_text("You have no active alerts.\n`/setalert BTC > 70000`", parse_mode="Markdown"); return
+    lines = ["🔔 **Your Alerts**"] + [f"• `{aid}` — **{s.upper()} {op} {thr}**" for (aid,s,op,thr,act) in rows]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-    if not context.args:
-        await update.message.reply_text("Usage: `/delalert <ID>`", parse_mode="Markdown"); return
-    try:
-        aid = int(context.args[0])
-    except Exception:
-        await update.message.reply_text("Usage: `/delalert <ID>`", parse_mode="Markdown"); return
-    cur = CONN.execute("UPDATE alerts SET active=0 WHERE id=? AND user_id=?", (aid, uid))
-    CONN.commit()
-    if cur.rowcount:
-        await update.message.reply_text(f"🗑️ Deleted alert `{aid}`", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("Alert not found.", parse_mode="Markdown")
+    uid = update.effective_user.id; ensure_user(uid)
+    if not context.args: await update.message.reply_text("Usage: `/delalert <ID>`", parse_mode="Markdown"); return
+    try: aid = int(context.args[0])
+    except Exception: await update.message.reply_text("Usage: `/delalert <ID>`", parse_mode="Markdown"); return
+    cur = CONN.execute("UPDATE alerts SET active=0 WHERE id=? AND user_id=?", (aid, uid)); CONN.commit()
+    await update.message.reply_text("🗑️ Deleted." if cur.rowcount else "Alert not found.", parse_mode="Markdown")
 
 async def clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-    cur = CONN.execute("UPDATE alerts SET active=0 WHERE user_id=? AND active=1", (uid,))
-    CONN.commit()
+    uid = update.effective_user.id; ensure_user(uid)
+    cur = CONN.execute("UPDATE alerts SET active=0 WHERE user_id=? AND active=1", (uid,)); CONN.commit()
     await update.message.reply_text(f"🧹 Cleared {cur.rowcount} alert(s).")
 
-# =============== (Optional) Standalone polling runner ===============
+# =============== Polling helper (local) ===============
 def run_bot():
     from telegram.ext import Application
     async def _post_init(application):
-        try:
-            await application.bot.delete_webhook(drop_pending_updates=True)
-        except Exception as e:
-            logging.warning("delete_webhook failed %s", e)
-
+        try: await application.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e: logging.warning("delete_webhook failed %s", e)
     app = (Application.builder().token(BOT_TOKEN).post_init(_post_init).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -432,16 +349,14 @@ def run_bot():
     logging.info("🤖 Bot running (polling)…")
     app.run_polling(drop_pending_updates=True)
 
-# Helpers for server_combined
-def get_db_conn():
-    return CONN
+def get_db_conn(): return CONN
 
 __all__ = [
     "start","help_cmd","premium_cmd","setpremium",
     "price","diagprice",
     "setalert","myalerts","delalert","clearalerts",
     "resolve_price_usd","normalize_symbol","SYMBOL_TO_ID",
-    "get_db_conn","is_premium","ensure_user"
+    "get_db_conn","is_premium","ensure_user","set_premium","set_subscription_record"
 ]
 
 if __name__ == "__main__":
