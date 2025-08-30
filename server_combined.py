@@ -13,7 +13,7 @@ HOST        = os.getenv("HOST", "0.0.0.0")
 PORT        = int(os.getenv("PORT", "8000"))
 ALERT_INTERVAL_SEC = int(os.getenv("ALERT_INTERVAL_SEC", "0"))
 
-# PayPal LIVE
+# PayPal LIVE (because you pay live)
 PAYPAL_MODE = os.getenv("PAYPAL_MODE", "live").lower()
 PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID", "")
 PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET", "")
@@ -58,7 +58,7 @@ def subscribe_live():
 
 # ======== TELEGRAM APP ========
 from bot import (
-    start as start_cmd, help_cmd, premium_cmd, setpremium, setpremiumme, whoami, stats, subs, bindsub, syncsub,
+    start as start_cmd, help_cmd, premium_cmd, whoami, stats, subs, bindsub, syncsub,
     price, diagprice, setalert, myalerts, delalert, clearalerts,
     resolve_price_usd, get_db_conn, set_premium, set_subscription_record
 )
@@ -83,8 +83,6 @@ async def _safe(handler, tag, update: Update, context: ContextTypes.DEFAULT_TYPE
 async def start_wrap(u,c):       await _safe(start_cmd, "/start", u, c)
 async def help_wrap(u,c):        await _safe(help_cmd, "/help", u, c)
 async def premium_wrap(u,c):     await _safe(premium_cmd, "/premium", u, c)
-async def setpremium_wrap(u,c):  await _safe(setpremium, "/setpremium", u, c)
-async def setpremiumme_wrap(u,c):await _safe(setpremiumme, "/setpremiumme", u, c)
 async def whoami_wrap(u,c):      await _safe(whoami, "/whoami", u, c)
 async def stats_wrap(u,c):       await _safe(stats, "/stats", u, c)
 async def subs_wrap(u,c):        await _safe(subs, "/subs", u, c)
@@ -106,8 +104,6 @@ async def catch_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 application.add_handler(CommandHandler("start", start_wrap))
 application.add_handler(CommandHandler("help", help_wrap))
 application.add_handler(CommandHandler("premium", premium_wrap))
-application.add_handler(CommandHandler("setpremium", setpremium_wrap))
-application.add_handler(CommandHandler("setpremiumme", setpremiumme_wrap))
 application.add_handler(CommandHandler("whoami", whoami_wrap))
 application.add_handler(CommandHandler("stats", stats_wrap))
 application.add_handler(CommandHandler("subs", subs_wrap))
@@ -254,6 +250,10 @@ def paypal_verify_webhook(req_headers, body_bytes):
 # ======== PAYPAL ROUTES ========
 @app.post("/paypal/subscribe-bind")
 def paypal_subscribe_bind():
+    """
+    Called from subscribe.html onApprove to bind subscription_id to Telegram user id
+    and fetch initial status from PayPal. If ACTIVE -> set premium immediately.
+    """
     try:
         data = request.get_json(force=True, silent=False)
         uid = int(data["uid"])
@@ -280,6 +280,10 @@ def paypal_subscribe_bind():
 
 @app.post("/paypal/webhook")
 def paypal_webhook():
+    """
+    PayPal calls this for subscription lifecycle events.
+    We verify signature, update DB, and toggle premium accordingly.
+    """
     raw = request.get_data()
     try:
         if not paypal_verify_webhook(request.headers, raw):
@@ -301,7 +305,6 @@ def paypal_webhook():
     conn = get_db_conn()
 
     try:
-        # Update/insert subscription record
         row = conn.execute("SELECT user_id FROM subscriptions WHERE subscription_id=?", (sub_id,)).fetchone()
         uid = row[0] if row else None
         set_subscription_record(sub_id, uid, status, payer_id, plan_id)
