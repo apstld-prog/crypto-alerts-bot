@@ -201,7 +201,7 @@ WELCOME_TEXT = (
     "_Fast prices • Diagnostics • Alerts_\n\n"
     "### 🚀 Getting Started\n"
     "• **/price BTC** — current price in USD (e.g., `/price ETH`).\n"
-    "• **/setalert BTC > 70000** — alert when condition is met.\n"
+    "• **/setalert BTC > 110000** — alert when condition is met.\n"
     "• **/myalerts** — list your active alerts.\n"
     "• **/help** — full instructions.\n\n"
     "💎 Premium: unlimited alerts. Free: up to 3."
@@ -223,7 +223,7 @@ def help_keyboard(uid: int):
 
 def quick_reply_keyboard():
     rows = [[KeyboardButton("/price BTC"), KeyboardButton("/price ETH")],
-            [KeyboardButton("/setalert BTC > 70000"), KeyboardButton("/myalerts")]]
+            [KeyboardButton("/setalert BTC > 110000"), KeyboardButton("/myalerts")]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, selective=True)
 
 # ================== HANDLERS ==================
@@ -324,7 +324,7 @@ async def diagprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 # ---------- Alerts (Premium enforced) ----------
-ALERT_USAGE = "Usage: `/setalert BTC > 70000`  or  `/setalert ETH < 2300`"
+ALERT_USAGE = "Usage: `/setalert BTC > 110000`  or  `/setalert ETH < 2300`"
 def parse_setalert(args):
     if len(args) < 3: return None
     sym = normalize_symbol(args[0]); op = args[1]
@@ -355,7 +355,7 @@ async def setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id; ensure_user(uid)
     rows = CONN.execute("SELECT id,symbol,op,threshold,active FROM alerts WHERE user_id=? AND active=1 ORDER BY id DESC",(uid,)).fetchall()
-    if not rows: await update.message.reply_text("You have no active alerts.\n`/setalert BTC > 70000`", parse_mode="Markdown"); return
+    if not rows: await update.message.reply_text("You have no active alerts.\n`/setalert BTC > 110000`", parse_mode="Markdown"); return
     lines = ["🔔 **Your Alerts**"] + [f"• `{aid}` — **{s.upper()} {op} {thr}**" for (aid,s,op,thr,act) in rows]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
