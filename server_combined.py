@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
-import os, logging, threading, asyncio, time, traceback
+import os, logging, threading, asyncio, time, traceback, json
 from flask import Flask, request, send_from_directory, Response
 from waitress import serve
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+import requests
 
-# ============== CONFIG ==============
+# ======== BASIC CONFIG ========
 BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
 PUBLIC_URL  = os.getenv("PUBLIC_URL", "")
 HOST        = os.getenv("HOST", "0.0.0.0")
 PORT        = int(os.getenv("PORT", "8000"))
-ALERT_INTERVAL_SEC = int(os.getenv("ALERT_INTERVAL_SEC", "0"))  # keep 0 (disabled) when using /cron
+ALERT_INTERVAL_SEC = int(os.getenv("ALERT_INTERVAL_SEC", "0"))
 
-if ":" not in BOT_TOKEN:
-    raise RuntimeError("Missing or invalid BOT_TOKEN")
+# PayPal (LIVE)
+PAYPAL_MODE = os.getenv("PAYPAL_MODE", "live").lower()  # must be 'live'
+PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID", "")
+PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET", "")
+PAYPAL_WEBHOOK_ID = os.getenv("PAYPAL_WEBHOOK_ID", "")  # LIVE webhook id from dashboard
+
+if ":" not in BOT_TOKEN: raise RuntimeError("Missing or invalid BOT_TOKEN")
 if not (PUBLIC_URL.startswith("http://") or PUBLIC_URL.startswith("https://")):
-    raise RuntimeError("PUBLIC_URL must be your full Render URL, e.g. https://<service>.onrender.com")
-
-WEBHOOK_PATH = f"/telegram/{BOT_TOKEN}"
-WEBHOOK_URL  = f"{PUBLIC_URL}{WEBHOOK_PATH}"
+    raise RuntimeError("PUBLIC_URL must be full URL")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("server")
 
-# ============== FLASK APP ==============
+API_BASE = "https://api-m.paypal.com"  # LIVE
+
+# ======== FLASK ========
 app = Flask(__name__)
 
 @app.after_request
@@ -36,18 +41,14 @@ def _headers(resp: Response):
 
 @app.get("/")
 def root():
-    return (
-        f"<h3>Crypto Alerts Bot</h3>"
-        f"<p>Health: <a href='/healthz'>/healthz</a></p>"
-        f"<p>Webhook probe: <a href='{WEBHOOK_PATH}'>GET {WEBHOOK_PATH}</a></p>"
-        f"<p>Cron: <a href='/cron'>/cron</a> (idempotent)</p>",
-        200,
-    )
+    return (f"<h3>Crypto Alerts Bot</h3>"
+            f"<p>Health: <a href='/healthz'>/healthz</a></p>"
+            f"<p>Webhook probe: <a href='{WEBHOOK_PATH}'>GET {WEBHOOK_PATH}</a></p>"
+            f"<p>Cron: <a href='/cron'>/cron</a> (call every 1′)</p>", 200)
 
 @app.get("/health")
 @app.get("/healthz")
-def healthz():
-    return "ok", 200
+def healthz(): return "ok", 200
 
 @app.get("/subscribe.html")
 def subscribe_live():
@@ -55,27 +56,18 @@ def subscribe_live():
         return send_from_directory(".", "subscribe.html")
     return ("<h3>Subscribe (LIVE)</h3><p>Place subscribe.html in project root.</p>", 200)
 
-@app.get("/subscribe-sandbox.html")
-def subscribe_sandbox():
-    if os.path.isfile("subscribe-sandbox.html"):
-        return send_from_directory(".", "subscribe-sandbox.html")
-    return ("<h3>Subscribe (SANDBOX)</h3><p>Place subscribe-sandbox.html in project root.</p>", 200)
-
-@app.get(WEBHOOK_PATH)
-def webhook_get_probe():
-    return "Telegram webhook endpoint (POST only).", 200
-
-# ============== TELEGRAM APP ==============
+# ======== TELEGRAM APP ========
 from bot import (
     start as start_cmd, help_cmd, premium_cmd, setpremium,
     price, diagprice,
     setalert, myalerts, delalert, clearalerts,
-    resolve_price_usd, get_db_conn
+    resolve_price_usd, get_db_conn, set_premium, set_subscription_record
 )
 
 application = Application.builder().token(BOT_TOKEN).build()
+WEBHOOK_PATH = f"/telegram/{BOT_TOKEN}"
+WEBHOOK_URL  = f"{PUBLIC_URL}{WEBHOOK_PATH}"
 
-# Wrappers με logging
 async def _safe(handler, tag, update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         log.info("→ handling %s (chat_id=%s, text=%r)", tag, getattr(update.effective_chat, "id", None), getattr(update.message, "text", None))
@@ -102,11 +94,10 @@ async def clearalerts_wrap(u,c): await _safe(clearalerts, "/clearalerts", u, c)
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Unknown command. Try /start or /help.")
-
 async def catch_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Hi! Use /start to see the instructions.")
 
-# Bind handlers
+# Bind
 application.add_handler(CommandHandler("start", start_wrap))
 application.add_handler(CommandHandler("help", help_wrap))
 application.add_handler(CommandHandler("premium", premium_wrap))
@@ -120,20 +111,15 @@ application.add_handler(CommandHandler("clearalerts", clearalerts_wrap))
 application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catch_all_text))
 
-# Global error handler
 async def on_error(update: object, context):
-    try:
-        upd = update.to_dict() if hasattr(update, "to_dict") else str(update)
-    except Exception:
-        upd = str(update)
+    try: upd = update.to_dict() if hasattr(update, "to_dict") else str(update)
+    except Exception: upd = str(update)
     log.error("PTB error: %s\nUpdate: %s\nTraceback:\n%s", context.error, upd, traceback.format_exc())
-
 application.add_error_handler(on_error)
 
-# --- Async loop reference for thread-safe dispatch ---
+# Async loop ref for thread-safe dispatch
 TG_LOOP = None
 
-# Init + set webhook
 async def tg_init_and_set_webhook():
     await application.initialize()
     try:
@@ -154,7 +140,6 @@ async def tg_shutdown():
     except Exception as e:
         log.warning("Telegram shutdown error: %s", e)
 
-# Webhook endpoint — non-blocking dispatch
 @app.post(WEBHOOK_PATH)
 def telegram_webhook():
     try:
@@ -180,36 +165,25 @@ def telegram_webhook():
 
     return "ok", 200
 
-# ============== ALERT TICK & WORKER ==============
+# ======== ALERTS: /cron endpoint ========
 def run_alert_tick():
-    """Execute a single alert-check cycle (no sleep). Called by /cron or worker."""
     from bot import resolve_price_usd, get_db_conn
-    conn = get_db_conn()
-    cur = conn.cursor()
-    rows = cur.execute(
-        "SELECT id,user_id,symbol,op,threshold FROM alerts WHERE active=1 ORDER BY id ASC"
-    ).fetchall()
-    if not rows:
-        return 0
-    # group by symbol
+    conn = get_db_conn(); cur = conn.cursor()
+    rows = cur.execute("SELECT id,user_id,symbol,op,threshold FROM alerts WHERE active=1 ORDER BY id ASC").fetchall()
+    if not rows: return 0
     symbols = {r[2] for r in rows}
     prices = {}
     for s in symbols:
         try:
             p = resolve_price_usd(s)
-            if p is not None:
-                prices[s] = float(p)
-        except Exception:
-            pass
+            if p is not None: prices[s] = float(p)
+        except Exception: pass
     triggered = []
     for (aid, uid, sym, op, thr) in rows:
         p = prices.get(sym.lower())
-        if p is None:
-            continue
+        if p is None: continue
         if (op == ">" and p > thr) or (op == "<" and p < thr):
             triggered.append((aid, uid, sym, op, thr, p))
-
-    # notify & deactivate
     for (aid, uid, sym, op, thr, p) in triggered:
         try:
             text = f"🔔 Alert hit: **{sym.upper()} {op} {thr}**\nCurrent price: **${p:.6f}**"
@@ -222,20 +196,6 @@ def run_alert_tick():
             log.warning("Failed to notify alert %s: %s", aid, e)
     return len(triggered)
 
-def alert_worker():
-    """Optional background loop (usually disabled on Free when /cron is used)."""
-    if ALERT_INTERVAL_SEC <= 0:
-        log.info("Alert worker disabled (ALERT_INTERVAL_SEC <= 0).")
-        return
-    while True:
-        try:
-            n = run_alert_tick()
-            log.info("Alert worker tick: triggered=%d", n)
-        except Exception as e:
-            log.error("Alert worker error: %s\n%s", e, traceback.format_exc())
-        time.sleep(ALERT_INTERVAL_SEC)
-
-# HTTP cron endpoint — κάλεσέ το κάθε 1′ από cron-job.org
 @app.get("/cron")
 def cron_tick():
     try:
@@ -245,7 +205,107 @@ def cron_tick():
         log.error("cron_tick error: %s\n%s", e, traceback.format_exc())
         return "cron error", 500
 
-# ============== RUN LOOPS ==============
+# ======== PAYPAL HELPERS (LIVE) ========
+def paypal_access_token():
+    r = requests.post(f"{API_BASE}/v1/oauth2/token",
+                      auth=(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET),
+                      data={"grant_type":"client_credentials"}, timeout=15)
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+def paypal_get_subscription(sub_id, token=None):
+    token = token or paypal_access_token()
+    r = requests.get(f"{API_BASE}/v1/billing/subscriptions/{sub_id}",
+                     headers={"Authorization": f"Bearer {token}"}, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def paypal_verify_webhook(req_headers, body_bytes):
+    token = paypal_access_token()
+    verify_payload = {
+        "auth_algo": req_headers.get("PayPal-Auth-Algo"),
+        "cert_url": req_headers.get("PayPal-Cert-Url"),
+        "transmission_id": req_headers.get("PayPal-Transmission-Id"),
+        "transmission_sig": req_headers.get("PayPal-Transmission-Sig"),
+        "transmission_time": req_headers.get("PayPal-Transmission-Time"),
+        "webhook_id": PAYPAL_WEBHOOK_ID,
+        "webhook_event": json.loads(body_bytes.decode("utf-8"))
+    }
+    r = requests.post(f"{API_BASE}/v1/notifications/verify-webhook-signature",
+                      headers={"Authorization": f"Bearer {token}",
+                              "Content-Type": "application/json"},
+                      json=verify_payload, timeout=20)
+    r.raise_for_status()
+    return (r.json().get("verification_status") == "SUCCESS")
+
+# ======== PAYPAL ROUTES (LIVE) ========
+@app.post("/paypal/subscribe-bind")
+def paypal_subscribe_bind():
+    try:
+        data = request.get_json(force=True, silent=False)
+        uid = int(data["uid"])
+        sub_id = str(data["subscription_id"])
+    except Exception:
+        return ("bad request", 400)
+
+    from bot import get_db_conn, set_premium, set_subscription_record
+    try:
+        token = paypal_access_token()
+        sub = paypal_get_subscription(sub_id, token=token)
+        status = sub.get("status")
+        payer_id = (sub.get("subscriber") or {}).get("payer_id")
+        plan_id = sub.get("plan_id")
+        set_subscription_record(sub_id, uid, status, payer_id, plan_id)
+
+        if status == "ACTIVE":
+            set_premium(uid, True)
+        return {"ok": True, "status": status}, 200
+    except Exception as e:
+        log.error("subscribe-bind error: %s\n%s", e, traceback.format_exc())
+        return ("error", 500)
+
+@app.post("/paypal/webhook")
+def paypal_webhook():
+    raw = request.get_data()
+    try:
+        if not paypal_verify_webhook(request.headers, raw):
+            log.warning("PayPal webhook verification FAILED")
+            return "not verified", 400
+        event = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        log.error("webhook parse/verify error: %s\n%s", e, traceback.format_exc())
+        return "bad request", 400
+
+    et = event.get("event_type", "")
+    res = event.get("resource", {})
+    sub_id = res.get("id") or res.get("billing_agreement_id")
+
+    from bot import get_db_conn, set_premium, set_subscription_record
+    conn = get_db_conn()
+
+    try:
+        row = conn.execute("SELECT user_id FROM subscriptions WHERE subscription_id=?", (sub_id,)).fetchone()
+        uid = row[0] if row else None
+        payer_id = (res.get("subscriber") or {}).get("payer_id") or (res.get("payer", {}) or {}).get("payer_info", {}).get("payer_id")
+        plan_id = res.get("plan_id")
+        status = res.get("status") or ""
+        set_subscription_record(sub_id, uid, status, payer_id, plan_id)
+    except Exception:
+        pass
+
+    try:
+        if et in ("BILLING.SUBSCRIPTION.ACTIVATED", "PAYMENT.SALE.COMPLETED", "BILLING.SUBSCRIPTION.RE-ACTIVATED"):
+            row = conn.execute("SELECT user_id FROM subscriptions WHERE subscription_id=?", (sub_id,)).fetchone()
+            if row and row[0]: set_premium(row[0], True)
+        elif et in ("BILLING.SUBSCRIPTION.CANCELLED", "BILLING.SUBSCRIPTION.EXPIRED", "BILLING.SUBSCRIPTION.SUSPENDED"):
+            row = conn.execute("SELECT user_id FROM subscriptions WHERE subscription_id=?", (sub_id,)).fetchone()
+            if row and row[0]: set_premium(row[0], False)
+    except Exception as e:
+        log.error("webhook premium update error: %s\n%s", e, traceback.format_exc())
+
+    return "ok", 200
+
+# ======== RUN LOOPS ========
 def run_flask():
     log.info("Starting Flask on %s:%s", HOST, PORT)
     serve(app, host=HOST, port=PORT)
@@ -256,15 +316,21 @@ def run_asyncio_loop(loop):
     loop.run_forever()
 
 if __name__ == "__main__":
-    # 1) Start Telegram async loop (webhook mode)
     TG_LOOP = asyncio.new_event_loop()
     t = threading.Thread(target=run_asyncio_loop, args=(TG_LOOP,), daemon=True, name="tg-loop")
     t.start()
 
-    # 2) Start alert worker (optional; keep disabled when using /cron)
-    threading.Thread(target=alert_worker, daemon=True, name="alert-worker").start()
+    if ALERT_INTERVAL_SEC and ALERT_INTERVAL_SEC > 0:
+        def _worker():
+            while True:
+                try:
+                    n = run_alert_tick()
+                    log.info("Alert worker tick: triggered=%d", n)
+                except Exception as e:
+                    log.error("Alert worker error: %s\n%s", e, traceback.format_exc())
+                time.sleep(ALERT_INTERVAL_SEC)
+        threading.Thread(target=_worker, daemon=True).start()
 
-    # 3) Start Flask web server (health + webhook + /cron)
     try:
         run_flask()
     finally:
