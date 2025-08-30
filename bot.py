@@ -112,7 +112,7 @@ def set_subscription_record(sub_id, user_id, status, payer_id=None, plan_id=None
                  (sub_id, user_id, status, payer_id, plan_id, time.time()))
     CONN.commit()
 
-# ================== Providers (Binance + fallbacks) ==================
+# ================== Providers ==================
 def binance_price_for_symbol(symbol_or_id: str):
     sym = symbol_or_id.upper()
     cg_map = {
@@ -219,6 +219,7 @@ HELP_TEXT = (
     "• **/delalert `<ID>`** — Delete one alert.\n"
     "• **/clearalerts** — Delete all active alerts.\n"
     "• **/premium** — Check your plan & limits.\n"
+    "• **/stats** — (admin) Bot statistics.\n"
     "• **/help** — This help screen.\n\n"
     "### ⏰ Alerts — How they work\n"
     "• One-shot: once triggered, they deactivate and you get notified.\n"
@@ -261,6 +262,22 @@ async def setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Premium for {uid}: {bool(val)}")
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Not authorized."); return
+    total_users = CONN.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    premium_users = CONN.execute("SELECT COUNT(*) FROM users WHERE premium_active=1").fetchone()[0]
+    active_alerts = CONN.execute("SELECT COUNT(*) FROM alerts WHERE active=1").fetchone()[0]
+    active_subs = CONN.execute("SELECT COUNT(*) FROM subscriptions WHERE status='ACTIVE'").fetchone()[0]
+    await update.message.reply_text(
+        "📊 **Bot Stats**\n\n"
+        f"👥 Users: {total_users}\n"
+        f"💎 Premium users: {premium_users}\n"
+        f"🔔 Active alerts: {active_alerts}\n"
+        f"🧾 Active subscriptions: {active_subs}",
+        parse_mode="Markdown"
+    )
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: await update.message.reply_text("Usage: `/price BTC`", parse_mode="Markdown"); return
@@ -340,6 +357,7 @@ def run_bot():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("premium", premium_cmd))
     app.add_handler(CommandHandler("setpremium", setpremium))
+    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("diagprice", diagprice))
     app.add_handler(CommandHandler("setalert", setalert))
@@ -352,7 +370,7 @@ def run_bot():
 def get_db_conn(): return CONN
 
 __all__ = [
-    "start","help_cmd","premium_cmd","setpremium",
+    "start","help_cmd","premium_cmd","setpremium","stats",
     "price","diagprice",
     "setalert","myalerts","delalert","clearalerts",
     "resolve_price_usd","normalize_symbol","SYMBOL_TO_ID",
