@@ -1,25 +1,23 @@
-# Render Blueprint: Crypto Alerts
-# Docs: https://render.com/docs/blueprint-spec
-
 services:
   - type: web
     name: crypto-alerts-web
     env: python
-    plan: starter  # change to 'standard' or higher if needed
-    region: oregon
+    region: frankfurt
+    plan: starter
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
     startCommand: gunicorn server_combined:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
-    autoDeploy: true
     healthCheckPath: /healthz
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
       - key: ENV
         value: production
       - key: DATABASE_URL
-        sync: false           # set in Dashboard after attaching Managed Postgres
+        sync: false
       - key: ALERTS_SECRET
-        sync: false           # set in Dashboard
+        sync: false
       - key: BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
@@ -32,14 +30,15 @@ services:
   - type: worker
     name: crypto-alerts-worker
     env: python
-    plan: starter
     region: frankfurt
+    plan: starter
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
     startCommand: python worker.py
-    autoDeploy: true
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
       - key: ENV
         value: production
       - key: DATABASE_URL
