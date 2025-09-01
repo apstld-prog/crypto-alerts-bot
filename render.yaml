@@ -10,7 +10,6 @@ services:
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-    # IMPORTANT: use uvicorn worker for ASGI (FastAPI)
     startCommand: gunicorn -k uvicorn.workers.UvicornWorker server_combined:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
     autoDeploy: true
     healthCheckPath: /healthz
