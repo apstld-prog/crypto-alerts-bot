@@ -6,13 +6,48 @@ from typing import Optional
 from sqlalchemy import create_engine, String, Integer, Boolean, DateTime, ForeignKey, Float
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
-DATABASE_URL = os.getenv("DATABASE_URL")
 
-# If DATABASE_URL is missing (e.g., Render free without external DB), fall back to SQLite (ephemeral on redeploy)
-if not DATABASE_URL:
-    DATABASE_URL = "sqlite:///./local.db"
+def _normalize_database_url(raw: Optional[str]) -> str:
+    """
+    Normalize DATABASE_URL for SQLAlchemy.
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    - Accepts postgres:// and converts to postgresql://
+    - Strips whitespace
+    - If empty/missing, returns sqlite local path (ephemeral in Render)
+    """
+    if not raw:
+        return "sqlite:///./local.db"
+
+    url = raw.strip()
+
+    # Heroku-style scheme
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+
+    return url
+
+
+def _build_engine(url: str):
+    try:
+        return create_engine(url, pool_pre_ping=True)
+    except Exception as e:
+        # Give a very clear hint about proper formats
+        raise RuntimeError(
+            "Invalid DATABASE_URL format.\n"
+            "Expected something like:\n"
+            "  postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require\n"
+            "Common fixes:\n"
+            "  • Use 'postgresql://' (not 'postgres://').\n"
+            "  • URL-encode special chars in PASSWORD (e.g. @ : / ? # %).\n"
+            "  • Include the DB name and host.\n"
+            f"Original error: {e}"
+        )
+
+
+DATABASE_URL_RAW = os.getenv("DATABASE_URL")
+DATABASE_URL = _normalize_database_url(DATABASE_URL_RAW)
+
+engine = _build_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
