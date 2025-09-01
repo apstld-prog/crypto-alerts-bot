@@ -3,7 +3,7 @@ uvicorn[standard]==0.27.1
 gunicorn==21.2.0
 requests==2.31.0
 python-telegram-bot==20.6
-SQLAlchemy==2.0.29
+SQLAlchemy>=2.0.42
 psycopg2-binary==2.9.9
 stripe==7.8.1
 python-dotenv==1.0.1
