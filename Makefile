@@ -1,5 +1,5 @@
-# Helper commands for local work
-.PHONY: install web worker bot
+# Helper commands for local/dev
+.PHONY: install web worker bot seed
 
 install:
 	pip install --upgrade pip
@@ -13,3 +13,6 @@ worker:
 
 bot:
 	python bot.py
+
+seed:
+	psql "$$DATABASE_URL" -f seed.sql
