@@ -1,1 +1,58 @@
-<render.yaml full code here>
+# Render Blueprint: Crypto Alerts (EU Frankfurt)
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: crypto-alerts-web
+    env: python
+    region: frankfurt
+    plan: starter
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: gunicorn server_combined:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: ALERTS_SECRET
+        sync: false
+      - key: ADMIN_KEY
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: STRIPE_SECRET
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+
+  - type: worker
+    name: crypto-alerts-worker
+    env: python
+    region: frankfurt
+    plan: starter
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: python worker.py
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: WORKER_INTERVAL_SECONDS
+        value: "60"
