@@ -11,7 +11,6 @@ from db import Alert
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # optional default
 
-
 def fetch_price_binance(symbol: str, timeout: int = 8) -> Optional[float]:
     """Fetch latest price from Binance public API. symbol example: BTCUSDT"""
     try:
@@ -26,7 +25,6 @@ def fetch_price_binance(symbol: str, timeout: int = 8) -> Optional[float]:
     except Exception:
         return None
 
-
 def should_trigger(rule: str, threshold: float, price: float) -> bool:
     if rule == "price_above":
         return price > threshold
@@ -34,12 +32,10 @@ def should_trigger(rule: str, threshold: float, price: float) -> bool:
         return price < threshold
     return False
 
-
 def can_fire(last_fired_at: Optional[datetime], cooldown_seconds: int) -> bool:
     if last_fired_at is None:
         return True
     return datetime.utcnow() >= last_fired_at + timedelta(seconds=cooldown_seconds)
-
 
 def notify_telegram(text: str, chat_id: Optional[str] = None, timeout: int = 10) -> bool:
     if not BOT_TOKEN:
@@ -53,7 +49,6 @@ def notify_telegram(text: str, chat_id: Optional[str] = None, timeout: int = 10)
         return r.status_code == 200
     except Exception:
         return False
-
 
 def run_alert_cycle(session: Session) -> Dict[str, int]:
     """Evaluate all enabled alerts once. Returns counters for logs/stats."""

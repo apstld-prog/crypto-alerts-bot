@@ -20,6 +20,5 @@ def main():
             print({"msg": "worker_error", "ts": ts, "error": str(e)})
         time.sleep(INTERVAL_SECONDS)
 
-
 if __name__ == "__main__":
     main()
