@@ -1,17 +1,16 @@
 # Render Blueprint: Crypto Alerts (Web API + Background Worker + Telegram Bot)
-# Ανέβασε αυτό το αρχείο στη ρίζα του repo και δημιούργησε Blueprint Instance στο Render.
+# Όλα τα services στο Free plan
 
 services:
   # ─────────────────────────────── WEB (FastAPI) ───────────────────────────────
   - type: web
     name: crypto-alerts-web
     env: python
-    region: frankfurt                 # κράτα ίδια region με τα υπόλοιπα
-    plan: starter                     # μπορείς να το αλλάξεις σε free αν θες
+    region: frankfurt
+    plan: free
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-    # Χρησιμοποιούμε uvicorn worker για ASGI (FastAPI), αλλιώς θα πάρεις σφάλμα WSGI.
     startCommand: gunicorn -k uvicorn.workers.UvicornWorker server_combined:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
     autoDeploy: true
     healthCheckPath: /healthz
@@ -20,19 +19,19 @@ services:
         value: "3.11.9"
       - key: ENV
         value: production
-      - key: DATABASE_URL            # π.χ. postgresql://USER:P%40SS@HOST/db?sslmode=require
+      - key: DATABASE_URL
         sync: false
-      - key: ALERTS_SECRET           # για /cron (αν ποτέ το χρησιμοποιήσεις)
+      - key: ALERTS_SECRET
         sync: false
-      - key: ADMIN_KEY               # για /admin/* (ως ?key= ή header x-admin-key)
+      - key: ADMIN_KEY
         sync: false
-      - key: BOT_TOKEN               # χρησιμοποιείται και από web αν στείλει ειδοποίηση
+      - key: BOT_TOKEN
         sync: false
-      - key: TELEGRAM_CHAT_ID        # προαιρετικό default chat id
+      - key: TELEGRAM_CHAT_ID
         sync: false
-      - key: STRIPE_SECRET           # προαιρετικό
+      - key: STRIPE_SECRET
         sync: false
-      - key: STRIPE_WEBHOOK_SECRET   # προαιρετικό
+      - key: STRIPE_WEBHOOK_SECRET
         sync: false
 
   # ───────────────────────────── BACKGROUND WORKER ─────────────────────────────
@@ -40,7 +39,7 @@ services:
     name: crypto-alerts-worker
     env: python
     region: frankfurt
-    plan: starter
+    plan: free
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
@@ -65,20 +64,20 @@ services:
     name: crypto-alerts-bot
     env: python
     region: frankfurt
-    plan: starter
+    plan: free
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-    startCommand: python bot.py       # polling bot
+    startCommand: python bot.py
     autoDeploy: true
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
       - key: ENV
         value: production
-      - key: DATABASE_URL             # ώστε το bot να διαβάζει/γράφει στη DB
+      - key: DATABASE_URL
         sync: false
-      - key: BOT_TOKEN                # από @BotFather
+      - key: BOT_TOKEN
         sync: false
-      - key: TELEGRAM_CHAT_ID         # προαιρετικό default chat για ειδοποιήσεις
+      - key: TELEGRAM_CHAT_ID
         sync: false
