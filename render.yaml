@@ -1,5 +1,5 @@
 # Render Blueprint: Crypto Alerts (Web API + Background Worker + Telegram Bot)
-# Όλα τα services στο Free plan
+# Όλα τα services στο Free plan με ρητά δηλωμένα env vars.
 
 services:
   # ─────────────────────────────── WEB (FastAPI) ───────────────────────────────
@@ -11,27 +11,31 @@ services:
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
+    # ASGI (FastAPI) μέσω Gunicorn + Uvicorn worker
     startCommand: gunicorn -k uvicorn.workers.UvicornWorker server_combined:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
     autoDeploy: true
     healthCheckPath: /healthz
     envVars:
+      # Σταθερές (βάζουμε τιμή εδώ)
       - key: PYTHON_VERSION
         value: "3.11.9"
       - key: ENV
         value: production
-      - key: DATABASE_URL
+
+      # Χρειάζονται χειροκίνητη τιμή ΜΕΤΑ το create (sync: false)
+      - key: DATABASE_URL              # π.χ. postgresql://USER:P%40SS@HOST:5432/DB?sslmode=require
         sync: false
-      - key: ALERTS_SECRET
+      - key: ADMIN_KEY                 # για /admin/* (ως ?key= ή header x-admin-key)
         sync: false
-      - key: ADMIN_KEY
+      - key: ALERTS_SECRET             # για /cron (αν το χρησιμοποιήσεις)
         sync: false
-      - key: BOT_TOKEN
+      - key: BOT_TOKEN                 # Telegram bot token (αν το web στέλνει/χρειάζεται)
         sync: false
-      - key: TELEGRAM_CHAT_ID
+      - key: TELEGRAM_CHAT_ID          # προαιρετικό default chat id
         sync: false
-      - key: STRIPE_SECRET
+      - key: STRIPE_SECRET             # προαιρετικό (αν βάλεις Stripe)
         sync: false
-      - key: STRIPE_WEBHOOK_SECRET
+      - key: STRIPE_WEBHOOK_SECRET     # προαιρετικό (αν βάλεις Stripe)
         sync: false
 
   # ───────────────────────────── BACKGROUND WORKER ─────────────────────────────
@@ -50,12 +54,15 @@ services:
         value: "3.11.9"
       - key: ENV
         value: production
+
       - key: DATABASE_URL
         sync: false
       - key: BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+
+      # Ρυθμίζει κάθε πόσα δευτερόλεπτα τρέχει ο κύκλος του worker
       - key: WORKER_INTERVAL_SECONDS
         value: "60"
 
@@ -75,9 +82,10 @@ services:
         value: "3.11.9"
       - key: ENV
         value: production
-      - key: DATABASE_URL
+
+      - key: DATABASE_URL              # ώστε το bot να διαβάζει/γράφει στη DB
         sync: false
-      - key: BOT_TOKEN
+      - key: BOT_TOKEN                 # από @BotFather
         sync: false
-      - key: TELEGRAM_CHAT_ID
+      - key: TELEGRAM_CHAT_ID          # προαιρετικό default chat για ειδοποιήσεις
         sync: false
