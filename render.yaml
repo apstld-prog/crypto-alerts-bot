@@ -1,5 +1,5 @@
-# Render Blueprint: Crypto Alerts (Web API + Background Worker + Telegram Bot)
-# Όλα τα services στο Free plan με ρητά δηλωμένα env vars.
+# Render Blueprint: Crypto Alerts (Web API + Worker + Telegram Bot)
+# Region: Frankfurt • Plan: Free • Payments: PayPal
 
 services:
   # ─────────────────────────────── WEB (FastAPI) ───────────────────────────────
@@ -11,31 +11,39 @@ services:
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-    # ASGI (FastAPI) μέσω Gunicorn + Uvicorn worker
+    # ASGI (FastAPI) μέσω gunicorn + uvicorn worker
     startCommand: gunicorn -k uvicorn.workers.UvicornWorker server_combined:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
     autoDeploy: true
     healthCheckPath: /healthz
     envVars:
-      # Σταθερές (βάζουμε τιμή εδώ)
+      # σταθερά
       - key: PYTHON_VERSION
         value: "3.11.9"
       - key: ENV
         value: production
 
-      # Χρειάζονται χειροκίνητη τιμή ΜΕΤΑ το create (sync: false)
+      # συμπλήρωσε χειροκίνητα μετά το create (sync:false)
       - key: DATABASE_URL              # π.χ. postgresql://USER:P%40SS@HOST:5432/DB?sslmode=require
         sync: false
-      - key: ADMIN_KEY                 # για /admin/* (ως ?key= ή header x-admin-key)
+      - key: ADMIN_KEY                 # για /admin/* και bot cancel endpoint
         sync: false
-      - key: ALERTS_SECRET             # για /cron (αν το χρησιμοποιήσεις)
+      - key: ALERTS_SECRET             # για /cron?key=...
         sync: false
-      - key: BOT_TOKEN                 # Telegram bot token (αν το web στέλνει/χρειάζεται)
+
+      # Telegram (αν χρειαστεί να στείλει μηνύματα το Web)
+      - key: BOT_TOKEN
         sync: false
-      - key: TELEGRAM_CHAT_ID          # προαιρετικό default chat id
+      - key: TELEGRAM_CHAT_ID          # optional
         sync: false
-      - key: STRIPE_SECRET             # προαιρετικό (αν βάλεις Stripe)
+
+      # PayPal
+      - key: PAYPAL_ENV                # sandbox ή live
         sync: false
-      - key: STRIPE_WEBHOOK_SECRET     # προαιρετικό (αν βάλεις Stripe)
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_WEBHOOK_ID
         sync: false
 
   # ───────────────────────────── BACKGROUND WORKER ─────────────────────────────
@@ -62,7 +70,7 @@ services:
       - key: TELEGRAM_CHAT_ID
         sync: false
 
-      # Ρυθμίζει κάθε πόσα δευτερόλεπτα τρέχει ο κύκλος του worker
+      # κάθε πόσα δευτερόλεπτα τρέχει ο κύκλος alerts + premium downgrade
       - key: WORKER_INTERVAL_SECONDS
         value: "60"
 
@@ -83,9 +91,13 @@ services:
       - key: ENV
         value: production
 
-      - key: DATABASE_URL              # ώστε το bot να διαβάζει/γράφει στη DB
+      - key: DATABASE_URL
         sync: false
-      - key: BOT_TOKEN                 # από @BotFather
+      - key: BOT_TOKEN                # από @BotFather
         sync: false
-      - key: TELEGRAM_CHAT_ID          # προαιρετικό default chat για ειδοποιήσεις
+      - key: TELEGRAM_CHAT_ID        # optional
+        sync: false
+      - key: WEB_URL                 # π.χ. https://crypto-alerts-2-web.onrender.com
+        sync: false
+      - key: ADMIN_KEY               # το ίδιο με του Web (για /billing/paypal/cancel)
         sync: false
