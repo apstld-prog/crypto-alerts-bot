@@ -1,13 +1,10 @@
-# Render Blueprint: Crypto Alerts (Web API + Worker + Telegram Bot)
-# Region: Frankfurt • Plan: Free • Payments: PayPal
 
 services:
-  # ─────────────────────────────── WEB (FastAPI) ───────────────────────────────
   - type: web
     name: crypto-alerts-web
     env: python
     region: frankfurt
-    plan: free
+    plan: starter
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
@@ -19,22 +16,12 @@ services:
         value: "3.11.9"
       - key: ENV
         value: production
-
-      # Database & secrets
       - key: DATABASE_URL
         sync: false
       - key: ADMIN_KEY
         sync: false
       - key: ALERTS_SECRET
         sync: false
-
-      # Telegram (optional, αν θες να στέλνει μηνύματα το Web)
-      - key: BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_CHAT_ID
-        sync: false
-
-      # PayPal
       - key: PAYPAL_ENV
         sync: false
       - key: PAYPAL_CLIENT_ID
@@ -43,51 +30,26 @@ services:
         sync: false
       - key: PAYPAL_WEBHOOK_ID
         sync: false
-
-  # ───────────────────────────── BACKGROUND WORKER ─────────────────────────────
-  - type: worker
-    name: crypto-alerts-worker
-    env: python
-    region: frankfurt
-    plan: free
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
-    startCommand: python worker.py
-    autoDeploy: true
-    envVars:
-      - key: PYTHON_VERSION
-        value: "3.11.9"
-      - key: ENV
-        value: production
-
-      - key: DATABASE_URL
-        sync: false
       - key: BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
 
-      - key: WORKER_INTERVAL_SECONDS
-        value: "60"
-
-  # ─────────────────────────────── TELEGRAM BOT ────────────────────────────────
   - type: worker
-    name: crypto-alerts-bot
+    name: crypto-alerts-daemon
     env: python
     region: frankfurt
-    plan: free
+    plan: starter
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python daemon.py
     autoDeploy: true
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
       - key: ENV
         value: production
-
       - key: DATABASE_URL
         sync: false
       - key: BOT_TOKEN
@@ -98,3 +60,5 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      - key: WORKER_INTERVAL_SECONDS
+        value: "60"
