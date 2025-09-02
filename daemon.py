@@ -1,4 +1,3 @@
-
 import os
 import time
 import threading
@@ -9,17 +8,19 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from sqlalchemy import select, text
 
-from db import init_db, session_scope, User, Subscription, Alert
+from db import init_db, session_scope, User
 from worker_logic import run_alert_cycle
 
+# ====== ENV ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEB_URL = os.getenv("WEB_URL")
+WEB_URL = os.getenv("WEB_URL")           # π.χ. https://crypto-alerts-2-web.onrender.com
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
 
+# ====== TELEGRAM BOT HANDLERS ======
 HELP_TEXT = (
     "🤖 *Crypto Alerts Bot*\n"
     "/start - register\n"
@@ -76,7 +77,7 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
             data = r.json()
             until = data.get("keeps_access_until")
             if until:
-                await update.message.reply_text(f"✅ Auto-renew cancelled. Your premium remains active until: {until}")
+                await update.message.reply_text(f"✅ Auto-renew cancelled.\nYour premium remains active until: {until}")
             else:
                 await update.message.reply_text("✅ Auto-renew cancelled. Your premium remains active until the end of the current period.")
         else:
@@ -84,7 +85,27 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         await update.message.reply_text(f"❌ Cancel error: {e}")
 
-def start_bot_polling():
+# ====== ALERTS LOOP (σε ξεχωριστό thread) ======
+def alerts_loop():
+    print({"msg": "alerts_loop_start", "interval": INTERVAL_SECONDS})
+    init_db()
+    while True:
+        ts = datetime.utcnow().isoformat()
+        try:
+            with session_scope() as session:
+                counters = run_alert_cycle(session)   # κάνει και downgrade premium όταν λήξει η περίοδος
+            print({"msg": "alert_cycle", "ts": ts, **counters})
+        except Exception as e:
+            print({"msg": "alert_cycle_error", "ts": ts, "error": str(e)})
+        time.sleep(INTERVAL_SECONDS)
+
+# ====== MAIN ======
+def main():
+    # 1) Ξεκίνα το alerts loop σε background thread
+    t = threading.Thread(target=alerts_loop, daemon=True)
+    t.start()
+
+    # 2) Τρέξε ΤΟΝ BOT στο main thread (απαραίτητο για asyncio/PTB v20+)
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -92,22 +113,8 @@ def start_bot_polling():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
     print({"msg": "bot_start"})
+    # run_polling μπλοκάρει στο main thread, όπως πρέπει
     app.run_polling(allowed_updates=None, drop_pending_updates=False)
 
-def start_alerts_loop():
-    print({"msg": "alerts_loop_start", "interval": INTERVAL_SECONDS})
-    init_db()
-    while True:
-        ts = datetime.utcnow().isoformat()
-        try:
-            with session_scope() as session:
-                counters = run_alert_cycle(session)
-            print({"msg": "alert_cycle", "ts": ts, **counters})
-        except Exception as e:
-            print({"msg": "alert_cycle_error", "ts": ts, "error": str(e)})
-        time.sleep(INTERVAL_SECONDS)
-
 if __name__ == "__main__":
-    t_bot = threading.Thread(target=start_bot_polling, daemon=True)
-    t_bot.start()
-    start_alerts_loop()
+    main()
