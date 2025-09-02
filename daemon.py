@@ -3,6 +3,7 @@ from datetime import datetime
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import Conflict
 from sqlalchemy import select, text
 from db import init_db, session_scope, User, Alert, engine
 from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
@@ -26,16 +27,16 @@ if not BOT_TOKEN:
 BOT_LOCK_ID = 911001    # μοναδικά ids για locks
 ALERTS_LOCK_ID = 911002
 
+from sqlalchemy import text as _sqltext
 def try_advisory_lock(lock_id: int) -> bool:
-    """Επιστρέφει True αν πήραμε αποκλειστικό lock, αλλιώς False."""
     try:
         with engine.connect() as conn:
-            res = conn.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id}).scalar()
+            res = conn.execute(_sqltext("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id}).scalar()
             return bool(res)
-    except Exception:
-        # Αν τρέχεις SQLite τοπικά, δεν υπάρχει pg_try_advisory_lock.
-        # Επιστρέφουμε True ΜΟΝΟ αν ξέρεις ότι τρέχεις ένα instance.
-        return True
+    except Exception as e:
+        # Αν δεν υπάρχει Postgres (π.χ. τοπικά), καλύτερα να ΜΗΝ ξεκινήσει δεύτερο bot
+        print({"msg": "advisory_lock_error", "error": str(e)})
+        return False
 
 # ───────── Texts/Keyboards ─────────
 START_TEXT = (
@@ -90,7 +91,6 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"💹 {pair}: *{price:.6f}* USDT", parse_mode="Markdown")
 
 ALERT_RE = re.compile(r"^(?P<sym>[A-Za-z0-9/]+)\s*(?P<op>>|<)\s*(?P<val>[0-9]+(\.[0-9]+)?)$")
-
 async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /setalert <SYMBOL> <op> <value>\nExample: /setalert BTC > 110000")
@@ -100,6 +100,7 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Format error. Example: /setalert BTC > 110000")
         return
     sym, op, val = m.group("sym"), m.group("op"), float(m.group("val"))
+    from worker_logic import resolve_symbol
     pair = resolve_symbol(sym)
     if not pair:
         await update.message.reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, SHIB, PEPE ...")
@@ -178,7 +179,6 @@ def alerts_loop():
         time.sleep(INTERVAL_SECONDS)
 
 def delete_webhook_if_any():
-    """Σβήνει τυχόν Telegram webhook πριν ξεκινήσει το polling, για να αποφύγουμε conflicts."""
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
         r = requests.get(url, timeout=10)
@@ -194,15 +194,13 @@ def main():
 
     # Bot στο main thread, μόνο αν έχουμε lock
     if not RUN_BOT:
-        print({"msg": "bot_disabled_env"})
-        return
+        print({"msg": "bot_disabled_env"}); return
     if not try_advisory_lock(BOT_LOCK_ID):
         print({"msg": "bot_lock_skipped"})
         # Μένουμε ζωντανοί για να τρέχει το alerts thread
         while True: time.sleep(3600)
 
     init_db()
-    # Σβήσε webhook πριν ξεκινήσει το polling (αν υπάρχει)
     delete_webhook_if_any()
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -213,7 +211,15 @@ def main():
     app.add_handler(CommandHandler("myalerts", cmd_myalerts))
     app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
     print({"msg": "bot_start"})
-    app.run_polling(allowed_updates=None, drop_pending_updates=False)
+
+    # Αν υπάρχει άλλο polling, πιάσε το Conflict και προσπάθησε ξανά αργότερα
+    while True:
+        try:
+            app.run_polling(allowed_updates=None, drop_pending_updates=False)
+            break  # κανονικό exit (π.χ. stop)
+        except Conflict as e:
+            print({"msg": "bot_conflict_retry", "error": str(e)})
+            time.sleep(30)
 
 if __name__ == "__main__":
     main()
