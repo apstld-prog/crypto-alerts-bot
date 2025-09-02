@@ -15,7 +15,7 @@ INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS","60"))
 PAYPAL_SUBSCRIBE_URL = os.getenv("PAYPAL_SUBSCRIBE_URL")
 FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT","3"))
 
-# Προαιρετικά flags για χειροκίνητο έλεγχο
+# Προαιρετικά flags για χειροκίνητο έλεγχο ρόλων
 RUN_BOT = os.getenv("RUN_BOT", "1") == "1"
 RUN_ALERTS = os.getenv("RUN_ALERTS", "1") == "1"
 
@@ -23,7 +23,7 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
 
 # ───────── Advisory Locks (Postgres) ─────────
-BOT_LOCK_ID = 911001    # μοναδικοί αριθμοί για κάθε ρόλο
+BOT_LOCK_ID = 911001    # μοναδικά ids για locks
 ALERTS_LOCK_ID = 911002
 
 def try_advisory_lock(lock_id: int) -> bool:
@@ -33,7 +33,8 @@ def try_advisory_lock(lock_id: int) -> bool:
             res = conn.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id}).scalar()
             return bool(res)
     except Exception:
-        # Αν είσαι σε SQLite local ή κάτι απέτυχε, για ασφάλεια κάνε True ΜΟΝΟ αν δεν έχεις πολλαπλά instances
+        # Αν τρέχεις SQLite τοπικά, δεν υπάρχει pg_try_advisory_lock.
+        # Επιστρέφουμε True ΜΟΝΟ αν ξέρεις ότι τρέχεις ένα instance.
         return True
 
 # ───────── Texts/Keyboards ─────────
@@ -176,13 +177,22 @@ def alerts_loop():
             print({"msg": "alert_cycle_error", "ts": ts, "error": str(e)})
         time.sleep(INTERVAL_SECONDS)
 
+def delete_webhook_if_any():
+    """Σβήνει τυχόν Telegram webhook πριν ξεκινήσει το polling, για να αποφύγουμε conflicts."""
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+        r = requests.get(url, timeout=10)
+        print({"msg": "delete_webhook", "status": r.status_code, "body": r.text[:200]})
+    except Exception as e:
+        print({"msg": "delete_webhook_error", "error": str(e)})
+
 # ───────── Main ─────────
 def main():
     # Alerts σε background thread (με lock)
     t = threading.Thread(target=alerts_loop, daemon=True)
     t.start()
 
-    # Bot στο main thread, αλλά ΜΟΝΟ αν κρατάμε lock
+    # Bot στο main thread, μόνο αν έχουμε lock
     if not RUN_BOT:
         print({"msg": "bot_disabled_env"})
         return
@@ -192,6 +202,9 @@ def main():
         while True: time.sleep(3600)
 
     init_db()
+    # Σβήσε webhook πριν ξεκινήσει το polling (αν υπάρχει)
+    delete_webhook_if_any()
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
