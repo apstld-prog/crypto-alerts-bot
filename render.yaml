@@ -1,45 +1,18 @@
-
 services:
   - type: web
     name: crypto-alerts-web
     env: python
+    plan: free   # ή starter αν θες σταθερό uptime
     region: frankfurt
-    plan: starter
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
-    startCommand: gunicorn -k uvicorn.workers.UvicornWorker server_combined:app --bind 0.0.0.0:$PORT
-    autoDeploy: true
-    healthCheckPath: /healthz
-    envVars:
-      - key: DATABASE_URL
-        sync: false
-      - key: ADMIN_KEY
-        sync: false
-      - key: ALERTS_SECRET
-        sync: false
-      - key: PAYPAL_ENV
-        sync: false
-      - key: PAYPAL_CLIENT_ID
-        sync: false
-      - key: PAYPAL_CLIENT_SECRET
-        sync: false
-      - key: PAYPAL_WEBHOOK_ID
-        sync: false
-      - key: BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_CHAT_ID
-        sync: false
-  - type: worker
-    name: crypto-alerts-daemon
-    env: python
-    region: frankfurt
-    plan: starter
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
-    startCommand: python daemon.py
-    autoDeploy: true
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: >
+      gunicorn server_combined:app
+      -k uvicorn.workers.UvicornWorker
+      --bind 0.0.0.0:$PORT
+      --workers 2
+      --timeout 60
+      --graceful-timeout 30
+      --keep-alive 5
     envVars:
       - key: DATABASE_URL
         sync: false
@@ -49,9 +22,44 @@ services:
         sync: false
       - key: ADMIN_KEY
         sync: false
-      - key: TELEGRAM_CHAT_ID
+      - key: PAYPAL_CLIENT_ID
         sync: false
-      - key: WORKER_INTERVAL_SECONDS
-        value: "60"
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
       - key: PAYPAL_SUBSCRIBE_URL
         sync: false
+      - key: FREE_ALERT_LIMIT
+        value: "3"
+      - key: WORKER_INTERVAL_SECONDS
+        value: "60"
+
+  - type: worker
+    name: crypto-alerts-daemon
+    env: python
+    plan: free
+    region: frankfurt
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python daemon.py"
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEB_URL
+        sync: false
+      - key: ADMIN_KEY
+        sync: false
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_SUBSCRIBE_URL
+        sync: false
+      - key: FREE_ALERT_LIMIT
+        value: "3"
+      - key: WORKER_INTERVAL_SECONDS
+        value: "60"
+      - key: RUN_BOT
+        value: "1"
+      - key: RUN_ALERTS
+        value: "1"
