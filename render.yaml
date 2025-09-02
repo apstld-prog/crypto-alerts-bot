@@ -2,8 +2,7 @@ services:
   - type: web
     name: crypto-alerts-web
     env: python
-    plan: free   # ή starter αν θες σταθερό uptime
-    region: frankfurt
+    plan: free        # βάλε starter αν θες 24/7
     buildCommand: "pip install -r requirements.txt"
     startCommand: >
       gunicorn server_combined:app
@@ -37,7 +36,6 @@ services:
     name: crypto-alerts-daemon
     env: python
     plan: free
-    region: frankfurt
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python daemon.py"
     envVars:
