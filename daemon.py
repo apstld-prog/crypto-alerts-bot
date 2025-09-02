@@ -24,17 +24,15 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
 
 # ───────── Advisory Locks (Postgres) ─────────
-BOT_LOCK_ID = 911001    # μοναδικά ids για locks
+BOT_LOCK_ID = 911001
 ALERTS_LOCK_ID = 911002
 
-from sqlalchemy import text as _sqltext
 def try_advisory_lock(lock_id: int) -> bool:
     try:
         with engine.connect() as conn:
-            res = conn.execute(_sqltext("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id}).scalar()
+            res = conn.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id}).scalar()
             return bool(res)
     except Exception as e:
-        # Αν δεν υπάρχει Postgres (π.χ. τοπικά), καλύτερα να ΜΗΝ ξεκινήσει δεύτερο bot
         print({"msg": "advisory_lock_error", "error": str(e)})
         return False
 
@@ -91,6 +89,7 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"💹 {pair}: *{price:.6f}* USDT", parse_mode="Markdown")
 
 ALERT_RE = re.compile(r"^(?P<sym>[A-Za-z0-9/]+)\s*(?P<op>>|<)\s*(?P<val>[0-9]+(\.[0-9]+)?)$")
+
 async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /setalert <SYMBOL> <op> <value>\nExample: /setalert BTC > 110000")
@@ -100,7 +99,6 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Format error. Example: /setalert BTC > 110000")
         return
     sym, op, val = m.group("sym"), m.group("op"), float(m.group("val"))
-    from worker_logic import resolve_symbol
     pair = resolve_symbol(sym)
     if not pair:
         await update.message.reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, SHIB, PEPE ...")
@@ -112,9 +110,11 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user:
             user = User(telegram_id=tg_id, is_premium=False)
             session.add(user); session.flush()
-        active_alerts = session.execute(text(
-            "SELECT COUNT(*) FROM alerts WHERE user_id=:uid AND enabled=1"
-        ), {"uid": user.id}).scalar_one()
+        # ✅ PostgreSQL boolean (όχι enabled=1)
+        active_alerts = session.execute(
+            text("SELECT COUNT(*) FROM alerts WHERE user_id=:uid AND enabled = TRUE"),
+            {"uid": user.id}
+        ).scalar_one()
         if (not user.is_premium) and active_alerts >= FREE_ALERT_LIMIT:
             await update.message.reply_text(f"Free plan limit reached ({FREE_ALERT_LIMIT}). Upgrade for unlimited.")
             return
@@ -197,7 +197,6 @@ def main():
         print({"msg": "bot_disabled_env"}); return
     if not try_advisory_lock(BOT_LOCK_ID):
         print({"msg": "bot_lock_skipped"})
-        # Μένουμε ζωντανοί για να τρέχει το alerts thread
         while True: time.sleep(3600)
 
     init_db()
@@ -212,11 +211,10 @@ def main():
     app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
     print({"msg": "bot_start"})
 
-    # Αν υπάρχει άλλο polling, πιάσε το Conflict και προσπάθησε ξανά αργότερα
     while True:
         try:
             app.run_polling(allowed_updates=None, drop_pending_updates=False)
-            break  # κανονικό exit (π.χ. stop)
+            break
         except Conflict as e:
             print({"msg": "bot_conflict_retry", "error": str(e)})
             time.sleep(30)
