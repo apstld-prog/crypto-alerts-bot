@@ -1,15 +1,17 @@
-# Render Blueprint: Crypto Alerts (EU Frankfurt)
-# Docs: https://render.com/docs/blueprint-spec
+# Render Blueprint: Crypto Alerts (Web API + Background Worker + Telegram Bot)
+# Ανέβασε αυτό το αρχείο στη ρίζα του repo και δημιούργησε Blueprint Instance στο Render.
 
 services:
+  # ─────────────────────────────── WEB (FastAPI) ───────────────────────────────
   - type: web
     name: crypto-alerts-web
     env: python
-    region: frankfurt
-    plan: starter
+    region: frankfurt                 # κράτα ίδια region με τα υπόλοιπα
+    plan: starter                     # μπορείς να το αλλάξεις σε free αν θες
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
+    # Χρησιμοποιούμε uvicorn worker για ASGI (FastAPI), αλλιώς θα πάρεις σφάλμα WSGI.
     startCommand: gunicorn -k uvicorn.workers.UvicornWorker server_combined:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
     autoDeploy: true
     healthCheckPath: /healthz
@@ -18,21 +20,22 @@ services:
         value: "3.11.9"
       - key: ENV
         value: production
-      - key: DATABASE_URL
+      - key: DATABASE_URL            # π.χ. postgresql://USER:P%40SS@HOST/db?sslmode=require
         sync: false
-      - key: ALERTS_SECRET
+      - key: ALERTS_SECRET           # για /cron (αν ποτέ το χρησιμοποιήσεις)
         sync: false
-      - key: ADMIN_KEY
+      - key: ADMIN_KEY               # για /admin/* (ως ?key= ή header x-admin-key)
         sync: false
-      - key: BOT_TOKEN
+      - key: BOT_TOKEN               # χρησιμοποιείται και από web αν στείλει ειδοποίηση
         sync: false
-      - key: TELEGRAM_CHAT_ID
+      - key: TELEGRAM_CHAT_ID        # προαιρετικό default chat id
         sync: false
-      - key: STRIPE_SECRET
+      - key: STRIPE_SECRET           # προαιρετικό
         sync: false
-      - key: STRIPE_WEBHOOK_SECRET
+      - key: STRIPE_WEBHOOK_SECRET   # προαιρετικό
         sync: false
 
+  # ───────────────────────────── BACKGROUND WORKER ─────────────────────────────
   - type: worker
     name: crypto-alerts-worker
     env: python
@@ -56,3 +59,26 @@ services:
         sync: false
       - key: WORKER_INTERVAL_SECONDS
         value: "60"
+
+  # ─────────────────────────────── TELEGRAM BOT ────────────────────────────────
+  - type: worker
+    name: crypto-alerts-bot
+    env: python
+    region: frankfurt
+    plan: starter
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: python bot.py       # polling bot
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: ENV
+        value: production
+      - key: DATABASE_URL             # ώστε το bot να διαβάζει/γράφει στη DB
+        sync: false
+      - key: BOT_TOKEN                # από @BotFather
+        sync: false
+      - key: TELEGRAM_CHAT_ID         # προαιρετικό default chat για ειδοποιήσεις
+        sync: false
