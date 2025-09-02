@@ -11,33 +11,31 @@ services:
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-    # ASGI (FastAPI) μέσω gunicorn + uvicorn worker
     startCommand: gunicorn -k uvicorn.workers.UvicornWorker server_combined:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
     autoDeploy: true
     healthCheckPath: /healthz
     envVars:
-      # σταθερά
       - key: PYTHON_VERSION
         value: "3.11.9"
       - key: ENV
         value: production
 
-      # συμπλήρωσε χειροκίνητα μετά το create (sync:false)
-      - key: DATABASE_URL              # π.χ. postgresql://USER:P%40SS@HOST:5432/DB?sslmode=require
+      # Database & secrets
+      - key: DATABASE_URL
         sync: false
-      - key: ADMIN_KEY                 # για /admin/* και bot cancel endpoint
+      - key: ADMIN_KEY
         sync: false
-      - key: ALERTS_SECRET             # για /cron?key=...
+      - key: ALERTS_SECRET
         sync: false
 
-      # Telegram (αν χρειαστεί να στείλει μηνύματα το Web)
+      # Telegram (optional, αν θες να στέλνει μηνύματα το Web)
       - key: BOT_TOKEN
         sync: false
-      - key: TELEGRAM_CHAT_ID          # optional
+      - key: TELEGRAM_CHAT_ID
         sync: false
 
       # PayPal
-      - key: PAYPAL_ENV                # sandbox ή live
+      - key: PAYPAL_ENV
         sync: false
       - key: PAYPAL_CLIENT_ID
         sync: false
@@ -70,7 +68,6 @@ services:
       - key: TELEGRAM_CHAT_ID
         sync: false
 
-      # κάθε πόσα δευτερόλεπτα τρέχει ο κύκλος alerts + premium downgrade
       - key: WORKER_INTERVAL_SECONDS
         value: "60"
 
@@ -93,11 +90,11 @@ services:
 
       - key: DATABASE_URL
         sync: false
-      - key: BOT_TOKEN                # από @BotFather
+      - key: BOT_TOKEN
         sync: false
-      - key: TELEGRAM_CHAT_ID        # optional
+      - key: WEB_URL
         sync: false
-      - key: WEB_URL                 # π.χ. https://crypto-alerts-2-web.onrender.com
+      - key: ADMIN_KEY
         sync: false
-      - key: ADMIN_KEY               # το ίδιο με του Web (για /billing/paypal/cancel)
+      - key: TELEGRAM_CHAT_ID
         sync: false
