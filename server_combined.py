@@ -1,11 +1,12 @@
 import os
 import json
-from typing import Optional
+from typing import Optional, Tuple
 
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy import text, select, func
 from dotenv import load_dotenv
+import requests
 
 from db import init_db, session_scope, User, Subscription, Alert
 from worker_logic import run_alert_cycle
@@ -17,9 +18,15 @@ app = FastAPI(title="Crypto Alerts API")
 
 # Secrets & configs from env
 ALERTS_SECRET = os.getenv("ALERTS_SECRET")
-STRIPE_SECRET = os.getenv("STRIPE_SECRET")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 ADMIN_KEY = os.getenv("ADMIN_KEY")
+
+# ---- PayPal config
+PAYPAL_ENV = (os.getenv("PAYPAL_ENV") or "sandbox").lower()  # sandbox | live
+PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID")
+PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET")
+PAYPAL_WEBHOOK_ID = os.getenv("PAYPAL_WEBHOOK_ID")  # from Dashboard → Webhooks
+
+PAYPAL_API = "https://api-m.paypal.com" if PAYPAL_ENV == "live" else "https://api-m.sandbox.paypal.com"
 
 
 @app.on_event("startup")
@@ -30,7 +37,7 @@ def on_startup():
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "crypto-alerts"}
+    return {"ok": True, "service": "crypto-alerts", "payments": "paypal", "env": PAYPAL_ENV}
 
 
 @app.get("/healthz")
@@ -89,29 +96,139 @@ def cron(request: Request):
     return {"ok": True, "counters": counters}
 
 
-# ============ Stripe webhook (optional) ============
-@app.post("/webhooks/stripe")
-async def stripe_webhook(request: Request):
-    if not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=400, detail="Stripe webhook not configured")
+# =============================================================================
+#                               PayPal Webhooks
+# =============================================================================
 
-    import stripe
-    stripe.api_key = STRIPE_SECRET
+def _paypal_get_token() -> str:
+    """Get OAuth2 access token from PayPal."""
+    if not (PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET):
+        raise HTTPException(status_code=400, detail="PayPal not configured (missing client id/secret)")
+    try:
+        r = requests.post(
+            f"{PAYPAL_API}/v1/oauth2/token",
+            auth=(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET),
+            data={"grant_type": "client_credentials"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json()["access_token"]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"paypal_oauth_error: {e}")
 
-    payload = await request.body()
-    sig_header = request.headers.get("Stripe-Signature")
+
+def _paypal_verify_webhook(headers: dict, body: dict) -> bool:
+    """Verify PayPal webhook signature per docs using /v1/notifications/verify-webhook-signature."""
+    if not PAYPAL_WEBHOOK_ID:
+        # You can still accept (NOT recommended), but here we enforce presence.
+        raise HTTPException(status_code=400, detail="PayPal not configured (missing PAYPAL_WEBHOOK_ID)")
+
+    transmission_id = headers.get("paypal-transmission-id")
+    transmission_time = headers.get("paypal-transmission-time")
+    cert_url = headers.get("paypal-cert-url")
+    auth_algo = headers.get("paypal-auth-algo")
+    transmission_sig = headers.get("paypal-transmission-sig")
+
+    if not all([transmission_id, transmission_time, cert_url, auth_algo, transmission_sig]):
+        raise HTTPException(status_code=400, detail="Missing PayPal verification headers")
+
+    token = _paypal_get_token()
 
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
+        vr = requests.post(
+            f"{PAYPAL_API}/v1/notifications/verify-webhook-signature",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            json={
+                "auth_algo": auth_algo,
+                "cert_url": cert_url,
+                "transmission_id": transmission_id,
+                "transmission_sig": transmission_sig,
+                "transmission_time": transmission_time,
+                "webhook_id": PAYPAL_WEBHOOK_ID,
+                "webhook_event": body,
+            },
+            timeout=20,
+        )
+        vr.raise_for_status()
+        status = vr.json().get("verification_status")
+        return status == "SUCCESS" or status == "VERIFIED"  # docs use "SUCCESS"
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"paypal_verify_error: {e}")
 
-    etype = event["type"]
-    data = event["data"]["object"]
 
-    # TODO: handle subscription updates & map to DB
-    print({"msg": "stripe_event", "type": etype, "id": event.get("id")})
-    return {"ok": True}
+def _attach_subscription_to_user_and_upsert(session, provider_status: str, status_internal: str,
+                                            custom_id: Optional[str]) -> Tuple[Optional[int], bool]:
+    """
+    Link subscription to a user via custom_id (we expect you pass telegram_id as custom_id during checkout).
+    If user found: set is_premium for ACTIVE, insert a Subscription row (provider='paypal').
+    Returns (user_id, created_new_row:boolean).
+    """
+    user_id = None
+    created = False
+
+    if custom_id:
+        # Try to find user by telegram_id == custom_id
+        user = session.execute(select(User).where(User.telegram_id == str(custom_id))).scalar_one_or_none()
+        if user:
+            user_id = user.id
+            # Update premium flag
+            user.is_premium = (status_internal == "ACTIVE")
+            session.add(user)
+
+    # Insert a new subscription row (simple history). We don't store PayPal sub ID to avoid schema changes.
+    sub = Subscription(
+        user_id=user_id,
+        provider="paypal",
+        provider_status=provider_status,  # e.g., ACTIVE, CANCELLED
+        status_internal=status_internal,  # ACTIVE | CANCELLED
+    )
+    session.add(sub)
+    created = True
+    session.flush()
+
+    return user_id, created
+
+
+@app.post("/webhooks/paypal")
+async def paypal_webhook(request: Request):
+    """
+    Handle PayPal webhooks.
+
+    IMPORTANT:
+    - During your PayPal subscription checkout flow you should pass a `custom_id` that equals the user's Telegram ID.
+      Then webhooks will allow us to map the payer to a User and flip is_premium.
+    """
+    raw_body = await request.body()
+    try:
+        body = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # Verify signature
+    if not _paypal_verify_webhook(request.headers, body):
+        raise HTTPException(status_code=400, detail="Invalid PayPal signature")
+
+    event_type = body.get("event_type")
+    resource = body.get("resource", {}) or {}
+
+    # Common fields
+    status = resource.get("status")  # e.g., ACTIVE, CANCELLED
+    custom_id = resource.get("custom_id")  # we expect telegram_id here (optional but recommended)
+
+    handled = False
+    with session_scope() as session:
+        # Map key events: ACTIVATED / CANCELLED / EXPIRED / PAYMENT.CAPTURE.COMPLETED
+        if event_type in ("BILLING.SUBSCRIPTION.ACTIVATED", "PAYMENT.SALE.COMPLETED", "PAYMENT.CAPTURE.COMPLETED"):
+            _attach_subscription_to_user_and_upsert(session, provider_status=status or "ACTIVE", status_internal="ACTIVE", custom_id=custom_id)
+            handled = True
+        elif event_type in ("BILLING.SUBSCRIPTION.CANCELLED", "BILLING.SUBSCRIPTION.SUSPENDED", "BILLING.SUBSCRIPTION.EXPIRED"):
+            _attach_subscription_to_user_and_upsert(session, provider_status=status or "CANCELLED", status_internal="CANCELLED", custom_id=custom_id)
+            handled = True
+
+    return {"ok": True, "handled": handled, "event_type": event_type, "status": status, "custom_id": custom_id}
 
 
 # ============ Admin (protected) ============
