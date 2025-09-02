@@ -1,120 +1,92 @@
-import os
-import time
-import threading
-from datetime import datetime
 
+import os, time, threading, re
+from datetime import datetime
 import requests
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 from sqlalchemy import select, text
+from db import init_db, session_scope, User, Alert
+from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
 
-from db import init_db, session_scope, User
-from worker_logic import run_alert_cycle
-
-# ====== ENV ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEB_URL = os.getenv("WEB_URL")           # π.χ. https://crypto-alerts-2-web.onrender.com
+WEB_URL = os.getenv("WEB_URL")
 ADMIN_KEY = os.getenv("ADMIN_KEY")
-INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
+INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS","60"))
+PAYPAL_SUBSCRIBE_URL = os.getenv("PAYPAL_SUBSCRIBE_URL")
+FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT","3"))
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN missing")
+HELP_TEXT = "Commands: /price, /setalert, /myalerts, /cancel_autorenew"
 
-# ====== TELEGRAM BOT HANDLERS ======
-HELP_TEXT = (
-    "🤖 *Crypto Alerts Bot*\n"
-    "/start - register\n"
-    "/stats - show bot stats\n"
-    "/cancel_autorenew - stop future billing, keep access until period end\n"
-    "/help - show this help\n"
-)
+def upgrade_keyboard():
+    if PAYPAL_SUBSCRIBE_URL:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("💠 Upgrade with PayPal", url=PAYPAL_SUBSCRIBE_URL)]])
+    return None
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = str(update.effective_user.id) if update.effective_user else None
+    tg_id = str(update.effective_user.id)
     with session_scope() as session:
-        user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
+        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
         if not user:
             user = User(telegram_id=tg_id, is_premium=False)
             session.add(user)
             session.flush()
-    await update.message.reply_text("👋 Welcome! You're registered.\nUse /help for commands.")
+    await update.message.reply_text("Welcome! Use /help.", reply_markup=upgrade_keyboard())
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+    await update.message.reply_text(HELP_TEXT, reply_markup=upgrade_keyboard())
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with session_scope() as session:
-        users = session.execute(text("SELECT COUNT(*) FROM users")).scalar_one()
-        premium = session.execute(text("SELECT COUNT(*) FROM users WHERE is_premium = 1")).scalar_one()
-        alerts = session.execute(text("""
-            SELECT COUNT(*) FROM alerts
-            WHERE enabled = 1 AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
-        """)).scalar_one()
-        subs = session.execute(text("""
-            SELECT COUNT(*) FROM subscriptions WHERE status_internal IN ('ACTIVE','CANCEL_AT_PERIOD_END')
-        """)).scalar_one()
-    msg = (
-        "📊 *Bot Stats*\n\n"
-        f"👥 Users: {users}\n"
-        f"💎 Premium users: {premium}\n"
-        f"🔔 Active alerts: {alerts}\n"
-        f"🧾 Subscriptions: ACTIVE_OR_CANCEL_AT_PERIOD_END={subs}\n"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not WEB_URL or not ADMIN_KEY:
-        await update.message.reply_text("⚠️ Cancel not available right now. Try again later.")
+async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /price BTC")
         return
-    tg_id = str(update.effective_user.id) if update.effective_user else None
-    try:
-        r = requests.post(
-            f"{WEB_URL}/billing/paypal/cancel",
-            params={"telegram_id": tg_id, "key": ADMIN_KEY},
-            timeout=20,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            until = data.get("keeps_access_until")
-            if until:
-                await update.message.reply_text(f"✅ Auto-renew cancelled.\nYour premium remains active until: {until}")
-            else:
-                await update.message.reply_text("✅ Auto-renew cancelled. Your premium remains active until the end of the current period.")
-        else:
-            await update.message.reply_text(f"❌ Cancel failed: {r.text}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Cancel error: {e}")
+    pair = resolve_symbol(context.args[0])
+    if not pair:
+        await update.message.reply_text("Unknown symbol")
+        return
+    price = fetch_price_binance(pair)
+    await update.message.reply_text(f"{pair} = {price} USDT")
 
-# ====== ALERTS LOOP (σε ξεχωριστό thread) ======
+ALERT_RE = re.compile(r"^(?P<sym>\w+)\s*(?P<op>>|<)\s*(?P<val>[0-9]+(\.[0-9]+)?)$")
+
+async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /setalert BTC > 30000")
+        return
+    m = ALERT_RE.match(" ".join(context.args))
+    if not m:
+        await update.message.reply_text("Format error")
+        return
+    sym, op, val = m.group("sym"), m.group("op"), float(m.group("val"))
+    pair = resolve_symbol(sym)
+    rule = "price_above" if op==">" else "price_below"
+    tg_id = str(update.effective_user.id)
+    with session_scope() as session:
+        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        if not user: return
+        active_alerts = session.execute(text("SELECT COUNT(*) FROM alerts WHERE user_id=:uid"),{"uid":user.id}).scalar_one()
+        if not user.is_premium and active_alerts>=FREE_ALERT_LIMIT:
+            await update.message.reply_text("Free limit reached. Upgrade!")
+            return
+        alert = Alert(user_id=user.id, symbol=pair, rule=rule, value=val, cooldown_seconds=900)
+        session.add(alert); session.flush()
+        aid = alert.id
+    await update.message.reply_text(f"Alert #{aid} set.")
+
 def alerts_loop():
-    print({"msg": "alerts_loop_start", "interval": INTERVAL_SECONDS})
-    init_db()
     while True:
-        ts = datetime.utcnow().isoformat()
-        try:
-            with session_scope() as session:
-                counters = run_alert_cycle(session)   # κάνει και downgrade premium όταν λήξει η περίοδος
-            print({"msg": "alert_cycle", "ts": ts, **counters})
-        except Exception as e:
-            print({"msg": "alert_cycle_error", "ts": ts, "error": str(e)})
+        with session_scope() as session:
+            run_alert_cycle(session)
         time.sleep(INTERVAL_SECONDS)
 
-# ====== MAIN ======
 def main():
-    # 1) Ξεκίνα το alerts loop σε background thread
-    t = threading.Thread(target=alerts_loop, daemon=True)
-    t.start()
-
-    # 2) Τρέξε ΤΟΝ BOT στο main thread (απαραίτητο για asyncio/PTB v20+)
+    threading.Thread(target=alerts_loop,daemon=True).start()
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
-    print({"msg": "bot_start"})
-    # run_polling μπλοκάρει στο main thread, όπως πρέπει
-    app.run_polling(allowed_updates=None, drop_pending_updates=False)
+    app.add_handler(CommandHandler("price", cmd_price))
+    app.add_handler(CommandHandler("setalert", cmd_setalert))
+    print("Bot started")
+    app.run_polling()
 
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()

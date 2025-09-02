@@ -8,14 +8,10 @@ services:
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-    startCommand: gunicorn -k uvicorn.workers.UvicornWorker server_combined:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker server_combined:app --bind 0.0.0.0:$PORT
     autoDeploy: true
     healthCheckPath: /healthz
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.11.9"
-      - key: ENV
-        value: production
       - key: DATABASE_URL
         sync: false
       - key: ADMIN_KEY
@@ -34,7 +30,6 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-
   - type: worker
     name: crypto-alerts-daemon
     env: python
@@ -46,10 +41,6 @@ services:
     startCommand: python daemon.py
     autoDeploy: true
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.11.9"
-      - key: ENV
-        value: production
       - key: DATABASE_URL
         sync: false
       - key: BOT_TOKEN
@@ -62,3 +53,5 @@ services:
         sync: false
       - key: WORKER_INTERVAL_SECONDS
         value: "60"
+      - key: PAYPAL_SUBSCRIBE_URL
+        sync: false
