@@ -2,7 +2,7 @@ services:
   - type: web
     name: crypto-alerts-web
     env: python
-    plan: free        # βάλε starter αν θες 24/7
+    plan: starter
     buildCommand: "pip install -r requirements.txt"
     startCommand: >
       gunicorn server_combined:app
@@ -35,7 +35,7 @@ services:
   - type: worker
     name: crypto-alerts-daemon
     env: python
-    plan: free
+    plan: starter
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python daemon.py"
     envVars:
