@@ -5,7 +5,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import Conflict
 from sqlalchemy import select, text
-from db import init_db, session_scope, User, Alert, engine
+from db import init_db, session_scope, User, Alert, Subscription, engine
 from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
 
 # ───────── ENV ─────────
@@ -20,8 +20,14 @@ FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT","3"))
 RUN_BOT = os.getenv("RUN_BOT", "1") == "1"
 RUN_ALERTS = os.getenv("RUN_ALERTS", "1") == "1"
 
+# 🔐 Admins: comma-separated Telegram user IDs
+_ADMIN_IDS = {s.strip() for s in (os.getenv("ADMIN_TELEGRAM_IDS") or "").split(",") if s.strip()}
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
+
+def is_admin(tg_id: str | None) -> bool:
+    return (tg_id or "") in _ADMIN_IDS
 
 # ───────── Advisory Locks (Postgres) ─────────
 BOT_LOCK_ID = 911001
@@ -37,16 +43,22 @@ def try_advisory_lock(lock_id: int) -> bool:
         return False
 
 # ───────── Texts/Keyboards ─────────
-START_TEXT = (
-    "🧭 *Crypto Alerts Bot*\n"
-    "_Fast prices • Diagnostics • Alerts_\n\n"
-    "### 🚀 *Getting Started*\n"
-    "• `/price BTC` — current price in USD (e.g., `/price ETH`).\n"
-    "• `/setalert BTC > 110000` — alert when condition is met.\n"
-    "• `/myalerts` — list your active alerts.\n"
-    "• `/help` — full instructions.\n\n"
-    f"💎 *Premium*: unlimited alerts. *Free*: up to {FREE_ALERT_LIMIT}."
-)
+def upgrade_keyboard():
+    if PAYPAL_SUBSCRIBE_URL:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("💠 Upgrade with PayPal", url=PAYPAL_SUBSCRIBE_URL)]])
+    return None
+
+def start_text(limit: int) -> str:
+    return (
+        "🧭 *Crypto Alerts Bot*\n"
+        "_Fast prices • Diagnostics • Alerts_\n\n"
+        "### 🚀 *Getting Started*\n"
+        "• `/price BTC` — current price in USD (e.g., `/price ETH`).\n"
+        "• `/setalert BTC > 110000` — alert when condition is met.\n"
+        "• `/myalerts` — list your active alerts.\n"
+        "• `/help` — full instructions.\n\n"
+        f"💎 *Premium*: unlimited alerts. *Free*: up to {limit}."
+    )
 
 HELP_TEXT = (
     "📖 *Help*\n\n"
@@ -54,12 +66,9 @@ HELP_TEXT = (
     "• `/setalert <SYMBOL> <op> <value>` → Ops: `>`, `<` (π.χ. `/setalert BTC > 110000`).\n"
     "• `/myalerts` → Show active alerts.\n"
     "• `/cancel_autorenew` → Stop future billing (keeps access till period end).\n"
+    "• `/whoami` → δείχνει αν είσαι admin/premium.\n"
+    "_Admin only_: `/adminstats`, `/adminsubs`."
 )
-
-def upgrade_keyboard():
-    if PAYPAL_SUBSCRIBE_URL:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("💠 Upgrade with PayPal", url=PAYPAL_SUBSCRIBE_URL)]])
-    return None
 
 # ───────── Commands ─────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -68,11 +77,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
         if not user:
             user = User(telegram_id=tg_id, is_premium=False)
-            session.add(user); session.flush()
-    await update.message.reply_text(START_TEXT, parse_mode="Markdown", reply_markup=upgrade_keyboard())
+        # Admins = πάντα premium (για δοκιμές χωρίς περιορισμούς)
+        if is_admin(tg_id) and not user.is_premium:
+            user.is_premium = True
+        session.add(user); session.flush()
+    lim = 9999 if is_admin(tg_id) else FREE_ALERT_LIMIT
+    await update.message.reply_text(start_text(lim), parse_mode="Markdown", reply_markup=upgrade_keyboard())
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=upgrade_keyboard())
+
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = str(update.effective_user.id)
+    role = "admin" if is_admin(tg_id) else "user"
+    with session_scope() as session:
+        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        prem = bool(user and user.is_premium)
+    await update.message.reply_text(f"👤 You are: *{role}*\n💎 Premium: *{prem}*", parse_mode="Markdown")
 
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -109,15 +130,21 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
         if not user:
             user = User(telegram_id=tg_id, is_premium=False)
-            session.add(user); session.flush()
-        # ✅ PostgreSQL boolean (όχι enabled=1)
-        active_alerts = session.execute(
-            text("SELECT COUNT(*) FROM alerts WHERE user_id=:uid AND enabled = TRUE"),
-            {"uid": user.id}
-        ).scalar_one()
-        if (not user.is_premium) and active_alerts >= FREE_ALERT_LIMIT:
-            await update.message.reply_text(f"Free plan limit reached ({FREE_ALERT_LIMIT}). Upgrade for unlimited.")
-            return
+        # Admins = always premium
+        if is_admin(tg_id):
+            user.is_premium = True
+        session.add(user); session.flush()
+
+        # ✅ PostgreSQL boolean (όχι enabled=1) — και bypass limit για admin
+        if not user.is_premium and not is_admin(tg_id):
+            active_alerts = session.execute(
+                text("SELECT COUNT(*) FROM alerts WHERE user_id=:uid AND enabled = TRUE"),
+                {"uid": user.id}
+            ).scalar_one()
+            if active_alerts >= FREE_ALERT_LIMIT:
+                await update.message.reply_text(f"Free plan limit reached ({FREE_ALERT_LIMIT}). Upgrade for unlimited.")
+                return
+
         alert = Alert(user_id=user.id, symbol=pair, rule=rule, value=val, cooldown_seconds=900)
         session.add(alert); session.flush()
         aid = alert.id
@@ -159,6 +186,73 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(f"❌ Cancel failed: {r.text}")
     except Exception as e:
         await update.message.reply_text(f"❌ Cancel error: {e}")
+
+# ───────── Admin-only commands ─────────
+def _require_admin(update: Update) -> str | None:
+    tg_id = str(update.effective_user.id)
+    if not is_admin(tg_id):
+        return tg_id
+    return None
+
+async def cmd_adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    not_admin = _require_admin(update)
+    if not_admin:
+        await update.message.reply_text("⛔ Admins only."); return
+    with session_scope() as session:
+        users_total = session.execute(text("SELECT COUNT(*) FROM users")).scalar_one()
+        users_premium = session.execute(text("SELECT COUNT(*) FROM users WHERE is_premium = TRUE")).scalar_one()
+        alerts_total = session.execute(text("SELECT COUNT(*) FROM alerts")).scalar_one()
+        alerts_active = session.execute(text("SELECT COUNT(*) FROM alerts WHERE enabled = TRUE")).scalar_one()
+        subs_total = session.execute(text("SELECT COUNT(*) FROM subscriptions")).scalar_one()
+        # status_internal: ACTIVE | CANCEL_AT_PERIOD_END | CANCELLED | (άλλα)
+        subs_active = session.execute(text(
+            "SELECT COUNT(*) FROM subscriptions WHERE status_internal = 'ACTIVE'"
+        )).scalar_one()
+        subs_cancel_at_period_end = session.execute(text(
+            "SELECT COUNT(*) FROM subscriptions WHERE status_internal = 'CANCEL_AT_PERIOD_END'"
+        )).scalar_one()
+        subs_cancelled = session.execute(text(
+            "SELECT COUNT(*) FROM subscriptions WHERE status_internal = 'CANCELLED'"
+        )).scalar_one()
+        subs_unknown = subs_total - subs_active - subs_cancel_at_period_end - subs_cancelled
+
+    msg = (
+        "📊 *Admin Stats*\n"
+        f"👥 Users: {users_total}  •  💎 Premium: {users_premium}\n"
+        f"🔔 Alerts: total={alerts_total}, active={alerts_active}\n"
+        f"🧾 Subscriptions: total={subs_total}\n"
+        f"   • ACTIVE={subs_active}\n"
+        f"   • CANCEL_AT_PERIOD_END={subs_cancel_at_period_end}\n"
+        f"   • CANCELLED={subs_cancelled}\n"
+        f"   • UNKNOWN={subs_unknown}\n"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def cmd_adminsubs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    not_admin = _require_admin(update)
+    if not_admin:
+        await update.message.reply_text("⛔ Admins only."); return
+    with session_scope() as session:
+        rows = session.execute(text("""
+            SELECT s.id, s.user_id, s.provider, s.status_internal, s.provider_status,
+                   COALESCE(s.provider_ref,'') AS provider_ref,
+                   s.current_period_end, s.created_at,
+                   u.telegram_id
+            FROM subscriptions s
+            LEFT JOIN users u ON u.id = s.user_id
+            ORDER BY s.id DESC
+            LIMIT 20
+        """)).all()
+    if not rows:
+        await update.message.reply_text("No subscriptions in DB."); return
+    lines = []
+    for r in rows:
+        cpe = r.current_period_end.isoformat() if r.current_period_end else "-"
+        lines.append(
+            f"#{r.id} uid={r.user_id or '-'} tg={r.telegram_id or '-'} "
+            f"{r.status_internal} ({r.provider_status}) ref={r.provider_ref or '-'} cpe={cpe}"
+        )
+    await update.message.reply_text("🧾 *Last 20 subscriptions:*\n" + "\n".join(lines), parse_mode="Markdown")
 
 # ───────── Alerts loop (τρέχει μόνο αν πάρουμε lock) ─────────
 def alerts_loop():
@@ -205,10 +299,15 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("price", cmd_price))
     app.add_handler(CommandHandler("setalert", cmd_setalert))
     app.add_handler(CommandHandler("myalerts", cmd_myalerts))
     app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
+    # Admin
+    app.add_handler(CommandHandler("adminstats", cmd_adminstats))
+    app.add_handler(CommandHandler("adminsubs", cmd_adminsubs))
+
     print({"msg": "bot_start"})
 
     while True:
