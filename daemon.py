@@ -44,35 +44,34 @@ def try_advisory_lock(lock_id: int) -> bool:
 # ───────── Helpers ─────────
 def upgrade_keyboard():
     if PAYPAL_SUBSCRIBE_URL:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("💠 Upgrade with PayPal", url=PAYPAL_SUBSCRIBE_URL)]])
+        return InlineKeyboardMarkup([[InlineKeyboardButton("Upgrade with PayPal", url=PAYPAL_SUBSCRIBE_URL)]])
     return None
 
 def start_text(limit: int) -> str:
     return (
-        "🧭 *Crypto Alerts Bot*\n"
-        "_Fast prices • Diagnostics • Alerts_\n\n"
-        "### 🚀 *Getting Started*\n"
-        "• `/price BTC` — current price in USD (e.g., `/price ETH`).\n"
-        "• `/setalert BTC > 110000` — alert when condition is met.\n"
-        "• `/myalerts` — list your active alerts.\n"
-        "• `/help` — full instructions.\n\n"
-        f"💎 *Premium*: unlimited alerts. *Free*: up to {limit}."
+        "Crypto Alerts Bot\n"
+        "Fast prices • Diagnostics • Alerts\n\n"
+        "Getting Started:\n"
+        "• /price BTC — current price\n"
+        "• /setalert BTC > 110000 — alert when condition is met\n"
+        "• /myalerts — list your active alerts\n"
+        "• /help — instructions\n\n"
+        f"Premium: unlimited alerts. Free: up to {limit}."
     )
 
 def safe_chunks(s: str, limit: int = 3900):
-    # αφήνουμε περιθώριο από 4096
     while s:
         yield s[:limit]
         s = s[limit:]
 
 HELP_TEXT = (
-    "📖 *Help*\n\n"
-    "• `/price <SYMBOL>` → Spot price. Example: `/price BTC`.\n"
-    "• `/setalert <SYMBOL> <op> <value>` → Ops: `>`, `<` (π.χ. `/setalert BTC > 110000`).\n"
-    "• `/myalerts` → Show active alerts.\n"
-    "• `/cancel_autorenew` → Stop future billing (keeps access till period end).\n"
-    "• `/whoami` → δείχνει/ορίζει premium για admin.\n"
-    "_Admin only_: `/adminstats`, `/adminsubs`."
+    "Help\n\n"
+    "• /price <SYMBOL> → Spot price. Example: /price BTC\n"
+    "• /setalert <SYMBOL> <op> <value> → Ops: >, < (e.g. /setalert BTC > 110000)\n"
+    "• /myalerts → Show active alerts\n"
+    "• /cancel_autorenew → Stop future billing (keeps access till period end)\n"
+    "• /whoami → shows if you are admin/premium\n"
+    "Admin only: /adminstats, /adminsubs\n"
 )
 
 # ───────── Commands ─────────
@@ -83,14 +82,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user:
             user = User(telegram_id=tg_id, is_premium=False)
         if is_admin(tg_id) and not user.is_premium:
-            user.is_premium = True  # admins πάντα premium
+            user.is_premium = True  # admins always premium
         session.add(user); session.flush()
     lim = 9999 if is_admin(tg_id) else FREE_ALERT_LIMIT
-    await update.message.reply_text(start_text(lim), parse_mode="Markdown", reply_markup=upgrade_keyboard())
+    await update.message.reply_text(start_text(lim), reply_markup=upgrade_keyboard())
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chunk in safe_chunks(HELP_TEXT):
-        await update.message.reply_text(chunk, parse_mode="Markdown", reply_markup=upgrade_keyboard())
+        await update.message.reply_text(chunk, reply_markup=upgrade_keyboard())
 
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
@@ -103,7 +102,7 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.is_premium = True
         session.add(user); session.flush()
         prem = bool(user.is_premium)
-    await update.message.reply_text(f"👤 You are: *{role}*\n💎 Premium: *{prem}*", parse_mode="Markdown")
+    await update.message.reply_text(f"You are: {role}\nPremium: {prem}")
 
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -117,7 +116,7 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if price is None:
         await update.message.reply_text("Price fetch failed. Try again later.")
         return
-    await update.message.reply_text(f"💹 {pair}: *{price:.6f}* USDT", parse_mode="Markdown")
+    await update.message.reply_text(f"{pair}: {price:.6f} USDT")
 
 ALERT_RE = re.compile(r"^(?P<sym>[A-Za-z0-9/]+)\s*(?P<op>>|<)\s*(?P<val>[0-9]+(\.[0-9]+)?)$")
 
@@ -156,7 +155,7 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alert = Alert(user_id=user.id, symbol=pair, rule=rule, value=val, cooldown_seconds=900)
         session.add(alert); session.flush()
         aid = alert.id
-    await update.message.reply_text(f"✅ Alert #{aid} set: {pair} {op} {val}")
+    await update.message.reply_text(f"Alert #{aid} set: {pair} {op} {val}")
 
 async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
@@ -173,14 +172,14 @@ async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     for r in rows:
         op = ">" if r.rule == "price_above" else "<"
-        lines.append(f"• #{r.id} {r.symbol} {op} {r.value} {'✅' if r.enabled else '❌'}")
-    msg = "🧾 *Your alerts:*\n" + "\n".join(lines)
+        lines.append(f"• #{r.id} {r.symbol} {op} {r.value} {'ON' if r.enabled else 'OFF'}")
+    msg = "Your alerts:\n" + "\n".join(lines)
     for chunk in safe_chunks(msg):
-        await update.message.reply_text(chunk, parse_mode="Markdown")
+        await update.message.reply_text(chunk)
 
 async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not WEB_URL or not ADMIN_KEY:
-        await update.message.reply_text("⚠️ Cancel not available right now. Try again later.")
+        await update.message.reply_text("Cancel not available right now. Try again later.")
         return
     tg_id = str(update.effective_user.id)
     try:
@@ -189,13 +188,13 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
             data = r.json()
             until = data.get("keeps_access_until")
             if until:
-                await update.message.reply_text(f"✅ Auto-renew cancelled. Premium active until: {until}")
+                await update.message.reply_text(f"Auto-renew cancelled. Premium active until: {until}")
             else:
-                await update.message.reply_text("✅ Auto-renew cancelled. Premium remains active till end of period.")
+                await update.message.reply_text("Auto-renew cancelled. Premium remains active till end of period.")
         else:
-            await update.message.reply_text(f"❌ Cancel failed: {r.text}")
+            await update.message.reply_text(f"Cancel failed: {r.text}")
     except Exception as e:
-        await update.message.reply_text(f"❌ Cancel error: {e}")
+        await update.message.reply_text(f"Cancel error: {e}")
 
 # ───────── Admin-only commands ─────────
 def _require_admin(update: Update) -> str | None:
@@ -207,9 +206,8 @@ def _require_admin(update: Update) -> str | None:
 async def cmd_adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     not_admin = _require_admin(update)
     if not_admin:
-        await update.message.reply_text("⛔ Admins only."); return
+        await update.message.reply_text("Admins only."); return
 
-    # Defaults
     users_total = users_premium = alerts_total = alerts_active = 0
     subs_total = subs_active = subs_cancel_at_period_end = subs_cancelled = subs_unknown = 0
     subs_note = ""
@@ -243,25 +241,25 @@ async def cmd_adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             subs_note += f"\n• subscriptions: {e}"
 
     msg = (
-        "📊 *Admin Stats*\n"
-        f"👥 Users: {users_total}  •  💎 Premium: {users_premium}\n"
-        f"🔔 Alerts: total={alerts_total}, active={alerts_active}\n"
-        f"🧾 Subscriptions: total={subs_total}\n"
-        f"   • ACTIVE={subs_active}\n"
-        f"   • CANCEL_AT_PERIOD_END={subs_cancel_at_period_end}\n"
-        f"   • CANCELLED={subs_cancelled}\n"
-        f"   • UNKNOWN={subs_unknown}\n"
+        "Admin Stats\n"
+        f"Users: {users_total}  •  Premium: {users_premium}\n"
+        f"Alerts: total={alerts_total}, active={alerts_active}\n"
+        f"Subscriptions: total={subs_total}\n"
+        f"  - ACTIVE={subs_active}\n"
+        f"  - CANCEL_AT_PERIOD_END={subs_cancel_at_period_end}\n"
+        f"  - CANCELLED={subs_cancelled}\n"
+        f"  - UNKNOWN={subs_unknown}\n"
     )
     if subs_note:
-        msg += "\n_Notes:_ " + subs_note
+        msg += "\nNotes:" + subs_note
 
     for chunk in safe_chunks(msg):
-        await update.message.reply_text(chunk, parse_mode="Markdown")
+        await update.message.reply_text(chunk)
 
 async def cmd_adminsubs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     not_admin = _require_admin(update)
     if not_admin:
-        await update.message.reply_text("⛔ Admins only."); return
+        await update.message.reply_text("Admins only."); return
 
     with session_scope() as session:
         try:
@@ -289,9 +287,9 @@ async def cmd_adminsubs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"#{r.id} uid={r.user_id or '-'} tg={r.telegram_id or '-'} "
             f"{r.status_internal} ({r.provider_status}) ref={r.provider_ref or '-'} cpe={cpe}"
         )
-    msg = "🧾 *Last 20 subscriptions:*\n" + "\n".join(lines)
+    msg = "Last 20 subscriptions:\n" + "\n".join(lines)
     for chunk in safe_chunks(msg):
-        await update.message.reply_text(chunk, parse_mode="Markdown")
+        await update.message.reply_text(chunk)
 
 # ───────── Alerts loop (τρέχει μόνο αν πάρουμε lock) ─────────
 def alerts_loop():

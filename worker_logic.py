@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from db import Alert, User, Subscription
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # optional default
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # optional default/fallback
 
 # Πολλά σύμβολα → Binance USDT pairs
 SYMBOL_MAP = {
@@ -58,6 +58,7 @@ def can_fire(last_fired_at: Optional[datetime], cooldown_seconds: int) -> bool:
     return datetime.utcnow() >= last_fired_at + timedelta(seconds=cooldown_seconds)
 
 def notify_telegram(text: str, chat_id: Optional[str] = None, timeout: int = 10) -> bool:
+    """Στέλνει plain text (χωρίς Markdown) ώστε να μην σπάει ποτέ."""
     if not BOT_TOKEN:
         return False
     chat = chat_id or TELEGRAM_CHAT_ID
@@ -76,7 +77,7 @@ def downgrade_expired_premiums(session: Session) -> int:
     users: List[User] = session.execute(select(User)).scalars().all()
     for u in users:
         sub = session.execute(
-            select(Subscription).where(Subscription.user_id == u.id).order_by(desc(Subscription.id))
+            select(Subscription).where(Subscription.user_id == u.id).order_by(Subscription.id.desc())
         ).scalar_one_or_none()
         if not sub:
             continue
@@ -113,6 +114,17 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
             alert.last_fired_at = datetime.utcnow()
             session.add(alert)
             session.flush()
-            counters["triggered"] += 1
-            notify_telegram(f"🔔 Alert #{alert.id} | {alert.symbol} {alert.rule} {alert.value} | price={price:.6f}")
+            # ➜ Στείλε στον ίδιο τον χρήστη (fallback στο TELEGRAM_CHAT_ID αν λείπει)
+            chat_id = None
+            try:
+                if alert.user and alert.user.telegram_id:
+                    chat_id = str(alert.user.telegram_id)
+            except Exception:
+                chat_id = None
+            text = f"🔔 Alert #{alert.id} | {alert.symbol} {alert.rule} {alert.value} | price={price:.6f}"
+            ok = notify_telegram(text, chat_id=chat_id)
+            if ok:
+                counters["triggered"] += 1
+            else:
+                counters["errors"] += 1
     return counters
