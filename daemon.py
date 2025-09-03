@@ -66,7 +66,7 @@ HELP_TEXT = (
     "• `/setalert <SYMBOL> <op> <value>` → Ops: `>`, `<` (π.χ. `/setalert BTC > 110000`).\n"
     "• `/myalerts` → Show active alerts.\n"
     "• `/cancel_autorenew` → Stop future billing (keeps access till period end).\n"
-    "• `/whoami` → δείχνει αν είσαι admin/premium.\n"
+    "• `/whoami` → δείχνει/ορίζει premium για admin.\n"
     "_Admin only_: `/adminstats`, `/adminsubs`."
 )
 
@@ -77,9 +77,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
         if not user:
             user = User(telegram_id=tg_id, is_premium=False)
-        # Admins = πάντα premium (για δοκιμές χωρίς περιορισμούς)
         if is_admin(tg_id) and not user.is_premium:
-            user.is_premium = True
+            user.is_premium = True  # admins πάντα premium
         session.add(user); session.flush()
     lim = 9999 if is_admin(tg_id) else FREE_ALERT_LIMIT
     await update.message.reply_text(start_text(lim), parse_mode="Markdown", reply_markup=upgrade_keyboard())
@@ -92,7 +91,13 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = "admin" if is_admin(tg_id) else "user"
     with session_scope() as session:
         user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
-        prem = bool(user and user.is_premium)
+        if not user:
+            user = User(telegram_id=tg_id, is_premium=False)
+        # ✅ Force premium if admin (και αποθήκευση)
+        if is_admin(tg_id):
+            user.is_premium = True
+        session.add(user); session.flush()
+        prem = bool(user.is_premium)
     await update.message.reply_text(f"👤 You are: *{role}*\n💎 Premium: *{prem}*", parse_mode="Markdown")
 
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -130,12 +135,10 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
         if not user:
             user = User(telegram_id=tg_id, is_premium=False)
-        # Admins = always premium
         if is_admin(tg_id):
-            user.is_premium = True
+            user.is_premium = True  # admin bypass limit
         session.add(user); session.flush()
 
-        # ✅ PostgreSQL boolean (όχι enabled=1) — και bypass limit για admin
         if not user.is_premium and not is_admin(tg_id):
             active_alerts = session.execute(
                 text("SELECT COUNT(*) FROM alerts WHERE user_id=:uid AND enabled = TRUE"),
@@ -204,7 +207,6 @@ async def cmd_adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alerts_total = session.execute(text("SELECT COUNT(*) FROM alerts")).scalar_one()
         alerts_active = session.execute(text("SELECT COUNT(*) FROM alerts WHERE enabled = TRUE")).scalar_one()
         subs_total = session.execute(text("SELECT COUNT(*) FROM subscriptions")).scalar_one()
-        # status_internal: ACTIVE | CANCEL_AT_PERIOD_END | CANCELLED | (άλλα)
         subs_active = session.execute(text(
             "SELECT COUNT(*) FROM subscriptions WHERE status_internal = 'ACTIVE'"
         )).scalar_one()
