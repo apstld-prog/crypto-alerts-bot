@@ -16,7 +16,6 @@ INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS","60"))
 PAYPAL_SUBSCRIBE_URL = os.getenv("PAYPAL_SUBSCRIBE_URL")
 FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT","3"))
 
-# Προαιρετικά flags για χειροκίνητο έλεγχο ρόλων
 RUN_BOT = os.getenv("RUN_BOT", "1") == "1"
 RUN_ALERTS = os.getenv("RUN_ALERTS", "1") == "1"
 
@@ -42,7 +41,7 @@ def try_advisory_lock(lock_id: int) -> bool:
         print({"msg": "advisory_lock_error", "error": str(e)})
         return False
 
-# ───────── Texts/Keyboards ─────────
+# ───────── Helpers ─────────
 def upgrade_keyboard():
     if PAYPAL_SUBSCRIBE_URL:
         return InlineKeyboardMarkup([[InlineKeyboardButton("💠 Upgrade with PayPal", url=PAYPAL_SUBSCRIBE_URL)]])
@@ -59,6 +58,12 @@ def start_text(limit: int) -> str:
         "• `/help` — full instructions.\n\n"
         f"💎 *Premium*: unlimited alerts. *Free*: up to {limit}."
     )
+
+def safe_chunks(s: str, limit: int = 3900):
+    # αφήνουμε περιθώριο από 4096
+    while s:
+        yield s[:limit]
+        s = s[limit:]
 
 HELP_TEXT = (
     "📖 *Help*\n\n"
@@ -84,7 +89,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(start_text(lim), parse_mode="Markdown", reply_markup=upgrade_keyboard())
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=upgrade_keyboard())
+    for chunk in safe_chunks(HELP_TEXT):
+        await update.message.reply_text(chunk, parse_mode="Markdown", reply_markup=upgrade_keyboard())
 
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
@@ -93,7 +99,6 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
         if not user:
             user = User(telegram_id=tg_id, is_premium=False)
-        # ✅ Force premium if admin (και αποθήκευση)
         if is_admin(tg_id):
             user.is_premium = True
         session.add(user); session.flush()
@@ -169,7 +174,9 @@ async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         op = ">" if r.rule == "price_above" else "<"
         lines.append(f"• #{r.id} {r.symbol} {op} {r.value} {'✅' if r.enabled else '❌'}")
-    await update.message.reply_text("🧾 *Your alerts:*\n" + "\n".join(lines), parse_mode="Markdown")
+    msg = "🧾 *Your alerts:*\n" + "\n".join(lines)
+    for chunk in safe_chunks(msg):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
 
 async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not WEB_URL or not ADMIN_KEY:
@@ -201,22 +208,39 @@ async def cmd_adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     not_admin = _require_admin(update)
     if not_admin:
         await update.message.reply_text("⛔ Admins only."); return
+
+    # Defaults
+    users_total = users_premium = alerts_total = alerts_active = 0
+    subs_total = subs_active = subs_cancel_at_period_end = subs_cancelled = subs_unknown = 0
+    subs_note = ""
+
     with session_scope() as session:
-        users_total = session.execute(text("SELECT COUNT(*) FROM users")).scalar_one()
-        users_premium = session.execute(text("SELECT COUNT(*) FROM users WHERE is_premium = TRUE")).scalar_one()
-        alerts_total = session.execute(text("SELECT COUNT(*) FROM alerts")).scalar_one()
-        alerts_active = session.execute(text("SELECT COUNT(*) FROM alerts WHERE enabled = TRUE")).scalar_one()
-        subs_total = session.execute(text("SELECT COUNT(*) FROM subscriptions")).scalar_one()
-        subs_active = session.execute(text(
-            "SELECT COUNT(*) FROM subscriptions WHERE status_internal = 'ACTIVE'"
-        )).scalar_one()
-        subs_cancel_at_period_end = session.execute(text(
-            "SELECT COUNT(*) FROM subscriptions WHERE status_internal = 'CANCEL_AT_PERIOD_END'"
-        )).scalar_one()
-        subs_cancelled = session.execute(text(
-            "SELECT COUNT(*) FROM subscriptions WHERE status_internal = 'CANCELLED'"
-        )).scalar_one()
-        subs_unknown = subs_total - subs_active - subs_cancel_at_period_end - subs_cancelled
+        try:
+            users_total = session.execute(text("SELECT COUNT(*) FROM users")).scalar_one()
+            users_premium = session.execute(text("SELECT COUNT(*) FROM users WHERE is_premium = TRUE")).scalar_one()
+        except Exception as e:
+            subs_note += f"\n• users: {e}"
+
+        try:
+            alerts_total = session.execute(text("SELECT COUNT(*) FROM alerts")).scalar_one()
+            alerts_active = session.execute(text("SELECT COUNT(*) FROM alerts WHERE enabled = TRUE")).scalar_one()
+        except Exception as e:
+            subs_note += f"\n• alerts: {e}"
+
+        try:
+            subs_total = session.execute(text("SELECT COUNT(*) FROM subscriptions")).scalar_one()
+            subs_active = session.execute(text(
+                "SELECT COUNT(*) FROM subscriptions WHERE status_internal = 'ACTIVE'"
+            )).scalar_one()
+            subs_cancel_at_period_end = session.execute(text(
+                "SELECT COUNT(*) FROM subscriptions WHERE status_internal = 'CANCEL_AT_PERIOD_END'"
+            )).scalar_one()
+            subs_cancelled = session.execute(text(
+                "SELECT COUNT(*) FROM subscriptions WHERE status_internal = 'CANCELLED'"
+            )).scalar_one()
+            subs_unknown = subs_total - subs_active - subs_cancel_at_period_end - subs_cancelled
+        except Exception as e:
+            subs_note += f"\n• subscriptions: {e}"
 
     msg = (
         "📊 *Admin Stats*\n"
@@ -228,25 +252,36 @@ async def cmd_adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   • CANCELLED={subs_cancelled}\n"
         f"   • UNKNOWN={subs_unknown}\n"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    if subs_note:
+        msg += "\n_Notes:_ " + subs_note
+
+    for chunk in safe_chunks(msg):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
 
 async def cmd_adminsubs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     not_admin = _require_admin(update)
     if not_admin:
         await update.message.reply_text("⛔ Admins only."); return
+
     with session_scope() as session:
-        rows = session.execute(text("""
-            SELECT s.id, s.user_id, s.provider, s.status_internal, s.provider_status,
-                   COALESCE(s.provider_ref,'') AS provider_ref,
-                   s.current_period_end, s.created_at,
-                   u.telegram_id
-            FROM subscriptions s
-            LEFT JOIN users u ON u.id = s.user_id
-            ORDER BY s.id DESC
-            LIMIT 20
-        """)).all()
+        try:
+            rows = session.execute(text("""
+                SELECT s.id, s.user_id, s.provider, s.status_internal, s.provider_status,
+                       COALESCE(s.provider_ref,'') AS provider_ref,
+                       s.current_period_end, s.created_at,
+                       u.telegram_id
+                FROM subscriptions s
+                LEFT JOIN users u ON u.id = s.user_id
+                ORDER BY s.id DESC
+                LIMIT 20
+            """)).all()
+        except Exception as e:
+            await update.message.reply_text(f"subscriptions query error: {e}")
+            return
+
     if not rows:
         await update.message.reply_text("No subscriptions in DB."); return
+
     lines = []
     for r in rows:
         cpe = r.current_period_end.isoformat() if r.current_period_end else "-"
@@ -254,7 +289,9 @@ async def cmd_adminsubs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"#{r.id} uid={r.user_id or '-'} tg={r.telegram_id or '-'} "
             f"{r.status_internal} ({r.provider_status}) ref={r.provider_ref or '-'} cpe={cpe}"
         )
-    await update.message.reply_text("🧾 *Last 20 subscriptions:*\n" + "\n".join(lines), parse_mode="Markdown")
+    msg = "🧾 *Last 20 subscriptions:*\n" + "\n".join(lines)
+    for chunk in safe_chunks(msg):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
 
 # ───────── Alerts loop (τρέχει μόνο αν πάρουμε lock) ─────────
 def alerts_loop():
