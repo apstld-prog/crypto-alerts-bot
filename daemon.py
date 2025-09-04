@@ -1,3 +1,4 @@
+# daemon.py
 import os, time, threading, re
 from datetime import datetime
 import requests
@@ -12,9 +13,9 @@ from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEB_URL = os.getenv("WEB_URL")
 ADMIN_KEY = os.getenv("ADMIN_KEY")
-INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS","60"))
+INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
 PAYPAL_SUBSCRIBE_URL = os.getenv("PAYPAL_SUBSCRIBE_URL")
-FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT","3"))
+FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "3"))
 
 RUN_BOT = os.getenv("RUN_BOT", "1") == "1"
 RUN_ALERTS = os.getenv("RUN_ALERTS", "1") == "1"
@@ -54,9 +55,10 @@ def start_text(limit: int) -> str:
         "Getting Started:\n"
         "• /price BTC — current price\n"
         "• /setalert BTC > 110000 — alert when condition is met\n"
-        "• /myalerts — list your active alerts\n"
+        "• /myalerts — list your active alerts (with delete buttons)\n"
         "• /help — instructions\n\n"
-        f"Premium: unlimited alerts. Free: up to {limit}."
+        f"Premium: unlimited alerts. Free: up to {limit}.\n\n"
+        "Missing a coin? Send /requestcoin <SYMBOL> and we'll add it."
     )
 
 def safe_chunks(s: str, limit: int = 3900):
@@ -73,6 +75,7 @@ HELP_TEXT = (
     "• /clearalerts → Delete ALL your alerts (Premium/Admin)\n"
     "• /cancel_autorenew → Stop future billing (keeps access till period end)\n"
     "• /whoami → shows if you are admin/premium\n"
+    "• /requestcoin <SYMBOL> → Ask admins to add a new coin (e.g. /requestcoin ARKM)\n"
     "• /adminhelp → admin commands (admins only)\n"
 )
 
@@ -92,7 +95,7 @@ ADMIN_HELP = (
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     with session_scope() as session:
-        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         if not user:
             user = User(telegram_id=tg_id, is_premium=False)
         if is_admin(tg_id) and not user.is_premium:
@@ -116,7 +119,7 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     role = "admin" if is_admin(tg_id) else "user"
     with session_scope() as session:
-        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         if not user:
             user = User(telegram_id=tg_id, is_premium=False)
         if is_admin(tg_id):
@@ -154,10 +157,10 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pair:
         await update.message.reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, SHIB, PEPE ...")
         return
-    rule = "price_above" if op==">" else "price_below"
+    rule = "price_above" if op == ">" else "price_below"
     tg_id = str(update.effective_user.id)
     with session_scope() as session:
-        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         if not user:
             user = User(telegram_id=tg_id, is_premium=False)
         if is_admin(tg_id):
@@ -187,7 +190,7 @@ def _alert_buttons(aid: int) -> InlineKeyboardMarkup:
 async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     with session_scope() as session:
-        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         if not user:
             await update.message.reply_text("No alerts yet."); return
         rows = session.execute(text(
@@ -205,7 +208,7 @@ async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     with session_scope() as session:
-        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         is_premium = bool(user and user.is_premium) or is_admin(tg_id)
     if not is_premium:
         await update.message.reply_text("This feature is for Premium users. Upgrade to delete alerts.")
@@ -220,7 +223,7 @@ async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     with session_scope() as session:
-        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         if not user:
             await update.message.reply_text("User not found.")
             return
@@ -238,18 +241,41 @@ async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     with session_scope() as session:
-        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         is_premium = bool(user and user.is_premium) or is_admin(tg_id)
     if not is_premium:
         await update.message.reply_text("This feature is for Premium users. Upgrade to clear alerts.")
         return
     with session_scope() as session:
-        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         if not user:
             await update.message.reply_text("User not found."); return
         res = session.execute(text("DELETE FROM alerts WHERE user_id=:uid"), {"uid": user.id})
         deleted = res.rowcount or 0
     await update.message.reply_text(f"Deleted {deleted} alert(s).")
+
+# ───────── Request coin (notifies admins) ─────────
+async def cmd_requestcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /requestcoin <SYMBOL>  e.g. /requestcoin ARKM")
+        return
+    sym = (context.args[0] or "").upper().strip()
+    requester = update.effective_user
+    who = f"{requester.first_name or ''} (@{requester.username}) id={requester.id}"
+    msg = f"🆕 Coin request: {sym}\nFrom: {who}"
+    await update.message.reply_text(f"Got it! We'll review and add {sym} if possible.")
+    if _ADMIN_IDS:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            for admin_id in _ADMIN_IDS:
+                if not admin_id:
+                    continue
+                try:
+                    requests.post(url, json={"chat_id": admin_id, "text": msg}, timeout=10)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not WEB_URL or not ADMIN_KEY:
@@ -478,7 +504,7 @@ async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rq = requests.post(url, json={"chat_id": chat_id, "text": textmsg}, timeout=10)
             if rq.status_code == 200:
                 session.execute(text("UPDATE alerts SET last_fired_at = NOW(), last_met = TRUE WHERE id=:id"), {"id": aid})
-                await update.message.reply_text(f"Force sent ok. status=200")
+                await update.message.reply_text("Force sent ok. status=200")
             else:
                 await update.message.reply_text(f"Force send failed: {rq.status_code} {rq.text[:200]}")
         except Exception as e:
@@ -494,7 +520,7 @@ async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             SELECT id, symbol, rule, value, enabled, last_fired_at, last_met
             FROM alerts ORDER BY id DESC LIMIT 5
         """)).all()
-    lines = [f"run_alert_cycle: {counters}","last_5:"]
+    lines = [f"run_alert_cycle: {counters}", "last_5:"]
     for r in rows:
         op = ">" if r.rule == "price_above" else "<"
         lines.append(f"  #{r.id} {r.symbol} {op} {r.value} {'ON' if r.enabled else 'OFF'} last_fired={r.last_fired_at or '-'} last_met={r.last_met}")
@@ -510,7 +536,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Validate premium/admin
     with session_scope() as session:
-        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         is_premium = bool(user and user.is_premium) or is_admin(tg_id)
 
     if data.startswith("del:"):
@@ -531,7 +557,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             # Only owner or admin
             if not is_admin(tg_id):
-                u = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+                u = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
                 if not u or owner.user_id != u.id:
                     await query.edit_message_text("You can delete only your own alerts.")
                     return
@@ -580,7 +606,8 @@ def main():
         print({"msg": "bot_disabled_env"}); return
     if not try_advisory_lock(BOT_LOCK_ID):
         print({"msg": "bot_lock_skipped"})
-        while True: time.sleep(3600)
+        while True:
+            time.sleep(3600)
 
     init_db()
     delete_webhook_if_any()
@@ -595,6 +622,7 @@ def main():
     app.add_handler(CommandHandler("myalerts", cmd_myalerts))
     app.add_handler(CommandHandler("delalert", cmd_delalert))
     app.add_handler(CommandHandler("clearalerts", cmd_clearalerts))
+    app.add_handler(CommandHandler("requestcoin", cmd_requestcoin))
     app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
     # Admin
     app.add_handler(CommandHandler("adminstats", cmd_adminstats))
