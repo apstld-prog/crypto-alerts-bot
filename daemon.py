@@ -71,7 +71,7 @@ HELP_TEXT = (
     "• /myalerts → Show active alerts\n"
     "• /cancel_autorenew → Stop future billing (keeps access till period end)\n"
     "• /whoami → shows if you are admin/premium\n"
-    "Admin only: /adminstats, /adminsubs, /admincheck, /testalert, /resetalert <id>, /forcealert <id>\n"
+    "Admin only: /adminstats, /adminsubs, /admincheck, /listalerts, /testalert, /runalerts, /resetalert <id>, /forcealert <id>\n"
 )
 
 # ───────── Commands ─────────
@@ -325,6 +325,30 @@ async def cmd_admincheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"admincheck error: {e}")
 
+async def cmd_listalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    not_admin = _require_admin(update)
+    if not_admin:
+        await update.message.reply_text("Admins only."); return
+    with session_scope() as session:
+        rows = session.execute(text("""
+            SELECT a.id, a.symbol, a.rule, a.value, a.enabled, a.last_fired_at, a.last_met
+            FROM alerts a
+            ORDER BY a.id DESC
+            LIMIT 20
+        """)).all()
+    if not rows:
+        await update.message.reply_text("No alerts in DB."); return
+    lines = []
+    for r in rows:
+        op = ">" if r.rule == "price_above" else "<"
+        lines.append(
+            f"#{r.id} {r.symbol} {op} {r.value} "
+            f"{'ON' if r.enabled else 'OFF'} last_fired={r.last_fired_at or '-'} last_met={r.last_met}"
+        )
+    msg = "Last 20 alerts:\n" + "\n".join(lines)
+    for chunk in safe_chunks(msg):
+        await update.message.reply_text(chunk)
+
 async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     try:
@@ -334,7 +358,6 @@ async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"testalert exception: {e}")
 
-# NEW: admin reset & force
 async def cmd_resetalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     not_admin = _require_admin(update)
     if not_admin:
@@ -386,6 +409,25 @@ async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Force send failed: {rq.status_code} {rq.text[:200]}")
         except Exception as e:
             await update.message.reply_text(f"Force send exception: {e}")
+
+# NEW: τρέχει έναν κύκλο alerts τώρα και επιστρέφει counters + μικρό log
+async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    not_admin = _require_admin(update)
+    if not_admin:
+        await update.message.reply_text("Admins only."); return
+    with session_scope() as session:
+        counters = run_alert_cycle(session)
+        # Εμφάνισε και μικρό snapshot των τελευταίων 5 alerts
+        rows = session.execute(text("""
+            SELECT id, symbol, rule, value, enabled, last_fired_at, last_met
+            FROM alerts ORDER BY id DESC LIMIT 5
+        """)).all()
+    lines = [f"run_alert_cycle: {counters}","last_5:"]
+    for r in rows:
+        op = ">" if r.rule == "price_above" else "<"
+        lines.append(f"  #{r.id} {r.symbol} {op} {r.value} {'ON' if r.enabled else 'OFF'} last_fired={r.last_fired_at or '-'} last_met={r.last_met}")
+    for chunk in safe_chunks("\n".join(lines)):
+        await update.message.reply_text(chunk)
 
 # ───────── Alerts loop (τρέχει μόνο αν πάρουμε lock) ─────────
 def alerts_loop():
@@ -441,9 +483,11 @@ def main():
     app.add_handler(CommandHandler("adminstats", cmd_adminstats))
     app.add_handler(CommandHandler("adminsubs", cmd_adminsubs))
     app.add_handler(CommandHandler("admincheck", cmd_admincheck))
+    app.add_handler(CommandHandler("listalerts", cmd_listalerts))
     app.add_handler(CommandHandler("testalert", cmd_testalert))
     app.add_handler(CommandHandler("resetalert", cmd_resetalert))
     app.add_handler(CommandHandler("forcealert", cmd_forcealert))
+    app.add_handler(CommandHandler("runalerts", cmd_runalerts))
 
     print({"msg": "bot_start"})
 
