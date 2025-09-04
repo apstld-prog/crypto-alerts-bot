@@ -71,7 +71,7 @@ HELP_TEXT = (
     "• /myalerts → Show active alerts\n"
     "• /cancel_autorenew → Stop future billing (keeps access till period end)\n"
     "• /whoami → shows if you are admin/premium\n"
-    "Admin only: /adminstats, /adminsubs, /admincheck, /testalert\n"
+    "Admin only: /adminstats, /adminsubs, /admincheck, /testalert, /resetalert <id>, /forcealert <id>\n"
 )
 
 # ───────── Commands ─────────
@@ -303,7 +303,7 @@ async def cmd_admincheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with session_scope() as session:
             total = session.execute(text("SELECT COUNT(*) FROM alerts")).scalar_one()
             rows = session.execute(text("""
-                SELECT a.id, a.user_id, a.symbol, a.rule, a.value, a.enabled, u.telegram_id
+                SELECT a.id, a.user_id, a.symbol, a.rule, a.value, a.enabled, u.telegram_id, a.last_fired_at, a.last_met
                 FROM alerts a
                 LEFT JOIN users u ON u.id = a.user_id
                 ORDER BY a.id DESC
@@ -313,7 +313,11 @@ async def cmd_admincheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if rows:
             for r in rows:
                 op = ">" if r.rule == "price_above" else "<"
-                lines.append(f"  #{r.id} uid={r.user_id} tg={r.telegram_id or '-'} {r.symbol} {op} {r.value} {'ON' if r.enabled else 'OFF'}")
+                lines.append(
+                    f"  #{r.id} uid={r.user_id} tg={r.telegram_id or '-'} "
+                    f"{r.symbol} {op} {r.value} {'ON' if r.enabled else 'OFF'} "
+                    f"last_fired={r.last_fired_at} last_met={r.last_met}"
+                )
         else:
             lines.append("  (none)")
         for chunk in safe_chunks("\n".join(lines)):
@@ -322,7 +326,6 @@ async def cmd_admincheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"admincheck error: {e}")
 
 async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Απλό self-test: στέλνει ένα μήνυμα στον χρήστη (DM) για να ελέγξουμε ότι το send δουλεύει
     tg_id = str(update.effective_user.id)
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -330,6 +333,59 @@ async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"testalert status={r.status_code} body={r.text[:200]}")
     except Exception as e:
         await update.message.reply_text(f"testalert exception: {e}")
+
+# NEW: admin reset & force
+async def cmd_resetalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    not_admin = _require_admin(update)
+    if not_admin:
+        await update.message.reply_text("Admins only."); return
+    if not context.args:
+        await update.message.reply_text("Usage: /resetalert <id>"); return
+    try:
+        aid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Bad id"); return
+
+    with session_scope() as session:
+        row = session.execute(text("SELECT id FROM alerts WHERE id=:id"), {"id": aid}).first()
+        if not row:
+            await update.message.reply_text(f"Alert {aid} not found"); return
+        session.execute(text("UPDATE alerts SET last_fired_at = NULL, last_met = FALSE WHERE id=:id"), {"id": aid})
+    await update.message.reply_text(f"Alert #{aid} reset (last_fired_at=NULL, last_met=FALSE).")
+
+async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    not_admin = _require_admin(update)
+    if not_admin:
+        await update.message.reply_text("Admins only."); return
+    if not context.args:
+        await update.message.reply_text("Usage: /forcealert <id>"); return
+    try:
+        aid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Bad id"); return
+
+    with session_scope() as session:
+        r = session.execute(text("""
+            SELECT a.id, a.symbol, a.rule, a.value, a.user_id, u.telegram_id
+            FROM alerts a LEFT JOIN users u ON u.id=a.user_id
+            WHERE a.id=:id
+        """), {"id": aid}).first()
+        if not r:
+            await update.message.reply_text(f"Alert {aid} not found"); return
+        chat_id = str(r.telegram_id) if r.telegram_id else None
+        if not chat_id:
+            await update.message.reply_text("No telegram_id for this user; cannot send."); return
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            textmsg = f"🔔 (force) Alert #{r.id} | {r.symbol} {r.rule} {r.value}"
+            rq = requests.post(url, json={"chat_id": chat_id, "text": textmsg}, timeout=10)
+            if rq.status_code == 200:
+                session.execute(text("UPDATE alerts SET last_fired_at = NOW(), last_met = TRUE WHERE id=:id"), {"id": aid})
+                await update.message.reply_text(f"Force sent ok. status=200")
+            else:
+                await update.message.reply_text(f"Force send failed: {rq.status_code} {rq.text[:200]}")
+        except Exception as e:
+            await update.message.reply_text(f"Force send exception: {e}")
 
 # ───────── Alerts loop (τρέχει μόνο αν πάρουμε lock) ─────────
 def alerts_loop():
@@ -386,6 +442,8 @@ def main():
     app.add_handler(CommandHandler("adminsubs", cmd_adminsubs))
     app.add_handler(CommandHandler("admincheck", cmd_admincheck))
     app.add_handler(CommandHandler("testalert", cmd_testalert))
+    app.add_handler(CommandHandler("resetalert", cmd_resetalert))
+    app.add_handler(CommandHandler("forcealert", cmd_forcealert))
 
     print({"msg": "bot_start"})
 
