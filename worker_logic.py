@@ -1,9 +1,9 @@
 import os
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 
 import requests
-from sqlalchemy import select, desc
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from db import Alert, User, Subscription
@@ -57,19 +57,21 @@ def can_fire(last_fired_at: Optional[datetime], cooldown_seconds: int) -> bool:
         return True
     return datetime.utcnow() >= last_fired_at + timedelta(seconds=cooldown_seconds)
 
-def notify_telegram(text: str, chat_id: Optional[str] = None, timeout: int = 10) -> bool:
-    """Στέλνει plain text (χωρίς Markdown) ώστε να μην σπάει ποτέ."""
-    if not BOT_TOKEN:
-        return False
-    chat = chat_id or TELEGRAM_CHAT_ID
-    if not chat:
-        return False
+def _telegram_send(text: str, chat_id: str, timeout: int = 10) -> Tuple[bool, int, str]:
+    """Plain text send. Επιστρέφει (ok, status, body)."""
+    if not BOT_TOKEN or not chat_id:
+        return (False, 0, "missing token or chat_id")
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        r = requests.post(url, json={"chat_id": chat, "text": text}, timeout=timeout)
-        return r.status_code == 200
-    except Exception:
-        return False
+        r = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=timeout)
+        body = ""
+        try:
+            body = r.text[:500]
+        except Exception:
+            body = "<no body>"
+        return (r.status_code == 200, r.status_code, body)
+    except Exception as e:
+        return (False, 0, f"exception: {e}")
 
 def downgrade_expired_premiums(session: Session) -> int:
     now = datetime.utcnow()
@@ -98,10 +100,17 @@ def downgrade_expired_premiums(session: Session) -> int:
     return changed
 
 def run_alert_cycle(session: Session) -> Dict[str, int]:
+    """
+    Edge-triggered:
+    - met = should_trigger(...)
+    - fire ONLY if (met == True) AND (last_met IS DISTINCT FROM TRUE) AND cooldown ok
+    - set last_met = True on fire (μόνο αν το send πετύχει)
+    - όταν δεν ισχύει: set last_met = False (για να ξαναπυροδοτήσει στο επόμενο crossing)
+    """
     counters = {"evaluated": 0, "triggered": 0, "errors": 0, "downgraded": 0}
     counters["downgraded"] = downgrade_expired_premiums(session)
     alerts = session.execute(
-        select(Alert).where(Alert.enabled == True)  # boolean OK με ORM
+        select(Alert).where(Alert.enabled == True)
     ).scalars().all()
 
     for alert in alerts:
@@ -109,22 +118,47 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
         price = fetch_price_binance(alert.symbol)
         if price is None:
             counters["errors"] += 1
+            print({"msg": "price_fetch_failed", "alert_id": alert.id, "symbol": alert.symbol})
             continue
-        if should_trigger(alert.rule, alert.value, price) and can_fire(alert.last_fired_at, alert.cooldown_seconds):
-            alert.last_fired_at = datetime.utcnow()
-            session.add(alert)
-            session.flush()
-            # ➜ Στείλε στον ίδιο τον χρήστη (fallback στο TELEGRAM_CHAT_ID αν λείπει)
+
+        met = should_trigger(alert.rule, alert.value, price)
+
+        # Ενημέρωσε το last_met=False όταν δεν ισχύει η συνθήκη
+        if not met:
+            if alert.last_met is not False:
+                alert.last_met = False
+                session.add(alert)
+            # και δεν πυροδοτούμε
+            continue
+
+        # met == True: πυροδότησε μόνο σε μετάβαση (crossing) + cooldown
+        already_met = (alert.last_met is True)
+        if not already_met and can_fire(alert.last_fired_at, alert.cooldown_seconds):
+            # Προετοιμασία αποστολής
             chat_id = None
             try:
                 if alert.user and alert.user.telegram_id:
                     chat_id = str(alert.user.telegram_id)
             except Exception:
                 chat_id = None
+            if not chat_id:
+                chat_id = TELEGRAM_CHAT_ID
+
             text = f"🔔 Alert #{alert.id} | {alert.symbol} {alert.rule} {alert.value} | price={price:.6f}"
-            ok = notify_telegram(text, chat_id=chat_id)
+            ok, status, body = _telegram_send(text, chat_id)
+
             if ok:
+                alert.last_fired_at = datetime.utcnow()
+                alert.last_met = True  # edge: κλείδωσε ως met για να μην ξαναστείλει μέχρι να πέσει
+                session.add(alert)
                 counters["triggered"] += 1
+                print({"msg": "alert_sent", "alert_id": alert.id, "chat_id": chat_id, "status": status})
             else:
                 counters["errors"] += 1
+                # ΔΕΝ γράφουμε last_fired_at/last_met, ώστε να δοκιμάσει ξανά στον επόμενο κύκλο
+                print({"msg": "alert_send_failed", "alert_id": alert.id, "chat_id": chat_id, "status": status, "body": body})
+        else:
+            # met==True αλλά δεν είχαμε crossing ή δεν πέρασε cooldown → δεν κάνουμε τίποτα
+            pass
+
     return counters

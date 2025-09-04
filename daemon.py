@@ -71,7 +71,7 @@ HELP_TEXT = (
     "• /myalerts → Show active alerts\n"
     "• /cancel_autorenew → Stop future billing (keeps access till period end)\n"
     "• /whoami → shows if you are admin/premium\n"
-    "Admin only: /adminstats, /adminsubs, /admincheck\n"
+    "Admin only: /adminstats, /adminsubs, /admincheck, /testalert\n"
 )
 
 # ───────── Commands ─────────
@@ -175,7 +175,7 @@ async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• #{r.id} {r.symbol} {op} {r.value} {'ON' if r.enabled else 'OFF'}")
     msg = "Your alerts:\n" + "\n".join(lines)
     for chunk in safe_chunks(msg):
-        await update.message.reply_text(chunk)
+        await update.message.reply_text(msg)
 
 async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not WEB_URL or not ADMIN_KEY:
@@ -254,7 +254,7 @@ async def cmd_adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += "\nNotes:" + subs_note
 
     for chunk in safe_chunks(msg):
-        await update.message.reply_text(chunk)
+        await update.message.reply_text(msg)
 
 async def cmd_adminsubs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     not_admin = _require_admin(update)
@@ -289,15 +289,13 @@ async def cmd_adminsubs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     msg = "Last 20 subscriptions:\n" + "\n".join(lines)
     for chunk in safe_chunks(msg):
-        await update.message.reply_text(chunk)
+        await update.message.reply_text(msg)
 
 async def cmd_admincheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Δείχνει τη βάση που βλέπει το daemon και τα τελευταία alerts, για διαγνωστικά."""
     not_admin = _require_admin(update)
     if not_admin:
         await update.message.reply_text("Admins only."); return
     try:
-        # Μασκάρισμα DB URL (χωρίς password)
         try:
             url_masked = engine.url.render_as_string(hide_password=True)
         except Exception:
@@ -322,6 +320,16 @@ async def cmd_admincheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(chunk)
     except Exception as e:
         await update.message.reply_text(f"admincheck error: {e}")
+
+async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Απλό self-test: στέλνει ένα μήνυμα στον χρήστη (DM) για να ελέγξουμε ότι το send δουλεύει
+    tg_id = str(update.effective_user.id)
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        r = requests.post(url, json={"chat_id": tg_id, "text": "Test alert ✅"}, timeout=10)
+        await update.message.reply_text(f"testalert status={r.status_code} body={r.text[:200]}")
+    except Exception as e:
+        await update.message.reply_text(f"testalert exception: {e}")
 
 # ───────── Alerts loop (τρέχει μόνο αν πάρουμε lock) ─────────
 def alerts_loop():
@@ -377,6 +385,7 @@ def main():
     app.add_handler(CommandHandler("adminstats", cmd_adminstats))
     app.add_handler(CommandHandler("adminsubs", cmd_adminsubs))
     app.add_handler(CommandHandler("admincheck", cmd_admincheck))
+    app.add_handler(CommandHandler("testalert", cmd_testalert))
 
     print({"msg": "bot_start"})
 
