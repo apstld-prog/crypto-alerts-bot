@@ -1,66 +1,56 @@
-
+# db.py
 import os
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional
 
-from sqlalchemy import create_engine, String, Integer, Boolean, DateTime, ForeignKey, Float
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
-def _normalize_database_url(raw: Optional[str]) -> str:
-    if not raw:
-        return "sqlite:///./local.db"
-    url = raw.strip()
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
-    return url
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL missing")
+# SQLAlchemy θέλει postgresql://
+DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://")
 
-def _build_engine(url: str):
-    return create_engine(url, pool_pre_ping=True)
-
-DATABASE_URL_RAW = os.getenv("DATABASE_URL")
-DATABASE_URL = _normalize_database_url(DATABASE_URL_RAW)
-engine = _build_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=10)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-
-class Base(DeclarativeBase):
-    pass
+Base = declarative_base()
 
 class User(Base):
     __tablename__ = "users"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    telegram_id: Mapped[Optional[str]] = mapped_column(String(64), unique=True, nullable=True)
-    is_premium: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(String(64), unique=True, index=True, nullable=False)
+    is_premium = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-class Subscription(Base):
-    __tablename__ = "subscriptions"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
-    provider: Mapped[str] = mapped_column(String(32))
-    provider_status: Mapped[str] = mapped_column(String(64))
-    status_internal: Mapped[str] = mapped_column(String(32))
-    provider_ref: Mapped[Optional[str]] = mapped_column(String(128))
-    current_period_end: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    user: Mapped[Optional[User]] = relationship(User)
+    alerts = relationship("Alert", back_populates="user")
 
 class Alert(Base):
     __tablename__ = "alerts"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    symbol: Mapped[str] = mapped_column(String(32))
-    rule: Mapped[str] = mapped_column(String(32))
-    value: Mapped[float] = mapped_column(Float)
-    cooldown_seconds: Mapped[int] = mapped_column(Integer, default=900)
-    last_fired_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    user: Mapped[User] = relationship(User)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    symbol = Column(String(32), index=True, nullable=False)          # π.χ. BTCUSDT
+    rule = Column(String(32), nullable=False)                        # "price_above" | "price_below"
+    value = Column(Float, nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+    cooldown_seconds = Column(Integer, default=900, nullable=False)
+    last_fired_at = Column(DateTime, nullable=True)
+    last_met = Column(Boolean, nullable=True)                        # ✅ για edge-trigger
 
-def init_db():
-    Base.metadata.create_all(bind=engine)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="alerts")
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    provider = Column(String(32), nullable=False)                    # "paypal"
+    provider_status = Column(String(64), nullable=True)
+    status_internal = Column(String(32), nullable=False)             # ACTIVE | CANCEL_AT_PERIOD_END | CANCELLED
+    provider_ref = Column(String(128), nullable=True)                # π.χ. subscription id
+    current_period_end = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 @contextmanager
 def session_scope():
@@ -73,3 +63,6 @@ def session_scope():
         raise
     finally:
         session.close()
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
