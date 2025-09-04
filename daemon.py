@@ -67,11 +67,25 @@ def safe_chunks(s: str, limit: int = 3900):
 HELP_TEXT = (
     "Help\n\n"
     "• /price <SYMBOL> → Spot price. Example: /price BTC\n"
-    "• /setalert <SYMBOL> <op> <value> → Ops: >, < (e.g. /setalert BTC > 110000)\n"
-    "• /myalerts → Show active alerts\n"
+    "• /setalert <SYMBOL> <op> <value> → Ops: >, <  (e.g. /setalert BTC > 110000)\n"
+    "• /myalerts → Show your active alerts\n"
+    "• /delalert <id> → Delete a specific alert (Premium/Admin)\n"
+    "• /clearalerts → Delete ALL your alerts (Premium/Admin)\n"
     "• /cancel_autorenew → Stop future billing (keeps access till period end)\n"
     "• /whoami → shows if you are admin/premium\n"
-    "Admin only: /adminstats, /adminsubs, /admincheck, /listalerts, /testalert, /runalerts, /resetalert <id>, /forcealert <id>\n"
+    "• /adminhelp → admin commands (admins only)\n"
+)
+
+ADMIN_HELP = (
+    "Admin Commands (cheat sheet)\n\n"
+    "• /adminstats — users/premium/alerts/subs counters\n"
+    "• /adminsubs — last 20 subscriptions\n"
+    "• /admincheck — DB URL (masked), last 5 alerts with last_fired/last_met\n"
+    "• /listalerts — last 20 alerts (id, rule, state)\n"
+    "• /runalerts — run one alert-evaluation cycle now, show counters & snapshot\n"
+    "• /resetalert <id> — set last_fired=NULL, last_met=FALSE (allow next crossing)\n"
+    "• /forcealert <id> — send alert immediately & mark last_met=TRUE\n"
+    "• /testalert — quick DM test (status=200 expected)\n"
 )
 
 # ───────── Commands ─────────
@@ -90,6 +104,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chunk in safe_chunks(HELP_TEXT):
         await update.message.reply_text(chunk, reply_markup=upgrade_keyboard())
+
+async def cmd_adminhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = str(update.effective_user.id)
+    if not is_admin(tg_id):
+        await update.message.reply_text("Admins only."); return
+    for chunk in safe_chunks(ADMIN_HELP):
+        await update.message.reply_text(chunk)
 
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
@@ -177,6 +198,61 @@ async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chunk in safe_chunks(msg):
         await update.message.reply_text(msg)
 
+# NEW: Premium/Admin delete a single alert by id
+async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = str(update.effective_user.id)
+    with session_scope() as session:
+        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        is_premium = bool(user and user.is_premium) or is_admin(tg_id)
+    if not is_premium:
+        await update.message.reply_text("This feature is for Premium users. Upgrade to delete alerts.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /delalert <id>")
+        return
+    try:
+        aid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Bad id")
+        return
+
+    with session_scope() as session:
+        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        if not user:
+            await update.message.reply_text("User not found.")
+            return
+        # Admin μπορεί να σβήσει οτιδήποτε. Αλλιώς μόνο δικά του.
+        if is_admin(tg_id):
+            res = session.execute(text("DELETE FROM alerts WHERE id=:id"), {"id": aid})
+        else:
+            res = session.execute(text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"), {"id": aid, "uid": user.id})
+        deleted = res.rowcount or 0
+    if deleted:
+        await update.message.reply_text(f"Alert #{aid} deleted.")
+    else:
+        await update.message.reply_text("Nothing deleted. Check the id (or ownership).")
+
+# NEW: Premium/Admin delete ALL own alerts
+async def cmd_clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = str(update.effective_user.id)
+    with session_scope() as session:
+        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        is_premium = bool(user and user.is_premium) or is_admin(tg_id)
+    if not is_premium:
+        await update.message.reply_text("This feature is for Premium users. Upgrade to clear alerts.")
+        return
+    with session_scope() as session:
+        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        if not user:
+            await update.message.reply_text("User not found."); return
+        if is_admin(tg_id):
+            # Αν θες να σβήνεις ΜΟΝΟ τα δικά σου ως admin, κράτα την άλλη γραμμή και αφαίρεσε αυτή.
+            res = session.execute(text("DELETE FROM alerts WHERE user_id=:uid"), {"uid": user.id})
+        else:
+            res = session.execute(text("DELETE FROM alerts WHERE user_id=:uid"), {"uid": user.id})
+        deleted = res.rowcount or 0
+    await update.message.reply_text(f"Deleted {deleted} alert(s).")
+
 async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not WEB_URL or not ADMIN_KEY:
         await update.message.reply_text("Cancel not available right now. Try again later.")
@@ -196,7 +272,7 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         await update.message.reply_text(f"Cancel error: {e}")
 
-# ───────── Admin-only commands ─────────
+# ───────── Admin-only commands & helpers ─────────
 def _require_admin(update: Update) -> str | None:
     tg_id = str(update.effective_user.id)
     if not is_admin(tg_id):
@@ -347,7 +423,7 @@ async def cmd_listalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     msg = "Last 20 alerts:\n" + "\n".join(lines)
     for chunk in safe_chunks(msg):
-        await update.message.reply_text(chunk)
+        await update.message.reply_text(msg)
 
 async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
@@ -410,14 +486,13 @@ async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"Force send exception: {e}")
 
-# NEW: τρέχει έναν κύκλο alerts τώρα και επιστρέφει counters + μικρό log
+# NEW: run a full cycle now and show counters + snapshot
 async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     not_admin = _require_admin(update)
     if not_admin:
         await update.message.reply_text("Admins only."); return
     with session_scope() as session:
         counters = run_alert_cycle(session)
-        # Εμφάνισε και μικρό snapshot των τελευταίων 5 alerts
         rows = session.execute(text("""
             SELECT id, symbol, rule, value, enabled, last_fired_at, last_met
             FROM alerts ORDER BY id DESC LIMIT 5
@@ -474,10 +549,13 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("adminhelp", cmd_adminhelp))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("price", cmd_price))
     app.add_handler(CommandHandler("setalert", cmd_setalert))
     app.add_handler(CommandHandler("myalerts", cmd_myalerts))
+    app.add_handler(CommandHandler("delalert", cmd_delalert))
+    app.add_handler(CommandHandler("clearalerts", cmd_clearalerts))
     app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
     # Admin
     app.add_handler(CommandHandler("adminstats", cmd_adminstats))
