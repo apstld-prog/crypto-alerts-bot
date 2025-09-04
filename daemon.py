@@ -5,6 +5,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram.error import Conflict
+from telegram.constants import ParseMode
 from sqlalchemy import select, text
 from db import init_db, session_scope, User, Alert, Subscription, engine
 from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
@@ -42,23 +43,39 @@ def try_advisory_lock(lock_id: int) -> bool:
         print({"msg": "advisory_lock_error", "error": str(e)})
         return False
 
-# ───────── Helpers ─────────
+# ───────── Pretty UI Helpers ─────────
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("📊 Price BTC", callback_data="go:price:BTC"),
+            InlineKeyboardButton("🔔 My Alerts", callback_data="go:myalerts"),
+        ],
+        [
+            InlineKeyboardButton("⏱️ Set Alert Help", callback_data="go:setalerthelp"),
+            InlineKeyboardButton("ℹ️ Help", callback_data="go:help"),
+        ]
+    ]
+    if PAYPAL_SUBSCRIBE_URL:
+        rows.append([InlineKeyboardButton("💎 Upgrade with PayPal", url=PAYPAL_SUBSCRIBE_URL)])
+    return InlineKeyboardMarkup(rows)
+
 def upgrade_keyboard():
     if PAYPAL_SUBSCRIBE_URL:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("Upgrade with PayPal", url=PAYPAL_SUBSCRIBE_URL)]])
+        return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade with PayPal", url=PAYPAL_SUBSCRIBE_URL)]])
     return None
 
 def start_text(limit: int) -> str:
+    # HTML formatting (bold, monospace for commands)
     return (
-        "Crypto Alerts Bot\n"
-        "Fast prices • Diagnostics • Alerts\n\n"
-        "Getting Started:\n"
-        "• /price BTC — current price\n"
-        "• /setalert BTC > 110000 — alert when condition is met\n"
-        "• /myalerts — list your active alerts (with delete buttons)\n"
-        "• /help — instructions\n\n"
-        f"Premium: unlimited alerts. Free: up to {limit}.\n\n"
-        "Missing a coin? Send /requestcoin <SYMBOL> and we'll add it."
+        "<b>Crypto Alerts Bot</b>\n"
+        "⚡️ <i>Fast prices</i> • 🧪 <i>Diagnostics</i> • 🔔 <i>Alerts</i>\n\n"
+        "<b>Getting Started</b>\n"
+        f"• <code>/price BTC</code> — current price\n"
+        f"• <code>/setalert BTC &gt; 110000</code> — alert when condition is met\n"
+        f"• <code>/myalerts</code> — list your active alerts (with delete buttons)\n"
+        f"• <code>/help</code> — instructions\n\n"
+        f"💎 <b>Premium</b>: unlimited alerts. <b>Free</b>: up to <b>{limit}</b>.\n\n"
+        "🧩 <i>Missing a coin?</i> Send <code>/requestcoin &lt;SYMBOL&gt;</code> and we’ll add it."
     )
 
 def safe_chunks(s: str, limit: int = 3900):
@@ -66,17 +83,18 @@ def safe_chunks(s: str, limit: int = 3900):
         yield s[:limit]
         s = s[limit:]
 
-HELP_TEXT = (
-    "Help\n\n"
-    "• /price <SYMBOL> → Spot price. Example: /price BTC\n"
-    "• /setalert <SYMBOL> <op> <value> → Ops: >, <  (e.g. /setalert BTC > 110000)\n"
-    "• /myalerts → Show your active alerts (with delete buttons)\n"
-    "• /delalert <id> → Delete a specific alert (Premium/Admin)\n"
-    "• /clearalerts → Delete ALL your alerts (Premium/Admin)\n"
-    "• /cancel_autorenew → Stop future billing (keeps access till period end)\n"
-    "• /whoami → shows if you are admin/premium\n"
-    "• /requestcoin <SYMBOL> → Ask admins to add a new coin (e.g. /requestcoin ARKM)\n"
-    "• /adminhelp → admin commands (admins only)\n"
+HELP_TEXT_HTML = (
+    "<b>Help</b>\n\n"
+    "• <code>/price &lt;SYMBOL&gt;</code> → Spot price. Example: <code>/price BTC</code>\n"
+    "• <code>/setalert &lt;SYMBOL&gt; &lt;op&gt; &lt;value&gt;</code> → ops: <b>&gt;</b>, <b>&lt;</b>\n"
+    "  e.g. <code>/setalert BTC &gt; 110000</code>\n"
+    "• <code>/myalerts</code> → show your active alerts (with delete buttons)\n"
+    "• <code>/delalert &lt;id&gt;</code> → delete one alert (Premium/Admin)\n"
+    "• <code>/clearalerts</code> → delete ALL your alerts (Premium/Admin)\n"
+    "• <code>/cancel_autorenew</code> → stop future billing (keeps access till period end)\n"
+    "• <code>/whoami</code> → shows if you are admin/premium\n"
+    "• <code>/requestcoin &lt;SYMBOL&gt;</code> → ask admins to add a coin (e.g. <code>/requestcoin ARKM</code>)\n"
+    "• <code>/adminhelp</code> → admin commands (admins only)\n"
 )
 
 ADMIN_HELP = (
@@ -102,11 +120,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.is_premium = True  # admins always premium
         session.add(user); session.flush()
     lim = 9999 if is_admin(tg_id) else FREE_ALERT_LIMIT
-    await update.message.reply_text(start_text(lim), reply_markup=upgrade_keyboard())
+    await update.message.reply_text(
+        start_text(lim),
+        reply_markup=main_menu_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for chunk in safe_chunks(HELP_TEXT):
-        await update.message.reply_text(chunk, reply_markup=upgrade_keyboard())
+    for chunk in safe_chunks(HELP_TEXT_HTML):
+        await update.message.reply_text(
+            chunk,
+            reply_markup=upgrade_keyboard(),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
 
 async def cmd_adminhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
@@ -527,14 +555,36 @@ async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chunk in safe_chunks("\n".join(lines)):
         await update.message.reply_text(chunk)
 
-# ───────── Callback handler for inline buttons ─────────
+# ───────── Callback handler (main menu + delete buttons) ─────────
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data or ""
     tg_id = str(query.from_user.id)
 
-    # Validate premium/admin
+    # Menu shortcuts
+    if data == "go:help":
+        for chunk in safe_chunks(HELP_TEXT_HTML):
+            await query.message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=upgrade_keyboard())
+        return
+    if data == "go:myalerts":
+        # call myalerts
+        fake_update = Update(update.update_id, message=query.message)  # not used; call directly
+        await cmd_myalerts(update, context)
+        return
+    if data.startswith("go:price:"):
+        sym = data.split(":", 2)[2]
+        price = fetch_price_binance(resolve_symbol(sym))
+        if price is None:
+            await query.message.reply_text("Price fetch failed. Try again later.")
+        else:
+            await query.message.reply_text(f"{resolve_symbol(sym)}: {price:.6f} USDT")
+        return
+    if data == "go:setalerthelp":
+        await query.message.reply_text("Examples:\n• /setalert BTC > 110000\n• /setalert ETH < 2000\n\nOps: >, <  (number in USD).")
+        return
+
+    # Validate premium/admin for destructive actions
     with session_scope() as session:
         user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         is_premium = bool(user and user.is_premium) or is_admin(tg_id)
