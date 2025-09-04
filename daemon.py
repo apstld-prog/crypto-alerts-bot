@@ -71,7 +71,7 @@ HELP_TEXT = (
     "• /myalerts → Show active alerts\n"
     "• /cancel_autorenew → Stop future billing (keeps access till period end)\n"
     "• /whoami → shows if you are admin/premium\n"
-    "Admin only: /adminstats, /adminsubs\n"
+    "Admin only: /adminstats, /adminsubs, /admincheck\n"
 )
 
 # ───────── Commands ─────────
@@ -291,6 +291,38 @@ async def cmd_adminsubs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chunk in safe_chunks(msg):
         await update.message.reply_text(chunk)
 
+async def cmd_admincheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Δείχνει τη βάση που βλέπει το daemon και τα τελευταία alerts, για διαγνωστικά."""
+    not_admin = _require_admin(update)
+    if not_admin:
+        await update.message.reply_text("Admins only."); return
+    try:
+        # Μασκάρισμα DB URL (χωρίς password)
+        try:
+            url_masked = engine.url.render_as_string(hide_password=True)
+        except Exception:
+            url_masked = str(engine.url)
+        with session_scope() as session:
+            total = session.execute(text("SELECT COUNT(*) FROM alerts")).scalar_one()
+            rows = session.execute(text("""
+                SELECT a.id, a.user_id, a.symbol, a.rule, a.value, a.enabled, u.telegram_id
+                FROM alerts a
+                LEFT JOIN users u ON u.id = a.user_id
+                ORDER BY a.id DESC
+                LIMIT 5
+            """)).all()
+        lines = [f"DB: {url_masked}", f"alerts_total={total}", "last_5:"]
+        if rows:
+            for r in rows:
+                op = ">" if r.rule == "price_above" else "<"
+                lines.append(f"  #{r.id} uid={r.user_id} tg={r.telegram_id or '-'} {r.symbol} {op} {r.value} {'ON' if r.enabled else 'OFF'}")
+        else:
+            lines.append("  (none)")
+        for chunk in safe_chunks("\n".join(lines)):
+            await update.message.reply_text(chunk)
+    except Exception as e:
+        await update.message.reply_text(f"admincheck error: {e}")
+
 # ───────── Alerts loop (τρέχει μόνο αν πάρουμε lock) ─────────
 def alerts_loop():
     if not RUN_ALERTS:
@@ -344,6 +376,7 @@ def main():
     # Admin
     app.add_handler(CommandHandler("adminstats", cmd_adminstats))
     app.add_handler(CommandHandler("adminsubs", cmd_adminsubs))
+    app.add_handler(CommandHandler("admincheck", cmd_admincheck))
 
     print({"msg": "bot_start"})
 
