@@ -2,7 +2,7 @@ import os, time, threading, re
 from datetime import datetime
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram.error import Conflict
 from sqlalchemy import select, text
 from db import init_db, session_scope, User, Alert, Subscription, engine
@@ -68,7 +68,7 @@ HELP_TEXT = (
     "Help\n\n"
     "• /price <SYMBOL> → Spot price. Example: /price BTC\n"
     "• /setalert <SYMBOL> <op> <value> → Ops: >, <  (e.g. /setalert BTC > 110000)\n"
-    "• /myalerts → Show your active alerts\n"
+    "• /myalerts → Show your active alerts (with delete buttons)\n"
     "• /delalert <id> → Delete a specific alert (Premium/Admin)\n"
     "• /clearalerts → Delete ALL your alerts (Premium/Admin)\n"
     "• /cancel_autorenew → Stop future billing (keeps access till period end)\n"
@@ -178,6 +178,12 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         aid = alert.id
     await update.message.reply_text(f"Alert #{aid} set: {pair} {op} {val}")
 
+# ───────── MYALERTS with inline Delete buttons ─────────
+def _alert_buttons(aid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🗑️ Delete #{aid}", callback_data=f"del:{aid}")]
+    ])
+
 async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     with session_scope() as session:
@@ -190,15 +196,12 @@ async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("No alerts in DB.")
         return
-    lines = []
     for r in rows:
         op = ">" if r.rule == "price_above" else "<"
-        lines.append(f"• #{r.id} {r.symbol} {op} {r.value} {'ON' if r.enabled else 'OFF'}")
-    msg = "Your alerts:\n" + "\n".join(lines)
-    for chunk in safe_chunks(msg):
-        await update.message.reply_text(msg)
+        txt = f"#{r.id}  {r.symbol} {op} {r.value}  {'ON' if r.enabled else 'OFF'}"
+        await update.message.reply_text(txt, reply_markup=_alert_buttons(r.id))
 
-# NEW: Premium/Admin delete a single alert by id
+# ───────── Premium/Admin delete via command ─────────
 async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     with session_scope() as session:
@@ -221,7 +224,6 @@ async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user:
             await update.message.reply_text("User not found.")
             return
-        # Admin μπορεί να σβήσει οτιδήποτε. Αλλιώς μόνο δικά του.
         if is_admin(tg_id):
             res = session.execute(text("DELETE FROM alerts WHERE id=:id"), {"id": aid})
         else:
@@ -232,7 +234,7 @@ async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Nothing deleted. Check the id (or ownership).")
 
-# NEW: Premium/Admin delete ALL own alerts
+# ───────── Premium/Admin delete ALL own alerts ─────────
 async def cmd_clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     with session_scope() as session:
@@ -245,11 +247,7 @@ async def cmd_clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
         if not user:
             await update.message.reply_text("User not found."); return
-        if is_admin(tg_id):
-            # Αν θες να σβήνεις ΜΟΝΟ τα δικά σου ως admin, κράτα την άλλη γραμμή και αφαίρεσε αυτή.
-            res = session.execute(text("DELETE FROM alerts WHERE user_id=:uid"), {"uid": user.id})
-        else:
-            res = session.execute(text("DELETE FROM alerts WHERE user_id=:uid"), {"uid": user.id})
+        res = session.execute(text("DELETE FROM alerts WHERE user_id=:uid"), {"uid": user.id})
         deleted = res.rowcount or 0
     await update.message.reply_text(f"Deleted {deleted} alert(s).")
 
@@ -486,7 +484,6 @@ async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"Force send exception: {e}")
 
-# NEW: run a full cycle now and show counters + snapshot
 async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     not_admin = _require_admin(update)
     if not_admin:
@@ -503,6 +500,48 @@ async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  #{r.id} {r.symbol} {op} {r.value} {'ON' if r.enabled else 'OFF'} last_fired={r.last_fired_at or '-'} last_met={r.last_met}")
     for chunk in safe_chunks("\n".join(lines)):
         await update.message.reply_text(chunk)
+
+# ───────── Callback handler for inline buttons ─────────
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    tg_id = str(query.from_user.id)
+
+    # Validate premium/admin
+    with session_scope() as session:
+        user = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+        is_premium = bool(user and user.is_premium) or is_admin(tg_id)
+
+    if data.startswith("del:"):
+        try:
+            aid = int(data.split(":", 1)[1])
+        except Exception:
+            await query.edit_message_text("Bad id.")
+            return
+
+        if not is_premium:
+            await query.edit_message_text("Premium required to delete alerts.")
+            return
+
+        with session_scope() as session:
+            owner = session.execute(text("SELECT user_id FROM alerts WHERE id=:id"), {"id": aid}).first()
+            if not owner:
+                await query.edit_message_text("Alert not found.")
+                return
+            # Only owner or admin
+            if not is_admin(tg_id):
+                u = session.execute(select(User).where(User.telegram_id==tg_id)).scalar_one_or_none()
+                if not u or owner.user_id != u.id:
+                    await query.edit_message_text("You can delete only your own alerts.")
+                    return
+            res = session.execute(text("DELETE FROM alerts WHERE id=:id"), {"id": aid})
+            deleted = res.rowcount or 0
+
+        if deleted:
+            await query.edit_message_text(f"✅ Deleted alert #{aid}.")
+        else:
+            await query.edit_message_text("Nothing deleted. Maybe it was already removed?")
 
 # ───────── Alerts loop (τρέχει μόνο αν πάρουμε lock) ─────────
 def alerts_loop():
@@ -566,6 +605,8 @@ def main():
     app.add_handler(CommandHandler("resetalert", cmd_resetalert))
     app.add_handler(CommandHandler("forcealert", cmd_forcealert))
     app.add_handler(CommandHandler("runalerts", cmd_runalerts))
+    # Callback buttons
+    app.add_handler(CallbackQueryHandler(on_callback))
 
     print({"msg": "bot_start"})
 
