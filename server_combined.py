@@ -1,7 +1,7 @@
 # server_combined.py
 import os, json
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Iterable
 
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
@@ -12,12 +12,23 @@ from db import session_scope, User, Subscription
 app = FastAPI(title="crypto-alerts-web")
 
 # ───────── ENV ─────────
-PAYPAL_MODE = os.getenv("PAYPAL_MODE", "live")  # live | sandbox
-PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID", "")
-PAYPAL_SECRET = os.getenv("PAYPAL_SECRET", "")
-PAYPAL_WEBHOOK_ID = os.getenv("PAYPAL_WEBHOOK_ID", "")
-ADMIN_KEY = os.getenv("ADMIN_KEY", "")
-WEB_URL = os.getenv("WEB_URL", "")
+def _env(name: str, default: str = "") -> str:
+    # Trim spaces to avoid trailing-space bugs
+    v = os.getenv(name, default)
+    if isinstance(v, str):
+        return v.strip()
+    return v
+
+PAYPAL_MODE = _env("PAYPAL_MODE", "live")  # live | sandbox
+PAYPAL_CLIENT_ID = _env("PAYPAL_CLIENT_ID", "")
+PAYPAL_SECRET = _env("PAYPAL_SECRET", "")
+PAYPAL_WEBHOOK_ID = _env("PAYPAL_WEBHOOK_ID", "")
+ADMIN_KEY = _env("ADMIN_KEY", "")
+WEB_URL = _env("WEB_URL", "")
+
+# for admin notifications
+BOT_TOKEN = _env("BOT_TOKEN", "")
+_ADMIN_IDS: Iterable[str] = [s.strip() for s in (_env("ADMIN_TELEGRAM_IDS","")).split(",") if s.strip()]
 
 def paypal_base() -> str:
     return "https://api-m.paypal.com" if PAYPAL_MODE == "live" else "https://api-m.sandbox.paypal.com"
@@ -34,7 +45,7 @@ async def paypal_access_token() -> str:
         r.raise_for_status()
         return r.json()["access_token"]
 
-# ───────── DB util ─────────
+# ───────── Utilities ─────────
 def parse_iso(dt_str: Optional[str]) -> Optional[datetime]:
     if not dt_str:
         return None
@@ -42,6 +53,31 @@ def parse_iso(dt_str: Optional[str]) -> Optional[datetime]:
         return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
     except Exception:
         return None
+
+def _mask(v: Optional[str], keep: int = 4) -> Optional[str]:
+    if not v:
+        return v
+    if len(v) <= keep:
+        return "***"
+    return v[:keep] + "…" + "***"
+
+def send_admin_msg(text: str) -> None:
+    if not BOT_TOKEN or not _ADMIN_IDS:
+        return
+    try:
+        with httpx.Client(timeout=10.0) as c:
+            for admin_id in _ADMIN_IDS:
+                if not admin_id:
+                    continue
+                try:
+                    c.post(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                        json={"chat_id": admin_id, "text": text},
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 def set_premium_and_upsert_subscription(
     telegram_id: str,
@@ -81,6 +117,7 @@ def set_premium_and_upsert_subscription(
             if period_end:
                 sub.current_period_end = period_end
 
+# ───────── Basic ─────────
 @app.get("/")
 async def root():
     return PlainTextResponse("crypto-alerts-web up")
@@ -89,15 +126,43 @@ async def root():
 async def healthz():
     return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
 
-# ───────── Start Subscription ─────────
+# ───────── DEBUG (for you) ─────────
+@app.get("/debug/env")
+async def debug_env(key: str = Query("")):
+    if key != ADMIN_KEY or not ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+    data = {
+        "PAYPAL_MODE": PAYPAL_MODE,
+        "PAYPAL_CLIENT_ID": _mask(PAYPAL_CLIENT_ID, 6),
+        "PAYPAL_SECRET": _mask(PAYPAL_SECRET, 6),
+        "PAYPAL_WEBHOOK_ID": _mask(PAYPAL_WEBHOOK_ID, 6),
+        "WEB_URL": WEB_URL,
+        "BOT_TOKEN": _mask(BOT_TOKEN, 6),
+        "ADMIN_TELEGRAM_IDS": list(_ADMIN_IDS),
+    }
+    return JSONResponse(data, status_code=200)
+
+@app.get("/debug/paypal_token")
+async def debug_paypal_token(key: str = Query("")):
+    if key != ADMIN_KEY or not ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        token = await paypal_access_token()
+        return JSONResponse({"ok": True, "token_prefix": token[:12] + "…"}, status_code=200)
+    except httpx.HTTPStatusError as he:
+        return JSONResponse({"ok": False, "error": "httpstatus", "status": he.response.status_code, "body": he.response.text[:400]}, status_code=200)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+
+# ───────── 1) Start: create subscription with custom_id ─────────
 @app.get("/billing/paypal/start")
 async def paypal_start(
-    tg: str = Query(...),
-    plan_id: str = Query(...),
+    tg: str = Query(..., description="Telegram user id"),
+    plan_id: str = Query(..., description="PayPal plan id, e.g. P-XXXX"),
 ):
     try:
         token = await paypal_access_token()
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="paypal token error")
 
     return_url = f"{WEB_URL}/billing/paypal/success?tg={tg}"
@@ -137,13 +202,13 @@ async def paypal_start(
 
 @app.get("/billing/paypal/success")
 async def paypal_success(tg: Optional[str] = None):
-    return PlainTextResponse(f"Thanks! If payment is approved, you'll be upgraded soon. tg={tg}")
+    return PlainTextResponse(f"Thanks! If payment is approved, you'll be upgraded shortly. tg={tg}")
 
 @app.get("/billing/paypal/cancelled")
 async def paypal_cancelled(tg: Optional[str] = None):
     return PlainTextResponse(f"Subscription was cancelled before approval. tg={tg}")
 
-# ───────── Webhook ─────────
+# ───────── 2) Webhook ─────────
 @app.post("/billing/paypal/webhook")
 async def paypal_webhook(request: Request):
     if not PAYPAL_WEBHOOK_ID:
@@ -152,9 +217,11 @@ async def paypal_webhook(request: Request):
     hdr = request.headers
     body_bytes = await request.body()
     body_text = body_bytes.decode("utf-8", "ignore")
-    event = json.loads(body_text or "{}")
+    try:
+        event = json.loads(body_text or "{}")
+    except Exception:
+        event = {}
 
-    # Verify
     token = await paypal_access_token()
     verify_payload = {
         "transmission_id": hdr.get("Paypal-Transmission-Id"),
@@ -180,13 +247,13 @@ async def paypal_webhook(request: Request):
     sub_id = resource.get("id") or resource.get("subscription_id")
     status = resource.get("status")
     custom_id = resource.get("custom_id")
+    plan_id = resource.get("plan_id") or (resource.get("plan_overridden") or {}).get("id")
 
-    print({"paypal_webhook_ok": {"etype": etype, "sub": sub_id, "status": status, "custom_id": custom_id}})
+    print({"paypal_webhook_ok": {"etype": etype, "sub": sub_id, "status": status, "custom_id": custom_id, "plan": plan_id}})
 
-    if etype in ("BILLING.SUBSCRIPTION.ACTIVATED", "PAYMENT.SALE.COMPLETED"):
-        cpe = parse_iso(((resource.get("billing_info") or {}).get("next_billing_time")))
-        if not cpe:
-            cpe = datetime.now(timezone.utc) + timedelta(days=30)
+    if etype in ("BILLING.SUBSCRIPTION.ACTIVATED", "PAYMENT.SALE.COMPLETED", "PAYMENT.CAPTURE.COMPLETED"):
+        cpe = parse_iso(((resource.get("billing_info") or {}).get("next_billing_time"))) \
+              or (datetime.now(timezone.utc) + timedelta(days=30))
         if custom_id:
             set_premium_and_upsert_subscription(
                 telegram_id=str(custom_id),
@@ -195,6 +262,9 @@ async def paypal_webhook(request: Request):
                 period_end=cpe,
                 status_internal="ACTIVE",
             )
+            send_admin_msg(f"💎 New Premium activated\nTG: {custom_id}\nSub: {sub_id}\nStatus: {status}\nPlan: {plan_id}\nCPE: {cpe.isoformat()}")
+        else:
+            send_admin_msg(f"ℹ️ PayPal ACTIVATE without custom_id\nSub: {sub_id}\nStatus: {status}\nUse /claim {sub_id} from your admin account to bind.")
     elif etype in ("BILLING.SUBSCRIPTION.CANCELLED", "BILLING.SUBSCRIPTION.SUSPENDED"):
         cpe = parse_iso(((resource.get("billing_info") or {}).get("next_billing_time")))
         if custom_id:
@@ -205,9 +275,13 @@ async def paypal_webhook(request: Request):
                 period_end=cpe,
                 status_internal="CANCELLED",
             )
+            send_admin_msg(f"⚠️ Subscription updated\nTG: {custom_id}\nSub: {sub_id}\nStatus: {status}\nCPE: {(cpe.isoformat() if cpe else '-')}")
+        else:
+            send_admin_msg(f"⚠️ Subscription {status} without custom_id\nSub: {sub_id}\n(legacy link?)")
+
     return JSONResponse({"ok": True}, status_code=200)
 
-# ───────── Claim (Admin) ─────────
+# ───────── 3) Admin claim ─────────
 @app.post("/billing/paypal/claim")
 async def paypal_claim(
     subscription_id: str = Query(...),
@@ -235,9 +309,10 @@ async def paypal_claim(
         period_end=cpe,
         status_internal="ACTIVE" if status in ("ACTIVE","APPROVED") else status,
     )
+    send_admin_msg(f"✅ CLAIM done\nTG: {tg}\nSub: {subscription_id}\nStatus: {status}\nCPE: {cpe.isoformat()}")
     return JSONResponse({"ok": True, "status": status, "current_period_end": cpe.isoformat()}, status_code=200)
 
-# ───────── Cancel auto-renew (Admin) ─────────
+# ───────── 4) Admin cancel auto-renew ─────────
 @app.post("/billing/paypal/cancel")
 async def paypal_cancel_autorenew(
     telegram_id: str = Query(...),
@@ -266,4 +341,5 @@ async def paypal_cancel_autorenew(
         )
     if r.status_code not in (200,204):
         return JSONResponse({"ok": False, "error": r.text}, status_code=400)
+    send_admin_msg(f"🛑 Auto-renew cancelled\nTG: {telegram_id}\nSub: {sub.provider_ref}")
     return JSONResponse({"ok": True, "keeps_access_until": (sub.current_period_end.isoformat() if sub.current_period_end else None)}, status_code=200)
