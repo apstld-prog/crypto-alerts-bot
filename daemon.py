@@ -12,10 +12,14 @@ from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
 
 # ───────── ENV ─────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEB_URL = os.getenv("WEB_URL")
+WEB_URL = os.getenv("WEB_URL", "").rstrip("/")
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
-PAYPAL_SUBSCRIBE_URL = os.getenv("PAYPAL_SUBSCRIBE_URL")
+
+# PayPal
+PAYPAL_MODE = os.getenv("PAYPAL_MODE", "live")          # live | sandbox
+PAYPAL_SUBSCRIBE_URL = os.getenv("PAYPAL_SUBSCRIBE_URL")  # optional (legacy share link)
+PAYPAL_PLAN_ID = os.getenv("PAYPAL_PLAN_ID")            # προτείνεται (για /billing/paypal/start)
 FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "3"))
 
 RUN_BOT = os.getenv("RUN_BOT", "1") == "1"
@@ -44,7 +48,19 @@ def try_advisory_lock(lock_id: int) -> bool:
         return False
 
 # ───────── Pretty UI Helpers ─────────
-def main_menu_keyboard() -> InlineKeyboardMarkup:
+def upgrade_url_for_user(tg_id: str) -> str | None:
+    """
+    Αν έχουμε WEB_URL & PAYPAL_PLAN_ID → χρησιμοποιούμε την αυτόματη ροή:
+      GET {WEB_URL}/billing/paypal/start?tg=<id>&plan_id=<P-...>
+    Διαφορετικά, αν έχουμε PAYPAL_SUBSCRIBE_URL → ανοίγουμε το shareable link (χωρίς mapping).
+    """
+    if WEB_URL and PAYPAL_PLAN_ID:
+        return f"{WEB_URL}/billing/paypal/start?tg={tg_id}&plan_id={PAYPAL_PLAN_ID}"
+    if PAYPAL_SUBSCRIBE_URL:
+        return PAYPAL_SUBSCRIBE_URL
+    return None
+
+def main_menu_keyboard(tg_id: str) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton("📊 Price BTC", callback_data="go:price:BTC"),
@@ -55,12 +71,17 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("ℹ️ Help", callback_data="go:help"),
         ]
     ]
-    if PAYPAL_SUBSCRIBE_URL:
-        rows.append([InlineKeyboardButton("💎 Upgrade with PayPal", url=PAYPAL_SUBSCRIBE_URL)])
+    upg = upgrade_url_for_user(tg_id)
+    if upg:
+        rows.append([InlineKeyboardButton("💎 Upgrade with PayPal", url=upg)])
     return InlineKeyboardMarkup(rows)
 
-def upgrade_keyboard():
-    if PAYPAL_SUBSCRIBE_URL:
+def upgrade_keyboard(tg_id: str | None):
+    if tg_id:
+        url = upgrade_url_for_user(tg_id)
+        if url:
+            return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade with PayPal", url=url)]])
+    elif PAYPAL_SUBSCRIBE_URL:
         return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade with PayPal", url=PAYPAL_SUBSCRIBE_URL)]])
     return None
 
@@ -107,6 +128,7 @@ ADMIN_HELP = (
     "• /resetalert <id> — set last_fired=NULL, last_met=FALSE (allow next crossing)\n"
     "• /forcealert <id> — send alert immediately & mark last_met=TRUE\n"
     "• /testalert — quick DM test (status=200 expected)\n"
+    "• /claim <subscription_id> — bind PayPal subscription to current admin user\n"
 )
 
 # ───────── Commands ─────────
@@ -122,16 +144,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lim = 9999 if is_admin(tg_id) else FREE_ALERT_LIMIT
     await update.message.reply_text(
         start_text(lim),
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(tg_id),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = str(update.effective_user.id)
     for chunk in safe_chunks(HELP_TEXT_HTML):
         await update.message.reply_text(
             chunk,
-            reply_markup=upgrade_keyboard(),
+            reply_markup=upgrade_keyboard(tg_id),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True
         )
@@ -311,8 +334,8 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     tg_id = str(update.effective_user.id)
     try:
-        r = requests.post(f"{WEB_URL}/billing/paypal/cancel", params={"telegram_id": tg_id, "key": ADMIN_KEY}, timeout=20)
-        if r.status_code == 200:
+        r = requests.post(f"{WEB_URL}/billing/paypal/cancel", params={"telegram_id": tg_id, "key": ADMIN_KEY}, timeout=25)
+        if r.status_code == 200 and r.json().get("ok"):
             data = r.json()
             until = data.get("keeps_access_until")
             if until:
@@ -320,7 +343,7 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
             else:
                 await update.message.reply_text("Auto-renew cancelled. Premium remains active till end of period.")
         else:
-            await update.message.reply_text(f"Cancel failed: {r.text}")
+            await update.message.reply_text(f"Cancel failed: {r.status_code} {r.text[:200]}")
     except Exception as e:
         await update.message.reply_text(f"Cancel error: {e}")
 
@@ -531,7 +554,8 @@ async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             textmsg = f"🔔 (force) Alert #{r.id} | {r.symbol} {r.rule} {r.value}"
             rq = requests.post(url, json={"chat_id": chat_id, "text": textmsg}, timeout=10)
             if rq.status_code == 200:
-                session.execute(text("UPDATE alerts SET last_fired_at = NOW(), last_met = TRUE WHERE id=:id"), {"id": aid})
+                with session_scope() as s:
+                    s.execute(text("UPDATE alerts SET last_fired_at = NOW(), last_met = TRUE WHERE id=:id"), {"id": aid})
                 await update.message.reply_text("Force sent ok. status=200")
             else:
                 await update.message.reply_text(f"Force send failed: {rq.status_code} {rq.text[:200]}")
@@ -555,6 +579,31 @@ async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chunk in safe_chunks("\n".join(lines)):
         await update.message.reply_text(chunk)
 
+# ───────── Admin: χειροκίνητο claim PayPal subscription → τρέχον admin user ─────────
+async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = str(update.effective_user.id)
+    if not is_admin(tg_id):
+        await update.message.reply_text("Admins only."); return
+    if not context.args:
+        await update.message.reply_text("Usage: /claim <subscription_id>"); return
+
+    sub_id = context.args[0]
+    if not WEB_URL or not ADMIN_KEY:
+        await update.message.reply_text("Server not configured (WEB_URL/ADMIN_KEY)."); return
+
+    try:
+        url = f"{WEB_URL}/billing/paypal/claim"
+        params = {"subscription_id": sub_id, "tg": tg_id, "key": ADMIN_KEY}
+        r = requests.post(url, params=params, timeout=25)
+        if r.status_code == 200 and r.json().get("ok"):
+            cpe = r.json().get("current_period_end")
+            st = r.json().get("status")
+            await update.message.reply_text(f"Claim OK: {sub_id}\nstatus={st}\nperiod_end={cpe}")
+        else:
+            await update.message.reply_text(f"Claim failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        await update.message.reply_text(f"Claim exception: {e}")
+
 # ───────── Callback handler (main menu + delete buttons) ─────────
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -565,20 +614,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Menu shortcuts
     if data == "go:help":
         for chunk in safe_chunks(HELP_TEXT_HTML):
-            await query.message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=upgrade_keyboard())
+            await query.message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=upgrade_keyboard(tg_id))
         return
     if data == "go:myalerts":
-        # call myalerts
-        fake_update = Update(update.update_id, message=query.message)  # not used; call directly
         await cmd_myalerts(update, context)
         return
     if data.startswith("go:price:"):
         sym = data.split(":", 2)[2]
-        price = fetch_price_binance(resolve_symbol(sym))
+        pair = resolve_symbol(sym)
+        price = fetch_price_binance(pair) if pair else None
         if price is None:
             await query.message.reply_text("Price fetch failed. Try again later.")
         else:
-            await query.message.reply_text(f"{resolve_symbol(sym)}: {price:.6f} USDT")
+            await query.message.reply_text(f"{pair}: {price:.6f} USDT")
         return
     if data == "go:setalerthelp":
         await query.message.reply_text("Examples:\n• /setalert BTC > 110000\n• /setalert ETH < 2000\n\nOps: >, <  (number in USD).")
@@ -683,6 +731,7 @@ def main():
     app.add_handler(CommandHandler("resetalert", cmd_resetalert))
     app.add_handler(CommandHandler("forcealert", cmd_forcealert))
     app.add_handler(CommandHandler("runalerts", cmd_runalerts))
+    app.add_handler(CommandHandler("claim", cmd_claim))
     # Callback buttons
     app.add_handler(CallbackQueryHandler(on_callback))
 
