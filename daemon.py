@@ -12,15 +12,15 @@ from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
 
 # ───────── ENV ─────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEB_URL = os.getenv("WEB_URL", "").rstrip("/")
+WEB_URL = os.getenv("WEB_URL")  # e.g. https://crypto-alerts-2-web.onrender.com
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
-
-# PayPal
-PAYPAL_MODE = os.getenv("PAYPAL_MODE", "live")          # live | sandbox
-PAYPAL_SUBSCRIBE_URL = os.getenv("PAYPAL_SUBSCRIBE_URL")  # optional (legacy share link)
-PAYPAL_PLAN_ID = os.getenv("PAYPAL_PLAN_ID")            # προτείνεται (για /billing/paypal/start)
 FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "3"))
+
+# PayPal dynamic start (recommended):
+PAYPAL_PLAN_ID = os.getenv("PAYPAL_PLAN_ID")  # e.g. P-XXXXXXXXXXXX (LIVE)
+# (legacy fallback) direct plan link if you still want it:
+PAYPAL_SUBSCRIBE_URL = os.getenv("PAYPAL_SUBSCRIBE_URL")
 
 RUN_BOT = os.getenv("RUN_BOT", "1") == "1"
 RUN_ALERTS = os.getenv("RUN_ALERTS", "1") == "1"
@@ -47,20 +47,14 @@ def try_advisory_lock(lock_id: int) -> bool:
         print({"msg": "advisory_lock_error", "error": str(e)})
         return False
 
-# ───────── Pretty UI Helpers ─────────
-def upgrade_url_for_user(tg_id: str) -> str | None:
-    """
-    Αν έχουμε WEB_URL & PAYPAL_PLAN_ID → χρησιμοποιούμε την αυτόματη ροή:
-      GET {WEB_URL}/billing/paypal/start?tg=<id>&plan_id=<P-...>
-    Διαφορετικά, αν έχουμε PAYPAL_SUBSCRIBE_URL → ανοίγουμε το shareable link (χωρίς mapping).
-    """
-    if WEB_URL and PAYPAL_PLAN_ID:
+# ───────── UI Helpers ─────────
+def paypal_upgrade_url_for(tg_id: str | None) -> str | None:
+    """Return dynamic PayPal start URL (preferred) or fallback static plan link."""
+    if WEB_URL and PAYPAL_PLAN_ID and tg_id:
         return f"{WEB_URL}/billing/paypal/start?tg={tg_id}&plan_id={PAYPAL_PLAN_ID}"
-    if PAYPAL_SUBSCRIBE_URL:
-        return PAYPAL_SUBSCRIBE_URL
-    return None
+    return PAYPAL_SUBSCRIBE_URL  # fallback (plain plan link, no custom_id mapping)
 
-def main_menu_keyboard(tg_id: str) -> InlineKeyboardMarkup:
+def main_menu_keyboard(tg_id: str | None) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton("📊 Price BTC", callback_data="go:price:BTC"),
@@ -71,30 +65,26 @@ def main_menu_keyboard(tg_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("ℹ️ Help", callback_data="go:help"),
         ]
     ]
-    upg = upgrade_url_for_user(tg_id)
-    if upg:
-        rows.append([InlineKeyboardButton("💎 Upgrade with PayPal", url=upg)])
+    u = paypal_upgrade_url_for(tg_id)
+    if u:
+        rows.append([InlineKeyboardButton("💎 Upgrade with PayPal", url=u)])
     return InlineKeyboardMarkup(rows)
 
 def upgrade_keyboard(tg_id: str | None):
-    if tg_id:
-        url = upgrade_url_for_user(tg_id)
-        if url:
-            return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade with PayPal", url=url)]])
-    elif PAYPAL_SUBSCRIBE_URL:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade with PayPal", url=PAYPAL_SUBSCRIBE_URL)]])
+    u = paypal_upgrade_url_for(tg_id)
+    if u:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade with PayPal", url=u)]])
     return None
 
 def start_text(limit: int) -> str:
-    # HTML formatting (bold, monospace for commands)
     return (
         "<b>Crypto Alerts Bot</b>\n"
         "⚡️ <i>Fast prices</i> • 🧪 <i>Diagnostics</i> • 🔔 <i>Alerts</i>\n\n"
         "<b>Getting Started</b>\n"
-        f"• <code>/price BTC</code> — current price\n"
-        f"• <code>/setalert BTC &gt; 110000</code> — alert when condition is met\n"
-        f"• <code>/myalerts</code> — list your active alerts (with delete buttons)\n"
-        f"• <code>/help</code> — instructions\n\n"
+        "• <code>/price BTC</code> — current price\n"
+        "• <code>/setalert BTC &gt; 110000</code> — alert when condition is met\n"
+        "• <code>/myalerts</code> — list your active alerts (with delete buttons)\n"
+        "• <code>/help</code> — instructions\n\n"
         f"💎 <b>Premium</b>: unlimited alerts. <b>Free</b>: up to <b>{limit}</b>.\n\n"
         "🧩 <i>Missing a coin?</i> Send <code>/requestcoin &lt;SYMBOL&gt;</code> and we’ll add it."
     )
@@ -114,21 +104,21 @@ HELP_TEXT_HTML = (
     "• <code>/clearalerts</code> → delete ALL your alerts (Premium/Admin)\n"
     "• <code>/cancel_autorenew</code> → stop future billing (keeps access till period end)\n"
     "• <code>/whoami</code> → shows if you are admin/premium\n"
-    "• <code>/requestcoin &lt;SYMBOL&gt;</code> → ask admins to add a coin (e.g. <code>/requestcoin ARKM</code>)\n"
+    "• <code>/requestcoin &lt;SYMBOL&gt;</code> → ask admins to add a coin\n"
     "• <code>/adminhelp</code> → admin commands (admins only)\n"
 )
 
 ADMIN_HELP = (
-    "Admin Commands (cheat sheet)\n\n"
+    "Admin Commands\n\n"
     "• /adminstats — users/premium/alerts/subs counters\n"
     "• /adminsubs — last 20 subscriptions\n"
     "• /admincheck — DB URL (masked), last 5 alerts with last_fired/last_met\n"
     "• /listalerts — last 20 alerts (id, rule, state)\n"
-    "• /runalerts — run one alert-evaluation cycle now, show counters & snapshot\n"
-    "• /resetalert <id> — set last_fired=NULL, last_met=FALSE (allow next crossing)\n"
-    "• /forcealert <id> — send alert immediately & mark last_met=TRUE\n"
-    "• /testalert — quick DM test (status=200 expected)\n"
-    "• /claim <subscription_id> — bind PayPal subscription to current admin user\n"
+    "• /runalerts — run one alert-evaluation cycle now\n"
+    "• /resetalert <id> — last_fired=NULL, last_met=FALSE\n"
+    "• /forcealert <id> — send alert now & set last_met=TRUE\n"
+    "• /testalert — quick DM test\n"
+    "• /claim <subscription_id> — bind existing PayPal sub to YOU\n"
 )
 
 # ───────── Commands ─────────
@@ -215,7 +205,7 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user:
             user = User(telegram_id=tg_id, is_premium=False)
         if is_admin(tg_id):
-            user.is_premium = True  # admin bypass limit
+            user.is_premium = True  # admin bypass
         session.add(user); session.flush()
 
         if not user.is_premium and not is_admin(tg_id):
@@ -334,8 +324,8 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     tg_id = str(update.effective_user.id)
     try:
-        r = requests.post(f"{WEB_URL}/billing/paypal/cancel", params={"telegram_id": tg_id, "key": ADMIN_KEY}, timeout=25)
-        if r.status_code == 200 and r.json().get("ok"):
+        r = requests.post(f"{WEB_URL}/billing/paypal/cancel", params={"telegram_id": tg_id, "key": ADMIN_KEY}, timeout=20)
+        if r.status_code == 200:
             data = r.json()
             until = data.get("keeps_access_until")
             if until:
@@ -343,11 +333,11 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
             else:
                 await update.message.reply_text("Auto-renew cancelled. Premium remains active till end of period.")
         else:
-            await update.message.reply_text(f"Cancel failed: {r.status_code} {r.text[:200]}")
+            await update.message.reply_text(f"Cancel failed: {r.text}")
     except Exception as e:
         await update.message.reply_text(f"Cancel error: {e}")
 
-# ───────── Admin-only commands & helpers ─────────
+# ───────── Admin-only helpers / commands ─────────
 def _require_admin(update: Update) -> str | None:
     tg_id = str(update.effective_user.id)
     if not is_admin(tg_id):
@@ -554,8 +544,7 @@ async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             textmsg = f"🔔 (force) Alert #{r.id} | {r.symbol} {r.rule} {r.value}"
             rq = requests.post(url, json={"chat_id": chat_id, "text": textmsg}, timeout=10)
             if rq.status_code == 200:
-                with session_scope() as s:
-                    s.execute(text("UPDATE alerts SET last_fired_at = NOW(), last_met = TRUE WHERE id=:id"), {"id": aid})
+                session.execute(text("UPDATE alerts SET last_fired_at = NOW(), last_met = TRUE WHERE id=:id"), {"id": aid})
                 await update.message.reply_text("Force sent ok. status=200")
             else:
                 await update.message.reply_text(f"Force send failed: {rq.status_code} {rq.text[:200]}")
@@ -579,7 +568,7 @@ async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chunk in safe_chunks("\n".join(lines)):
         await update.message.reply_text(chunk)
 
-# ───────── Admin: χειροκίνητο claim PayPal subscription → τρέχον admin user ─────────
+# ───────── Admin: χειροκίνητο claim PayPal subscription ─────────
 async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     if not is_admin(tg_id):
@@ -604,7 +593,7 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Claim exception: {e}")
 
-# ───────── Callback handler (main menu + delete buttons) ─────────
+# ───────── Callback handler (menu + delete buttons) ─────────
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
