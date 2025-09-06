@@ -12,7 +12,7 @@ from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
 
 # ───────── ENV ─────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEB_URL = os.getenv("WEB_URL")  # e.g. https://crypto-alerts-2-web.onrender.com
+WEB_URL = os.getenv("WEB_URL")  # e.g. https://crypto-alerts-web.onrender.com
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
 FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "3"))
@@ -47,13 +47,31 @@ def try_advisory_lock(lock_id: int) -> bool:
         print({"msg": "advisory_lock_error", "error": str(e)})
         return False
 
-# ───────── UI Helpers ─────────
+# ───────── Helpers ─────────
 def paypal_upgrade_url_for(tg_id: str | None) -> str | None:
     """Return dynamic PayPal start URL (preferred) or fallback static plan link."""
     if WEB_URL and PAYPAL_PLAN_ID and tg_id:
         return f"{WEB_URL}/billing/paypal/start?tg={tg_id}&plan_id={PAYPAL_PLAN_ID}"
     return PAYPAL_SUBSCRIBE_URL  # fallback (plain plan link, no custom_id mapping)
 
+def send_admins(text: str) -> None:
+    if not _ADMIN_IDS:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    for admin_id in _ADMIN_IDS:
+        if not admin_id:
+            continue
+        try:
+            requests.post(url, json={"chat_id": admin_id, "text": text}, timeout=10)
+        except Exception:
+            pass
+
+def send_message(chat_id: str, text_msg: str) -> tuple[int, str]:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    r = requests.post(url, json={"chat_id": chat_id, "text": text_msg}, timeout=15)
+    return r.status_code, r.text
+
+# ───────── UI ─────────
 def main_menu_keyboard(tg_id: str | None) -> InlineKeyboardMarkup:
     rows = [
         [
@@ -63,6 +81,9 @@ def main_menu_keyboard(tg_id: str | None) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("⏱️ Set Alert Help", callback_data="go:setalerthelp"),
             InlineKeyboardButton("ℹ️ Help", callback_data="go:help"),
+        ],
+        [
+            InlineKeyboardButton("🆘 Support", callback_data="go:support"),
         ]
     ]
     u = paypal_upgrade_url_for(tg_id)
@@ -84,7 +105,8 @@ def start_text(limit: int) -> str:
         "• <code>/price BTC</code> — current price\n"
         "• <code>/setalert BTC &gt; 110000</code> — alert when condition is met\n"
         "• <code>/myalerts</code> — list your active alerts (with delete buttons)\n"
-        "• <code>/help</code> — instructions\n\n"
+        "• <code>/help</code> — instructions\n"
+        "• <code>/support &lt;message&gt;</code> — contact admin support\n\n"
         f"💎 <b>Premium</b>: unlimited alerts. <b>Free</b>: up to <b>{limit}</b>.\n\n"
         "🧩 <i>Missing a coin?</i> Send <code>/requestcoin &lt;SYMBOL&gt;</code> and we’ll add it."
     )
@@ -103,6 +125,7 @@ HELP_TEXT_HTML = (
     "• <code>/delalert &lt;id&gt;</code> → delete one alert (Premium/Admin)\n"
     "• <code>/clearalerts</code> → delete ALL your alerts (Premium/Admin)\n"
     "• <code>/cancel_autorenew</code> → stop future billing (keeps access till period end)\n"
+    "• <code>/support &lt;message&gt;</code> → send a message to admins\n"
     "• <code>/whoami</code> → shows if you are admin/premium\n"
     "• <code>/requestcoin &lt;SYMBOL&gt;</code> → ask admins to add a coin\n"
     "• <code>/adminhelp</code> → admin commands (admins only)\n"
@@ -119,6 +142,7 @@ ADMIN_HELP = (
     "• /forcealert <id> — send alert now & set last_met=TRUE\n"
     "• /testalert — quick DM test\n"
     "• /claim <subscription_id> — bind existing PayPal sub to YOU\n"
+    "• /reply <tg_id> <message> — reply to a user’s /support\n"
 )
 
 # ───────── Commands ─────────
@@ -305,18 +329,31 @@ async def cmd_requestcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     who = f"{requester.first_name or ''} (@{requester.username}) id={requester.id}"
     msg = f"🆕 Coin request: {sym}\nFrom: {who}"
     await update.message.reply_text(f"Got it! We'll review and add {sym} if possible.")
-    if _ADMIN_IDS:
-        try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-            for admin_id in _ADMIN_IDS:
-                if not admin_id:
-                    continue
-                try:
-                    requests.post(url, json={"chat_id": admin_id, "text": msg}, timeout=10)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    send_admins(msg)
+
+# ───────── User Support & Admin Reply ─────────
+async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = str(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text("Στείλε: /support <μήνυμα σου προς τους διαχειριστές>")
+        return
+    msg = " ".join(context.args).strip()
+    who = update.effective_user
+    header = f"🆘 Support message\nFrom: {who.first_name or ''} (@{who.username}) id={tg_id}"
+    full = f"{header}\n\n{msg}"
+    send_admins(full)
+    await update.message.reply_text("✅ Το μήνυμα στάλθηκε στην ομάδα υποστήριξης. Θα σε απαντήσουμε σύντομα εδώ.")
+
+async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = str(update.effective_user.id)
+    if not is_admin(tg_id):
+        await update.message.reply_text("Admins only."); return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /reply <tg_id> <message>"); return
+    target = context.args[0]
+    text_msg = " ".join(context.args[1:]).strip()
+    code, body = send_message(target, f"💬 Support reply:\n{text_msg}")
+    await update.message.reply_text(f"Reply sent → {target}\nstatus={code}\n{body[:160]}")
 
 async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not WEB_URL or not ADMIN_KEY:
@@ -540,14 +577,14 @@ async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not chat_id:
             await update.message.reply_text("No telegram_id for this user; cannot send."); return
         try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
             textmsg = f"🔔 (force) Alert #{r.id} | {r.symbol} {r.rule} {r.value}"
-            rq = requests.post(url, json={"chat_id": chat_id, "text": textmsg}, timeout=10)
-            if rq.status_code == 200:
-                session.execute(text("UPDATE alerts SET last_fired_at = NOW(), last_met = TRUE WHERE id=:id"), {"id": aid})
+            code, body = send_message(chat_id, textmsg)
+            if code == 200:
+                with session_scope() as s2:
+                    s2.execute(text("UPDATE alerts SET last_fired_at = NOW(), last_met = TRUE WHERE id=:id"), {"id": aid})
                 await update.message.reply_text("Force sent ok. status=200")
             else:
-                await update.message.reply_text(f"Force send failed: {rq.status_code} {rq.text[:200]}")
+                await update.message.reply_text(f"Force send failed: {code} {body[:200]}")
         except Exception as e:
             await update.message.reply_text(f"Force send exception: {e}")
 
@@ -575,11 +612,9 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Admins only."); return
     if not context.args:
         await update.message.reply_text("Usage: /claim <subscription_id>"); return
-
     sub_id = context.args[0]
     if not WEB_URL or not ADMIN_KEY:
         await update.message.reply_text("Server not configured (WEB_URL/ADMIN_KEY)."); return
-
     try:
         url = f"{WEB_URL}/billing/paypal/claim"
         params = {"subscription_id": sub_id, "tg": tg_id, "key": ADMIN_KEY}
@@ -619,6 +654,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == "go:setalerthelp":
         await query.message.reply_text("Examples:\n• /setalert BTC > 110000\n• /setalert ETH < 2000\n\nOps: >, <  (number in USD).")
+        return
+    if data == "go:support":
+        await query.message.reply_text("Στείλε μήνυμα στην υποστήριξη:\n/support <το μήνυμά σου>", reply_markup=upgrade_keyboard(tg_id))
         return
 
     # Validate premium/admin for destructive actions
@@ -710,6 +748,8 @@ def main():
     app.add_handler(CommandHandler("delalert", cmd_delalert))
     app.add_handler(CommandHandler("clearalerts", cmd_clearalerts))
     app.add_handler(CommandHandler("requestcoin", cmd_requestcoin))
+    app.add_handler(CommandHandler("support", cmd_support))
+    app.add_handler(CommandHandler("reply", cmd_reply))
     app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
     # Admin
     app.add_handler(CommandHandler("adminstats", cmd_adminstats))
