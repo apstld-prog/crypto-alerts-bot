@@ -71,6 +71,10 @@ def send_message(chat_id: str, text_msg: str) -> tuple[int, str]:
     r = requests.post(url, json={"chat_id": chat_id, "text": text_msg}, timeout=15)
     return r.status_code, r.text
 
+# μικρό helper για να γυρίζουμε κανόνα → σύμβολο
+def op_from_rule(rule: str) -> str:
+    return ">" if rule == "price_above" else "<"
+
 # ───────── UI ─────────
 def main_menu_keyboard(tg_id: str | None) -> InlineKeyboardMarkup:
     rows = [
@@ -232,6 +236,12 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.is_premium = True  # admin bypass
         session.add(user); session.flush()
 
+        # πόσα alerts έχει *ήδη* ο χρήστης (για τον τοπικό αριθμό #U…)
+        user_total_before = session.execute(
+            text("SELECT COUNT(*) FROM alerts WHERE user_id=:uid"),
+            {"uid": user.id}
+        ).scalar_one()
+
         if not user.is_premium and not is_admin(tg_id):
             active_alerts = session.execute(
                 text("SELECT COUNT(*) FROM alerts WHERE user_id=:uid AND enabled = TRUE"),
@@ -244,7 +254,9 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alert = Alert(user_id=user.id, symbol=pair, rule=rule, value=val, cooldown_seconds=900)
         session.add(alert); session.flush()
         aid = alert.id
-    await update.message.reply_text(f"Alert #{aid} set: {pair} {op} {val}")
+        user_local_no = user_total_before + 1  # #U…
+
+    await update.message.reply_text(f"✅ Alert #U{user_local_no} (ID {aid}) set: {pair} {op} {val}")
 
 # ───────── MYALERTS with inline Delete buttons ─────────
 def _alert_buttons(aid: int) -> InlineKeyboardMarkup:
@@ -258,15 +270,17 @@ async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         if not user:
             await update.message.reply_text("No alerts yet."); return
+        # για να υπολογίσουμε #U… σταθερά, ταξινομούμε ΑΥΞΟΝΤΑ id και κάνουμε enumerate
         rows = session.execute(text(
-            "SELECT id, symbol, rule, value, enabled FROM alerts WHERE user_id=:uid ORDER BY id DESC LIMIT 20"
+            "SELECT id, symbol, rule, value, enabled FROM alerts WHERE user_id=:uid ORDER BY id ASC"
         ), {"uid": user.id}).all()
     if not rows:
         await update.message.reply_text("No alerts in DB.")
         return
-    for r in rows:
-        op = ">" if r.rule == "price_above" else "<"
-        txt = f"#{r.id}  {r.symbol} {op} {r.value}  {'ON' if r.enabled else 'OFF'}"
+    # εμφανίζουμε με #U… και (ID …)
+    for idx, r in enumerate(rows, start=1):
+        op = op_from_rule(r.rule)
+        txt = f"#U{idx} (ID {r.id})  {r.symbol} {op} {r.value}  {'ON' if r.enabled else 'OFF'}"
         await update.message.reply_text(txt, reply_markup=_alert_buttons(r.id))
 
 # ───────── Premium/Admin delete via command ─────────
@@ -298,7 +312,7 @@ async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             res = session.execute(text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"), {"id": aid, "uid": user.id})
         deleted = res.rowcount or 0
     if deleted:
-        await update.message.reply_text(f"Alert #{aid} deleted.")
+        await update.message.reply_text(f"Alert (ID {aid}) deleted.")
     else:
         await update.message.reply_text("Nothing deleted. Check the id (or ownership).")
 
@@ -490,7 +504,7 @@ async def cmd_admincheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [f"DB: {url_masked}", f"alerts_total={total}", "last_5:"]
         if rows:
             for r in rows:
-                op = ">" if r.rule == "price_above" else "<"
+                op = op_from_rule(r.rule)
                 lines.append(
                     f"  #{r.id} uid={r.user_id} tg={r.telegram_id or '-'} "
                     f"{r.symbol} {op} {r.value} {'ON' if r.enabled else 'OFF'} "
@@ -518,7 +532,7 @@ async def cmd_listalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No alerts in DB."); return
     lines = []
     for r in rows:
-        op = ">" if r.rule == "price_above" else "<"
+        op = op_from_rule(r.rule)
         lines.append(
             f"#{r.id} {r.symbol} {op} {r.value} "
             f"{'ON' if r.enabled else 'OFF'} last_fired={r.last_fired_at or '-'} last_met={r.last_met}"
@@ -552,7 +566,7 @@ async def cmd_resetalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not row:
             await update.message.reply_text(f"Alert {aid} not found"); return
         session.execute(text("UPDATE alerts SET last_fired_at = NULL, last_met = FALSE WHERE id=:id"), {"id": aid})
-    await update.message.reply_text(f"Alert #{aid} reset (last_fired_at=NULL, last_met=FALSE).")
+    await update.message.reply_text(f"Alert (ID {aid}) reset (last_fired_at=NULL, last_met=FALSE).")
 
 async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     not_admin = _require_admin(update)
@@ -577,7 +591,7 @@ async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not chat_id:
             await update.message.reply_text("No telegram_id for this user; cannot send."); return
         try:
-            textmsg = f"🔔 (force) Alert #{r.id} | {r.symbol} {r.rule} {r.value}"
+            textmsg = f"🔔 (force) Alert (ID {r.id}) | {r.symbol} {r.rule} {r.value}"
             code, body = send_message(chat_id, textmsg)
             if code == 200:
                 with session_scope() as s2:
@@ -600,8 +614,8 @@ async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """)).all()
     lines = [f"run_alert_cycle: {counters}", "last_5:"]
     for r in rows:
-        op = ">" if r.rule == "price_above" else "<"
-        lines.append(f"  #{r.id} {r.symbol} {op} {r.value} {'ON' if r.enabled else 'OFF'} last_fired={r.last_fired_at or '-'} last_met={r.last_met}")
+        op = op_from_rule(r.rule)
+        lines.append(f"  (ID {r.id}) {r.symbol} {op} {r.value} {'ON' if r.enabled else 'OFF'} last_fired={r.last_fired_at or '-'} last_met={r.last_met}")
     for chunk in safe_chunks("\n".join(lines)):
         await update.message.reply_text(chunk)
 
@@ -690,7 +704,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             deleted = res.rowcount or 0
 
         if deleted:
-            await query.edit_message_text(f"✅ Deleted alert #{aid}.")
+            await query.edit_message_text(f"✅ Deleted alert (ID {aid}).")
         else:
             await query.edit_message_text("Nothing deleted. Maybe it was already removed?")
 
