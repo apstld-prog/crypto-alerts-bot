@@ -337,14 +337,14 @@ async def cmd_requestcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     if not context.args:
-        await target_msg(update).reply_text("Στείλε: /support <μήνυμα σου προς τους διαχειριστές>")
+        await target_msg(update).reply_text("Send: /support <your message to the admins>")
         return
     msg = " ".join(context.args).strip()
     who = update.effective_user
     header = f"🆘 Support message\nFrom: {who.first_name or ''} (@{who.username}) id={tg_id}"
     full = f"{header}\n\n{msg}"
     send_admins(full)
-    await target_msg(update).reply_text("✅ Το μήνυμα στάλθηκε στην ομάδα υποστήριξης. Θα σε απαντήσουμε σύντομα εδώ.")
+    await target_msg(update).reply_text("✅ Your message has been sent to the support team. You will get a reply here soon.")
 
 async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
@@ -648,7 +648,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "go:support":
-        await query.message.reply_text("Στείλε μήνυμα στην υποστήριξη:\n/support <το μήνυμά σου>",
+        await query.message.reply_text("Send a message to support:\n/support <your message>",
                                        reply_markup=upgrade_keyboard(tg_id))
         return
 
