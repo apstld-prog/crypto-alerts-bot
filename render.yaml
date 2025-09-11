@@ -1,63 +1,127 @@
+# render.yaml — unified Blueprint for Web + Bot + Worker
+# - Uses 1 Gunicorn worker on Web to minimize DB connections
+# - Keeps alerts evaluation only in the dedicated Worker (not in the Bot)
+# - All sensitive env vars are marked sync:false so you set them in the dashboard
+
 services:
-  - type: web
-    name: crypto-alerts-web
-    env: python
+  # ────────────────────────────────────────────────────────────────────────────
+  # WEB API (FastAPI: PayPal webhooks, healthz, admin endpoints)
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: crypto-alerts-web
+    type: web
     plan: starter
-    buildCommand: "pip install -r requirements.txt"
+    runtime: python
+    buildCommand: pip install -r requirements.txt
     startCommand: >
       gunicorn server_combined:app
       -k uvicorn.workers.UvicornWorker
+      --workers 1
       --bind 0.0.0.0:$PORT
-      --workers 2
       --timeout 60
       --graceful-timeout 30
       --keep-alive 5
+    autoDeploy: true
+    healthCheckPath: /healthz
+    # NOTE: Omit region to avoid “changing region not supported” errors on updates
     envVars:
+      # Core
       - key: DATABASE_URL
-        sync: false
-      - key: BOT_TOKEN
         sync: false
       - key: WEB_URL
         sync: false
       - key: ADMIN_KEY
         sync: false
+      # Telegram (used for admin notifications from server)
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_TELEGRAM_IDS
+        sync: false
+      # PayPal
+      - key: PAYPAL_MODE         # "live" or "sandbox"
+        sync: false
       - key: PAYPAL_CLIENT_ID
         sync: false
-      - key: PAYPAL_CLIENT_SECRET
+      - key: PAYPAL_SECRET
         sync: false
-      - key: PAYPAL_SUBSCRIBE_URL
+      - key: PAYPAL_WEBHOOK_ID
         sync: false
-      - key: FREE_ALERT_LIMIT
-        value: "3"
-      - key: WORKER_INTERVAL_SECONDS
-        value: "60"
+      - key: PAYPAL_PLAN_ID
+        sync: false
+      # Optional tuning for DB driver/pool (safe defaults)
+      - key: DB_POOL_SIZE
+        value: "2"
+      - key: DB_MAX_OVERFLOW
+        value: "0"
+      - key: DB_POOL_RECYCLE
+        value: "180"
+      - key: DB_POOL_TIMEOUT
+        value: "30"
 
-  - type: worker
-    name: crypto-alerts-daemon
-    env: python
+  # ────────────────────────────────────────────────────────────────────────────
+  # TELEGRAM BOT (polling only; alerts loop disabled here)
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: crypto-alerts-bot
+    type: worker
     plan: starter
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python daemon.py"
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python daemon.py
+    autoDeploy: true
     envVars:
+      # Core
       - key: DATABASE_URL
-        sync: false
-      - key: BOT_TOKEN
         sync: false
       - key: WEB_URL
         sync: false
-      - key: ADMIN_KEY
+      # Telegram
+      - key: BOT_TOKEN
         sync: false
-      - key: PAYPAL_CLIENT_ID
+      - key: ADMIN_TELEGRAM_IDS
         sync: false
-      - key: PAYPAL_CLIENT_SECRET
-        sync: false
-      - key: PAYPAL_SUBSCRIBE_URL
-        sync: false
-      - key: FREE_ALERT_LIMIT
-        value: "3"
-      - key: WORKER_INTERVAL_SECONDS
-        value: "60"
+      # Bot toggles
       - key: RUN_BOT
         value: "1"
-      - key: RUN_ALERTS
-        value: "1"
+      - key: RUN_ALERTS            # disable alerts loop inside the bot
+        value: "0"
+      # Optional: limit free alerts, UI settings
+      - key: FREE_ALERT_LIMIT
+        value: "3"
+      # Optional DB pool tuning
+      - key: DB_POOL_SIZE
+        value: "2"
+      - key: DB_MAX_OVERFLOW
+        value: "0"
+      - key: DB_POOL_RECYCLE
+        value: "180"
+      - key: DB_POOL_TIMEOUT
+        value: "30"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # ALERTS WORKER (runs the evaluation loop every N seconds)
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: crypto-alerts-worker
+    type: worker
+    plan: starter
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python worker.py
+    autoDeploy: true
+    envVars:
+      # Core
+      - key: DATABASE_URL
+        sync: false
+      # Loop interval (choose 60s for near-real-time, or 180/300s for lower cost)
+      - key: WORKER_INTERVAL_SECONDS
+        value: "60"
+      # Advisory lock id so only one worker runs the loop
+      - key: ALERTS_LOCK_ID
+        value: "911002"
+      # Optional DB pool tuning
+      - key: DB_POOL_SIZE
+        value: "2"
+      - key: DB_MAX_OVERFLOW
+        value: "0"
+      - key: DB_POOL_RECYCLE
+        value: "180"
+      - key: DB_POOL_TIMEOUT
+        value: "30"
