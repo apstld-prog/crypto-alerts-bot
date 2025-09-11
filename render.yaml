@@ -1,12 +1,7 @@
-# render.yaml — unified Blueprint for Web + Bot + Worker
-# - Uses 1 Gunicorn worker on Web to minimize DB connections
-# - Keeps alerts evaluation only in the dedicated Worker (not in the Bot)
-# - All sensitive env vars are marked sync:false so you set them in the dashboard
+# render.yaml — Blueprint for Crypto Alerts Bot
+# Region ΔΕΝ μπαίνει στο αρχείο. Το ορίζεις στο UI (διάλεξε Frankfurt για όλα).
 
 services:
-  # ────────────────────────────────────────────────────────────────────────────
-  # WEB API (FastAPI: PayPal webhooks, healthz, admin endpoints)
-  # ────────────────────────────────────────────────────────────────────────────
   - name: crypto-alerts-web
     type: web
     plan: starter
@@ -22,22 +17,18 @@ services:
       --keep-alive 5
     autoDeploy: true
     healthCheckPath: /healthz
-    # NOTE: Omit region to avoid “changing region not supported” errors on updates
     envVars:
-      # Core
       - key: DATABASE_URL
         sync: false
       - key: WEB_URL
         sync: false
       - key: ADMIN_KEY
         sync: false
-      # Telegram (used for admin notifications from server)
       - key: BOT_TOKEN
         sync: false
       - key: ADMIN_TELEGRAM_IDS
         sync: false
-      # PayPal
-      - key: PAYPAL_MODE         # "live" or "sandbox"
+      - key: PAYPAL_MODE
         sync: false
       - key: PAYPAL_CLIENT_ID
         sync: false
@@ -47,7 +38,6 @@ services:
         sync: false
       - key: PAYPAL_PLAN_ID
         sync: false
-      # Optional tuning for DB driver/pool (safe defaults)
       - key: DB_POOL_SIZE
         value: "2"
       - key: DB_MAX_OVERFLOW
@@ -57,9 +47,6 @@ services:
       - key: DB_POOL_TIMEOUT
         value: "30"
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # TELEGRAM BOT (polling only; alerts loop disabled here)
-  # ────────────────────────────────────────────────────────────────────────────
   - name: crypto-alerts-bot
     type: worker
     plan: starter
@@ -68,25 +55,20 @@ services:
     startCommand: python daemon.py
     autoDeploy: true
     envVars:
-      # Core
       - key: DATABASE_URL
         sync: false
       - key: WEB_URL
         sync: false
-      # Telegram
       - key: BOT_TOKEN
         sync: false
       - key: ADMIN_TELEGRAM_IDS
         sync: false
-      # Bot toggles
       - key: RUN_BOT
         value: "1"
-      - key: RUN_ALERTS            # disable alerts loop inside the bot
+      - key: RUN_ALERTS
         value: "0"
-      # Optional: limit free alerts, UI settings
       - key: FREE_ALERT_LIMIT
         value: "3"
-      # Optional DB pool tuning
       - key: DB_POOL_SIZE
         value: "2"
       - key: DB_MAX_OVERFLOW
@@ -96,9 +78,6 @@ services:
       - key: DB_POOL_TIMEOUT
         value: "30"
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # ALERTS WORKER (runs the evaluation loop every N seconds)
-  # ────────────────────────────────────────────────────────────────────────────
   - name: crypto-alerts-worker
     type: worker
     plan: starter
@@ -107,16 +86,12 @@ services:
     startCommand: python worker.py
     autoDeploy: true
     envVars:
-      # Core
       - key: DATABASE_URL
         sync: false
-      # Loop interval (choose 60s for near-real-time, or 180/300s for lower cost)
       - key: WORKER_INTERVAL_SECONDS
         value: "60"
-      # Advisory lock id so only one worker runs the loop
       - key: ALERTS_LOCK_ID
         value: "911002"
-      # Optional DB pool tuning
       - key: DB_POOL_SIZE
         value: "2"
       - key: DB_MAX_OVERFLOW
