@@ -1,6 +1,5 @@
 # worker_logic.py
 import os
-import time
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
@@ -16,40 +15,36 @@ log = logging.getLogger("worker_logic")
 BINANCE_URL = "https://api.binance.com/api/v3/ticker/price"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# --- NEW: simple symbol resolver ---
-# Δέχεται "BTC", "BTC/USDT", "BTCUSDT" κ.λπ. και επιστρέφει ζεύγος τύπου "BTCUSDT"
-# Αν λείπει quote, το προεπιλεγμένο είναι USDT.
+# ─────────────────────────────────────────────────────────────────────────────
+# Symbol resolve helpers
+# ─────────────────────────────────────────────────────────────────────────────
 DEFAULT_QUOTE = "USDT"
 KNOWN_QUOTES = {"USDT", "USDC", "FDUSD", "TUSD", "BUSD"}
 
 def resolve_symbol(sym: Optional[str]) -> Optional[str]:
+    """Normalize symbols to Binance format, e.g. 'BTC' -> 'BTCUSDT', 'BTC/USDT' -> 'BTCUSDT'."""
     if not sym:
         return None
     s = sym.strip().upper()
-    # Allow e.g. "BTC/USDT"
     if "/" in s:
-        parts = s.split("/", 1)
-        base = parts[0].strip()
-        quote = parts[1].strip() if len(parts) > 1 else DEFAULT_QUOTE
+        base, _, quote = s.partition("/")
+        base = base.strip()
+        quote = (quote.strip() or DEFAULT_QUOTE)
         return f"{base}{quote}"
-    # Already full pair?
     for q in KNOWN_QUOTES:
         if s.endswith(q) and len(s) > len(q):
             return s
-    # Bare base like "BTC" -> append default quote
     return f"{s}{DEFAULT_QUOTE}"
 
-# --- existing helpers ---
-
 def fetch_price(symbol: str) -> float:
-    """Παίρνει τιμή από Binance για σύμβολο τύπου BTCUSDT."""
+    """Fetch price from Binance for a pair like BTCUSDT."""
     r = requests.get(BINANCE_URL, params={"symbol": symbol.upper()}, timeout=8)
     r.raise_for_status()
     data = r.json()
     return float(data["price"])
 
-# NEW: alias that χρησιμοποιείται από daemon/server_combined
 def fetch_price_binance(symbol_pair: str) -> float:
+    """Alias used by daemon/server_combined."""
     return fetch_price(symbol_pair)
 
 def should_fire(alert: Alert, price: float) -> bool:
@@ -80,8 +75,8 @@ def send_telegram(chat_id: int, text: str) -> Dict[str, Any]:
     return j
 
 def run_alert_cycle(session: Session) -> Dict[str, int]:
-    """Εκτελεί έναν κύκλο αξιολόγησης όλων των ενεργών alerts."""
-    alerts = session.execute(
+    """Run one evaluation cycle across all active alerts."""
+    rows = session.execute(
         select(Alert, User).join(User, Alert.user_id == User.id).where(Alert.enabled == True)  # noqa: E712
     ).all()
 
@@ -89,8 +84,8 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
     triggered = 0
     errors = 0
 
-    # Ομαδοποίηση ανά σύμβολο (λιγότερα HTTP calls)
-    symbols = {a.Alert.symbol for a in alerts}
+    # Fetch prices once per symbol (cache)
+    symbols = {r.Alert.symbol for r in rows}
     price_cache: Dict[str, Optional[float]] = {}
     for sym in symbols:
         try:
@@ -101,7 +96,7 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
 
     now = datetime.utcnow()
 
-    for row in alerts:
+    for row in rows:
         alert: Alert = row.Alert
         user: User = row.User
         evaluated += 1
@@ -110,17 +105,16 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
         if price is None:
             continue
 
-        cond = should_fire(alert, price)
+        met_now = should_fire(alert, price)
 
-        # Cooldown
+        # Cooldown logic
         if alert.last_fired_at:
             next_ok = alert.last_fired_at + timedelta(seconds=alert.cooldown_seconds)
             in_cooldown = now < next_ok
         else:
             in_cooldown = False
 
-        # Anti-spam: στείλε μόνο όταν περνάει το όριο από "όχι-μελετήθηκε" -> "μελετήθηκε"
-        met_now = bool(cond)
+        # Anti-spam: fire on crossing (False -> True) and not in cooldown
         should_send = (met_now and (not alert.last_met) and (not in_cooldown))
 
         if should_send:
@@ -139,8 +133,7 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
                 log.exception("alert_send_error id=%s err=%s", alert.id, e)
                 errors += 1
 
-        # Ενημέρωσε last_met για τον επόμενο κύκλο
-        alert.last_met = met_now
+        alert.last_met = bool(met_now)
 
     session.flush()
     return {"evaluated": evaluated, "triggered": triggered, "errors": errors}
