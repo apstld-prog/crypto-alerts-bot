@@ -1,136 +1,120 @@
 # worker_logic.py
 import os
+import time
+import logging
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Any
 
 import requests
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from db import Alert, User, Subscription
+from db import Alert, User
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # optional fallback
+log = logging.getLogger("worker_logic")
 
-SYMBOL_MAP = {
-    "BTC":"BTCUSDT","ETH":"ETHUSDT","BNB":"BNBUSDT","XRP":"XRPUSDT","ADA":"ADAUSDT","SOL":"SOLUSDT","DOGE":"DOGEUSDT",
-    "TRX":"TRXUSDT","DOT":"DOTUSDT","MATIC":"MATICUSDT","LTC":"LTCUSDT","BCH":"BCHUSDT","LINK":"LINKUSDT","XLM":"XLMUSDT",
-    "ATOM":"ATOMUSDT","AVAX":"AVAXUSDT","ETC":"ETCUSDT","XMR":"XMRUSDT","XTZ":"XTZUSDT","AAVE":"AAVEUSDT",
-    "ALGO":"ALGOUSDT","NEAR":"NEARUSDT","FIL":"FILUSDT","VET":"VETUSDT","ICP":"ICPUSDT","SAND":"SANDUSDT",
-    "MANA":"MANAUSDT","AXS":"AXSUSDT","EGLD":"EGLDUSDT","THETA":"THETAUSDT","HBAR":"HBARUSDT","KLAY":"KLAYUSDT",
-    "FLOW":"FLOWUSDT","CHZ":"CHZUSDT","EOS":"EOSUSDT","ENJ":"ENJUSDT","ZEC":"ZECUSDT","DASH":"DASHUSDT",
-    "COMP":"COMPUSDT","SNX":"SNXUSDT","CRV":"CRVUSDT","SUSHI":"SUSHIUSDT","UNI":"UNIUSDT","MKR":"MKRUSDT",
-    "RUNE":"RUNEUSDT","CAKE":"CAKEUSDT","FTM":"FTMUSDT","GRT":"GRTUSDT","ONE":"ONEUSDT","QTUM":"QTUMUSDT",
-    "OP":"OPUSDT","ARB":"ARBUSDT","SHIB":"SHIBUSDT","PEPE":"PEPEUSDT","BONK":"BONKUSDT","TIA":"TIAUSDT",
-    "SEI":"SEIUSDT","WIF":"WIFUSDT","JUP":"JUPUSDT","PYTH":"PYTHUSDT","SUI":"SUIUSDT","APT":"APTUSDT","INJ":"INJUSDT",
-    "RNDR":"RNDRUSDT","ROSE":"ROSEUSDT","AKT":"AKTUSDT","KAS":"KASUSDT","JASMY":"JASMYUSDT","IMX":"IMXUSDT"
-}
+BINANCE_URL = "https://api.binance.com/api/v3/ticker/price"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-def resolve_symbol(sym: str) -> Optional[str]:
-    s = (sym or "").upper().replace("/", "").strip()
-    if s.endswith("USDT"):
-        return s
-    return SYMBOL_MAP.get(s)
+def fetch_price(symbol: str) -> float:
+    """Παίρνει τιμή από Binance για σύμβολο τύπου BTCUSDT."""
+    r = requests.get(BINANCE_URL, params={"symbol": symbol.upper()}, timeout=8)
+    r.raise_for_status()
+    data = r.json()
+    return float(data["price"])
 
-def fetch_price_binance(symbol: str, timeout: int = 8) -> Optional[float]:
+def should_fire(alert: Alert, price: float) -> bool:
+    if alert.rule == "price_above":
+        return price > alert.value
+    if alert.rule == "price_below":
+        return price < alert.value
+    return False
+
+def send_telegram(chat_id: int, text: str) -> Dict[str, Any]:
+    if not BOT_TOKEN:
+        log.warning("BOT_TOKEN not set; skipping telegram send")
+        return {"ok": False, "reason": "no_token"}
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    r = requests.post(url, json=payload, timeout=10)
     try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/price",
-                         params={"symbol": symbol}, timeout=timeout)
-        r.raise_for_status()
-        return float(r.json()["price"])
+        j = r.json()
     except Exception:
-        return None
-
-def should_trigger(rule: str, threshold: float, price: float) -> bool:
-    return (price > threshold) if rule == "price_above" else (price < threshold)
-
-def can_fire(last_fired_at: Optional[datetime], cooldown_seconds: int) -> bool:
-    return (last_fired_at is None) or (datetime.utcnow() >= last_fired_at + timedelta(seconds=cooldown_seconds))
-
-def _telegram_send(text: str, chat_id: str, timeout: int = 10) -> Tuple[bool, int, str]:
-    if not BOT_TOKEN or not chat_id:
-        return (False, 0, "missing token or chat_id")
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          json={"chat_id": chat_id, "text": text}, timeout=timeout)
-        return (r.status_code == 200, r.status_code, r.text[:500])
-    except Exception as e:
-        return (False, 0, f"exception: {e}")
-
-def downgrade_expired_premiums(session: Session) -> int:
-    # (ίδιο όπως πριν)
-    now = datetime.utcnow()
-    changed = 0
-    users: List[User] = session.execute(select(User)).scalars().all()
-    for u in users:
-        sub = session.execute(
-            select(Subscription).where(Subscription.user_id == u.id).order_by(Subscription.id.desc())
-        ).scalar_one_or_none()
-        if not sub:
-            continue
-        if sub.status_internal in ("ACTIVE", "CANCEL_AT_PERIOD_END") and sub.current_period_end and sub.current_period_end < now:
-            if u.is_premium:
-                u.is_premium = False
-                session.add(u)
-            session.add(Subscription(
-                user_id=u.id, provider="paypal", provider_status="EXPIRED",
-                status_internal="CANCELLED", provider_ref=sub.provider_ref,
-                current_period_end=sub.current_period_end,
-            ))
-            changed += 1
-    return changed
+        j = {"ok": False, "status_code": r.status_code, "body": r.text[:500]}
+    if not j.get("ok"):
+        log.warning("telegram_send_fail chat=%s resp=%s", chat_id, j)
+    return j
 
 def run_alert_cycle(session: Session) -> Dict[str, int]:
-    """
-    Edge-triggered:
-    - met = should_trigger(...)
-    - fire ONLY if met==True AND last_met != True AND cooldown ok
-    - set last_met=True on success
-    - set last_met=False όταν δεν ισχύει η συνθήκη
-    """
-    counters = {"evaluated": 0, "triggered": 0, "errors": 0, "downgraded": 0}
-    counters["downgraded"] = downgrade_expired_premiums(session)
+    """Εκτελεί έναν κύκλο αξιολόγησης όλων των ενεργών alerts."""
+    # Φέρε όλα τα ενεργά alerts με user (για το telegram_id)
+    alerts = session.execute(
+        select(Alert, User).join(User, Alert.user_id == User.id).where(Alert.enabled == True)  # noqa: E712
+    ).all()
 
-    alerts = session.execute(select(Alert).where(Alert.enabled == True)).scalars().all()
+    evaluated = 0
+    triggered = 0
+    errors = 0
 
-    for alert in alerts:
-        counters["evaluated"] += 1
-        price = fetch_price_binance(alert.symbol)
+    # Ομαδοποίηση ανά σύμβολο για λιγότερα HTTP calls (cache 1 τιμή ανά symbol)
+    symbols = {a.Alert.symbol for a in alerts}
+    price_cache: Dict[str, float] = {}
+    for sym in symbols:
+        try:
+            price_cache[sym] = fetch_price(sym)
+        except Exception as e:
+            log.warning("price_fetch_fail symbol=%s err=%s", sym, e)
+            price_cache[sym] = None  # θα αγνοηθούν αυτά τα alerts
+
+    now = datetime.utcnow()
+
+    for row in alerts:
+        alert: Alert = row.Alert
+        user: User = row.User
+        evaluated += 1
+
+        price = price_cache.get(alert.symbol)
         if price is None:
-            counters["errors"] += 1
-            print({"msg": "price_fetch_failed", "alert_id": alert.id, "symbol": alert.symbol})
             continue
 
-        met = should_trigger(alert.rule, alert.value, price)
-        last_met = getattr(alert, "last_met", None)  # ✅ backward-safe
+        cond = should_fire(alert, price)
 
-        if not met:
-            if last_met is not False:
-                setattr(alert, "last_met", False)
-                session.add(alert)
-            continue
+        # Cooldown έλεγχος
+        if alert.last_fired_at:
+            next_ok = alert.last_fired_at + timedelta(seconds=alert.cooldown_seconds)
+            in_cooldown = now < next_ok
+        else:
+            in_cooldown = False
 
-        already_met = (last_met is True)
-        if not already_met and can_fire(alert.last_fired_at, alert.cooldown_seconds):
-            chat_id = None
+        # Λογική anti-spam:
+        # - Φωτογραφίζουμε αν η συνθήκη εκπληρώθηκε σε αυτόν τον κύκλο (met_now = True/False)
+        # - Αν met_now True & last_met False & όχι cooldown ⇒ fire
+        met_now = bool(cond)
+        should_send = (met_now and (not alert.last_met) and (not in_cooldown))
+
+        if should_send:
             try:
-                if alert.user and alert.user.telegram_id:
-                    chat_id = str(alert.user.telegram_id)
-            except Exception:
-                chat_id = None
-            if not chat_id:
-                chat_id = TELEGRAM_CHAT_ID
+                msg = (
+                    f"🔔 <b>Alert #{alert.id}</b>\n"
+                    f"Symbol: <b>{alert.symbol}</b>\n"
+                    f"Rule: <code>{'>' if alert.rule=='price_above' else '<'} {alert.value}</code>\n"
+                    f"Price: <b>{price}</b>\n"
+                    f"Time: <code>{now.isoformat(timespec='seconds')}Z</code>"
+                )
+                send_telegram(int(user.telegram_id), msg)
+                alert.last_fired_at = now
+                triggered += 1
+            except Exception as e:
+                log.exception("alert_send_error id=%s err=%s", alert.id, e)
+                errors += 1
 
-            txt = f"🔔 Alert #{alert.id} | {alert.symbol} {alert.rule} {alert.value} | price={price:.6f}"
-            ok, status, body = _telegram_send(txt, chat_id)
-            if ok:
-                alert.last_fired_at = datetime.utcnow()
-                setattr(alert, "last_met", True)
-                session.add(alert)
-                counters["triggered"] += 1
-                print({"msg": "alert_sent", "alert_id": alert.id, "chat_id": chat_id, "status": status})
-            else:
-                counters["errors"] += 1
-                print({"msg": "alert_send_failed", "alert_id": alert.id, "chat_id": chat_id, "status": status, "body": body})
+        # Ενημέρωσε last_met για τον επόμενο κύκλο
+        alert.last_met = met_now
 
-    return counters
+    session.flush()
+    return {"evaluated": evaluated, "triggered": triggered, "errors": errors}

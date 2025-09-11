@@ -4,44 +4,38 @@ from contextlib import contextmanager
 from datetime import datetime
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean, Float,
-    DateTime, Text, ForeignKey, func
+    DateTime, Text, ForeignKey
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
-from sqlalchemy.pool import NullPool
 
-# -------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # DATABASE URL
-# -------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 _DB_URL = os.getenv("DATABASE_URL", "").strip()
 if not _DB_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-# Normalize scheme: postgres:// → postgresql://
+# postgres:// → postgresql://
 if _DB_URL.startswith("postgres://"):
     _DB_URL = "postgresql://" + _DB_URL[len("postgres://"):]
 
-# Ensure sslmode=require if missing (Neon typically needs it)
+# ensure sslmode=require (Neon)
 if "sslmode=" not in _DB_URL and _DB_URL.startswith("postgresql://"):
-    if "?" in _DB_URL:
-        _DB_URL += "&sslmode=require"
-    else:
-        _DB_URL += "?sslmode=require"
+    _DB_URL += ("&" if "?" in _DB_URL else "?") + "sslmode=require"
 
-# -------------------------------------------------------------------
-# SQLAlchemy Engine options (lightweight, Neon-friendly)
-# -------------------------------------------------------------------
-# Small pool so the DB can autosuspend between cycles
+# ─────────────────────────────────────────────────────────────────────────────
+# SQLAlchemy Engine (μικρό pool για Neon + autosuspend)
+# ─────────────────────────────────────────────────────────────────────────────
 ENGINE_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "2"))
 ENGINE_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "0"))
-ENGINE_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "180"))  # seconds
-ENGINE_POOL_PRE_PING = True  # detect stale connections early
+ENGINE_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "180"))
 ENGINE_POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
 
 engine = create_engine(
     _DB_URL,
     pool_size=ENGINE_POOL_SIZE,
     max_overflow=ENGINE_MAX_OVERFLOW,
-    pool_pre_ping=ENGINE_POOL_PRE_PING,
+    pool_pre_ping=True,
     pool_recycle=ENGINE_POOL_RECYCLE,
     pool_timeout=ENGINE_POOL_TIMEOUT,
     future=True,
@@ -50,9 +44,9 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
 
-# -------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # MODELS
-# -------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 class User(Base):
     __tablename__ = "users"
@@ -69,13 +63,13 @@ class Alert(Base):
     __tablename__ = "alerts"
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
-    symbol = Column(String(32), index=True, nullable=False)       # e.g. BTCUSDT
-    rule = Column(String(32), nullable=False)                     # "price_above" | "price_below"
+    symbol = Column(String(32), index=True, nullable=False)   # e.g. BTCUSDT
+    rule = Column(String(16), nullable=False)                 # "price_above" | "price_below"
     value = Column(Float, nullable=False)
     enabled = Column(Boolean, nullable=False, default=True)
     cooldown_seconds = Column(Integer, nullable=False, default=900)
     last_fired_at = Column(DateTime, nullable=True)
-    last_met = Column(Boolean, nullable=False, default=False)     # κρατάμε το state για να μη σπαμάρει
+    last_met = Column(Boolean, nullable=False, default=False) # κρατάει προηγούμενη κατάσταση
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     user = relationship("User", back_populates="alerts")
@@ -85,27 +79,23 @@ class Subscription(Base):
     __tablename__ = "subscriptions"
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True)
-    provider = Column(String(32), nullable=False, default="paypal")       # "paypal"
-    provider_ref = Column(String(128), nullable=True)                     # PayPal subscription id
-    provider_status = Column(String(64), nullable=True)                   # RAW status from provider
-    status_internal = Column(String(64), nullable=False, default="UNKNOWN")  # ACTIVE / CANCELLED / CANCEL_AT_PERIOD_END / UNKNOWN
+    provider = Column(String(32), nullable=False, default="paypal")
+    provider_ref = Column(String(128), nullable=True)
+    provider_status = Column(String(64), nullable=True)
+    status_internal = Column(String(64), nullable=False, default="UNKNOWN")  # ACTIVE/CANCELLED/...
     current_period_end = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     extra = Column(Text, nullable=True)
 
     user = relationship("User", back_populates="subscriptions")
 
-# -------------------------------------------------------------------
-# INIT / SESSION
-# -------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 def init_db() -> None:
-    """Create tables if they don't exist."""
     Base.metadata.create_all(bind=engine)
 
 @contextmanager
 def session_scope():
-    """Provide a transactional scope."""
     session = SessionLocal()
     try:
         yield session
@@ -117,7 +107,6 @@ def session_scope():
         session.close()
 
 def masked_db_url() -> str:
-    """Return masked DB URL for logs (hide password)."""
     try:
         return engine.url.render_as_string(hide_password=True)
     except Exception:
