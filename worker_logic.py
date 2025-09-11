@@ -3,7 +3,7 @@ import os
 import time
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import requests
 from sqlalchemy import select
@@ -16,12 +16,41 @@ log = logging.getLogger("worker_logic")
 BINANCE_URL = "https://api.binance.com/api/v3/ticker/price"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
+# --- NEW: simple symbol resolver ---
+# Δέχεται "BTC", "BTC/USDT", "BTCUSDT" κ.λπ. και επιστρέφει ζεύγος τύπου "BTCUSDT"
+# Αν λείπει quote, το προεπιλεγμένο είναι USDT.
+DEFAULT_QUOTE = "USDT"
+KNOWN_QUOTES = {"USDT", "USDC", "FDUSD", "TUSD", "BUSD"}
+
+def resolve_symbol(sym: Optional[str]) -> Optional[str]:
+    if not sym:
+        return None
+    s = sym.strip().upper()
+    # Allow e.g. "BTC/USDT"
+    if "/" in s:
+        parts = s.split("/", 1)
+        base = parts[0].strip()
+        quote = parts[1].strip() if len(parts) > 1 else DEFAULT_QUOTE
+        return f"{base}{quote}"
+    # Already full pair?
+    for q in KNOWN_QUOTES:
+        if s.endswith(q) and len(s) > len(q):
+            return s
+    # Bare base like "BTC" -> append default quote
+    return f"{s}{DEFAULT_QUOTE}"
+
+# --- existing helpers ---
+
 def fetch_price(symbol: str) -> float:
     """Παίρνει τιμή από Binance για σύμβολο τύπου BTCUSDT."""
     r = requests.get(BINANCE_URL, params={"symbol": symbol.upper()}, timeout=8)
     r.raise_for_status()
     data = r.json()
     return float(data["price"])
+
+# NEW: alias that χρησιμοποιείται από daemon/server_combined
+def fetch_price_binance(symbol_pair: str) -> float:
+    return fetch_price(symbol_pair)
 
 def should_fire(alert: Alert, price: float) -> bool:
     if alert.rule == "price_above":
@@ -52,7 +81,6 @@ def send_telegram(chat_id: int, text: str) -> Dict[str, Any]:
 
 def run_alert_cycle(session: Session) -> Dict[str, int]:
     """Εκτελεί έναν κύκλο αξιολόγησης όλων των ενεργών alerts."""
-    # Φέρε όλα τα ενεργά alerts με user (για το telegram_id)
     alerts = session.execute(
         select(Alert, User).join(User, Alert.user_id == User.id).where(Alert.enabled == True)  # noqa: E712
     ).all()
@@ -61,15 +89,15 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
     triggered = 0
     errors = 0
 
-    # Ομαδοποίηση ανά σύμβολο για λιγότερα HTTP calls (cache 1 τιμή ανά symbol)
+    # Ομαδοποίηση ανά σύμβολο (λιγότερα HTTP calls)
     symbols = {a.Alert.symbol for a in alerts}
-    price_cache: Dict[str, float] = {}
+    price_cache: Dict[str, Optional[float]] = {}
     for sym in symbols:
         try:
             price_cache[sym] = fetch_price(sym)
         except Exception as e:
             log.warning("price_fetch_fail symbol=%s err=%s", sym, e)
-            price_cache[sym] = None  # θα αγνοηθούν αυτά τα alerts
+            price_cache[sym] = None
 
     now = datetime.utcnow()
 
@@ -84,16 +112,14 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
 
         cond = should_fire(alert, price)
 
-        # Cooldown έλεγχος
+        # Cooldown
         if alert.last_fired_at:
             next_ok = alert.last_fired_at + timedelta(seconds=alert.cooldown_seconds)
             in_cooldown = now < next_ok
         else:
             in_cooldown = False
 
-        # Λογική anti-spam:
-        # - Φωτογραφίζουμε αν η συνθήκη εκπληρώθηκε σε αυτόν τον κύκλο (met_now = True/False)
-        # - Αν met_now True & last_met False & όχι cooldown ⇒ fire
+        # Anti-spam: στείλε μόνο όταν περνάει το όριο από "όχι-μελετήθηκε" -> "μελετήθηκε"
         met_now = bool(cond)
         should_send = (met_now and (not alert.last_met) and (not in_cooldown))
 
