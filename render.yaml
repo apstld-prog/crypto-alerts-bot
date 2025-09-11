@@ -1,105 +1,32 @@
-# render.yaml — Blueprint for Crypto Alerts (choose Frankfurt in the UI)
-
 services:
-  # ── WEB: FastAPI (PayPal webhooks, healthz, admin endpoints)
-  - name: crypto-alerts-web
-    type: web
+  - type: web
+    name: crypto-alerts-bot
+    env: python
     plan: starter
-    runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: >
-      gunicorn server_combined:app
-      -k uvicorn.workers.UvicornWorker
-      --workers 1
-      --bind 0.0.0.0:$PORT
-      --timeout 60
-      --graceful-timeout 30
-      --keep-alive 5
-    autoDeploy: true
-    healthCheckPath: /healthz
-    envVars:
-      - key: DATABASE_URL
-        sync: false
-      - key: WEB_URL
-        sync: false
-      - key: ADMIN_KEY
-        sync: false
-      - key: BOT_TOKEN
-        sync: false
-      - key: ADMIN_TELEGRAM_IDS
-        sync: false
-      - key: PAYPAL_MODE
-        sync: false
-      - key: PAYPAL_CLIENT_ID
-        sync: false
-      - key: PAYPAL_SECRET
-        sync: false
-      - key: PAYPAL_WEBHOOK_ID
-        sync: false
-      - key: PAYPAL_PLAN_ID
-        sync: false
-      # DB pool tuning (χαμηλή κατανάλωση Neon)
-      - key: DB_POOL_SIZE
-        value: "2"
-      - key: DB_MAX_OVERFLOW
-        value: "0"
-      - key: DB_POOL_RECYCLE
-        value: "180"
-      - key: DB_POOL_TIMEOUT
-        value: "30"
-
-  # ── BOT: Telegram polling μόνο (χωρίς alerts loop εδώ)
-  - name: crypto-alerts-bot
-    type: worker
-    plan: starter
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python daemon.py
+    startCommand: bash -lc "uvicorn web_health:app --host 0.0.0.0 --port $PORT & python daemon.py"
     autoDeploy: true
     envVars:
-      - key: DATABASE_URL
-        sync: false
-      - key: WEB_URL
-        sync: false
-      - key: BOT_TOKEN
-        sync: false
-      - key: ADMIN_TELEGRAM_IDS
-        sync: false
+      - key: WEB_CONCURRENCY
+        value: "1"
       - key: RUN_BOT
         value: "1"
       - key: RUN_ALERTS
         value: "0"
-      - key: FREE_ALERT_LIMIT
-        value: "3"
-      - key: DB_POOL_SIZE
-        value: "2"
-      - key: DB_MAX_OVERFLOW
-        value: "0"
-      - key: DB_POOL_RECYCLE
-        value: "180"
-      - key: DB_POOL_TIMEOUT
-        value: "30"
+      # The following should be set in dashboard or from .env (do not commit secrets):
+      # BOT_TOKEN, DATABASE_URL, ADMIN_TELEGRAM_IDS, etc.
 
-  # ── WORKER: alerts evaluation loop
-  - name: crypto-alerts-worker
-    type: worker
+  - type: worker
+    name: crypto-alerts-worker
+    env: python
     plan: starter
-    runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python worker.py
     autoDeploy: true
     envVars:
-      - key: DATABASE_URL
-        sync: false
-      - key: WORKER_INTERVAL_SECONDS
-        value: "60"         # 60s για nearly real-time (ή 180/300 για χαμηλότερο κόστος)
-      - key: ALERTS_LOCK_ID
-        value: "911002"     # advisory lock για να μην τρέχουν πολλοί workers
-      - key: DB_POOL_SIZE
-        value: "2"
-      - key: DB_MAX_OVERFLOW
+      - key: RUN_BOT
         value: "0"
-      - key: DB_POOL_RECYCLE
-        value: "180"
-      - key: DB_POOL_TIMEOUT
-        value: "30"
+      - key: RUN_ALERTS
+        value: "1"
+      - key: WORKER_INTERVAL_SECONDS
+        value: "60"
