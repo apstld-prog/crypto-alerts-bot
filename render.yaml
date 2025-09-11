@@ -1,7 +1,7 @@
-# render.yaml — Blueprint for Crypto Alerts Bot
-# Region ΔΕΝ μπαίνει στο αρχείο. Το ορίζεις στο UI (διάλεξε Frankfurt για όλα).
+# render.yaml — Blueprint for Crypto Alerts (choose Frankfurt in the UI)
 
 services:
+  # ── WEB: FastAPI (PayPal webhooks, healthz, admin endpoints)
   - name: crypto-alerts-web
     type: web
     plan: starter
@@ -38,6 +38,7 @@ services:
         sync: false
       - key: PAYPAL_PLAN_ID
         sync: false
+      # DB pool tuning (χαμηλή κατανάλωση Neon)
       - key: DB_POOL_SIZE
         value: "2"
       - key: DB_MAX_OVERFLOW
@@ -47,6 +48,7 @@ services:
       - key: DB_POOL_TIMEOUT
         value: "30"
 
+  # ── BOT: Telegram polling μόνο (χωρίς alerts loop εδώ)
   - name: crypto-alerts-bot
     type: worker
     plan: starter
@@ -78,6 +80,7 @@ services:
       - key: DB_POOL_TIMEOUT
         value: "30"
 
+  # ── WORKER: alerts evaluation loop
   - name: crypto-alerts-worker
     type: worker
     plan: starter
@@ -89,9 +92,9 @@ services:
       - key: DATABASE_URL
         sync: false
       - key: WORKER_INTERVAL_SECONDS
-        value: "60"
+        value: "60"         # 60s για nearly real-time (ή 180/300 για χαμηλότερο κόστος)
       - key: ALERTS_LOCK_ID
-        value: "911002"
+        value: "911002"     # advisory lock για να μην τρέχουν πολλοί workers
       - key: DB_POOL_SIZE
         value: "2"
       - key: DB_MAX_OVERFLOW
