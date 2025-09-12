@@ -1,14 +1,14 @@
 # server_combined.py
-# Single-process runner for:
+# Single-process runner:
 # 1) Telegram Bot (polling)
 # 2) Alerts loop (background)
-# 3) FastAPI health server (binds $PORT for Render web service)
+# 3) FastAPI health endpoints: / (Render), /health, /botok (bot heartbeat)
 
 import os
 import time
 import threading
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 from fastapi import FastAPI
@@ -26,23 +26,19 @@ from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
 
 # ───────── ENV ─────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEB_URL = os.getenv("WEB_URL")  # e.g. https://your-service.onrender.com
+WEB_URL = os.getenv("WEB_URL")
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
 FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "3"))
 
-# Optional PayPal
-PAYPAL_PLAN_ID = os.getenv("PAYPAL_PLAN_ID")            # e.g. P-XXXXXXXXXXXX
-PAYPAL_SUBSCRIBE_URL = os.getenv("PAYPAL_SUBSCRIBE_URL")  # fallback plain link
+PAYPAL_PLAN_ID = os.getenv("PAYPAL_PLAN_ID")
+PAYPAL_SUBSCRIBE_URL = os.getenv("PAYPAL_SUBSCRIBE_URL")
 
-# Feature flags
 RUN_BOT = os.getenv("RUN_BOT", "1") == "1"
 RUN_ALERTS = os.getenv("RUN_ALERTS", "1") == "1"
 
-# Admin IDs
 _ADMIN_IDS = {s.strip() for s in (os.getenv("ADMIN_TELEGRAM_IDS") or "").split(",") if s.strip()}
 
-# Advisory locks (Postgres) — avoid multiple instances doing the same work
 BOT_LOCK_ID = int(os.getenv("BOT_LOCK_ID", "911001"))
 ALERTS_LOCK_ID = int(os.getenv("ALERTS_LOCK_ID", "911002"))
 
@@ -64,6 +60,12 @@ def try_advisory_lock(lock_id: int) -> bool:
 # ───────── Health server (FastAPI) ─────────
 health_app = FastAPI()
 
+# Shared state for bot heartbeat
+_BOT_HEART_BEAT_AT: datetime | None = None
+_BOT_HEART_STATUS: str = "unknown"  # "ok" / "fail" / "unknown"
+_BOT_HEART_INTERVAL = int(os.getenv("BOT_HEART_INTERVAL_SECONDS", "60"))
+_BOT_HEART_TTL = int(os.getenv("BOT_HEART_TTL_SECONDS", "180"))  # grace window for OK
+
 @health_app.get("/")
 def root():
     return {"ok": True, "service": "crypto-alerts-server"}
@@ -72,8 +74,23 @@ def root():
 def health():
     return {"status": "ok"}
 
+@health_app.get("/botok")
+def botok():
+    """Returns cached bot heartbeat; no external calls here."""
+    global _BOT_HEART_BEAT_AT, _BOT_HEART_STATUS
+    now = datetime.utcnow()
+    stale = (
+        (_BOT_HEART_BEAT_AT is None)
+        or ((now - _BOT_HEART_BEAT_AT) > timedelta(seconds=_BOT_HEART_TTL))
+    )
+    return {
+        "bot": ("stale" if stale else _BOT_HEART_STATUS),
+        "last": (_BOT_HEART_BEAT_AT.isoformat() + "Z") if _BOT_HEART_BEAT_AT else None,
+        "ttl_seconds": _BOT_HEART_TTL,
+        "interval_seconds": _BOT_HEART_INTERVAL,
+    }
+
 def start_health_server():
-    """Run uvicorn in a background thread to bind $PORT for Render."""
     port = int(os.getenv("PORT", "10000"))
     def _run():
         uvicorn.run(health_app, host="0.0.0.0", port=port, log_level="info")
@@ -81,16 +98,33 @@ def start_health_server():
     t.start()
     print({"msg": "health_server_started", "port": port})
 
+def bot_heartbeat_loop():
+    """Background: periodically ping Telegram getMe to verify bot reachability."""
+    global _BOT_HEART_BEAT_AT, _BOT_HEART_STATUS
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
+    print({"msg": "bot_heartbeat_started", "interval": _BOT_HEART_INTERVAL})
+    while True:
+        try:
+            r = requests.get(url, timeout=10)
+            ok = r.status_code == 200 and r.json().get("ok") is True
+            _BOT_HEART_STATUS = "ok" if ok else "fail"
+            _BOT_HEART_BEAT_AT = datetime.utcnow()
+            if not ok:
+                print({"msg": "bot_heartbeat_fail", "status": r.status_code, "body": r.text[:200]})
+        except Exception as e:
+            _BOT_HEART_STATUS = "fail"
+            _BOT_HEART_BEAT_AT = datetime.utcnow()
+            print({"msg": "bot_heartbeat_exception", "error": str(e)})
+        time.sleep(_BOT_HEART_INTERVAL)
+
 # ───────── Helpers ─────────
 def target_msg(update: Update):
-    """Return the right message target (works for commands & callbacks)."""
     return update.message or (update.callback_query.message if update.callback_query else None)
 
 def paypal_upgrade_url_for(tg_id: str | None) -> str | None:
-    """Return dynamic PayPal start URL (preferred) or fallback static plan link."""
     if WEB_URL and PAYPAL_PLAN_ID and tg_id:
         return f"{WEB_URL}/billing/paypal/start?tg={tg_id}&plan_id={PAYPAL_PLAN_ID}"
-    return PAYPAL_SUBSCRIBE_URL  # may be None
+    return PAYPAL_SUBSCRIBE_URL
 
 def send_admins(text_msg: str) -> None:
     if not _ADMIN_IDS:
@@ -120,14 +154,10 @@ def safe_chunks(s: str, limit: int = 3800):
 # ───────── UI ─────────
 def main_menu_keyboard(tg_id: str | None) -> InlineKeyboardMarkup:
     rows = [
-        [
-            InlineKeyboardButton("📊 Price BTC", callback_data="go:price:BTC"),
-            InlineKeyboardButton("🔔 My Alerts", callback_data="go:myalerts"),
-        ],
-        [
-            InlineKeyboardButton("⏱️ Set Alert Help", callback_data="go:setalerthelp"),
-            InlineKeyboardButton("ℹ️ Help", callback_data="go:help"),
-        ],
+        [InlineKeyboardButton("📊 Price BTC", callback_data="go:price:BTC"),
+         InlineKeyboardButton("🔔 My Alerts", callback_data="go:myalerts")],
+        [InlineKeyboardButton("⏱️ Set Alert Help", callback_data="go:setalerthelp"),
+         InlineKeyboardButton("ℹ️ Help", callback_data="go:help")],
         [InlineKeyboardButton("🆘 Support", callback_data="go:support")]
     ]
     u = paypal_upgrade_url_for(tg_id)
@@ -192,7 +222,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user:
             user = User(telegram_id=tg_id, is_premium=False)
         if is_admin(tg_id) and not user.is_premium:
-            user.is_premium = True  # admins always premium
+            user.is_premium = True
         session.add(user); session.flush()
     lim = 9999 if is_admin(tg_id) else FREE_ALERT_LIMIT
     await target_msg(update).reply_text(
@@ -212,7 +242,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True
         )
 
-async def cmd_adminhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_adminhelp(update: Update, Context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     if not is_admin(tg_id):
         await target_msg(update).reply_text("Admins only."); return
@@ -315,7 +345,6 @@ async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         aid = int(context.args[0])
     except Exception:
         await target_msg(update).reply_text("Bad id"); return
-
     with session_scope() as session:
         user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         if not user:
@@ -360,35 +389,6 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     header = f"🆘 Support message\nFrom: {who.first_name or ''} (@{who.username}) id={tg_id}"
     send_admins(f"{header}\n\n{msg}")
     await target_msg(update).reply_text("✅ Το μήνυμα στάλθηκε στην υποστήριξη. Θα απαντήσουμε εδώ.")
-
-async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = str(update.effective_user.id)
-    if not is_admin(tg_id):
-        await target_msg(update).reply_text("Admins only."); return
-    if len(context.args) < 2:
-        await target_msg(update).reply_text("Usage: /reply <tg_id> <message>"); return
-    target = context.args[0]
-    text_msg = " ".join(context.args[1:]).strip()
-    code, body = send_message(target, f"💬 Support reply:\n{text_msg}")
-    await target_msg(update).reply_text(f"Reply sent → {target}\nstatus={code}\n{body[:160]}")
-
-async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not WEB_URL or not ADMIN_KEY:
-        await target_msg(update).reply_text("Cancel not available right now. Try again later."); return
-    tg_id = str(update.effective_user.id)
-    try:
-        r = requests.post(f"{WEB_URL}/billing/paypal/cancel", params={"telegram_id": tg_id, "key": ADMIN_KEY}, timeout=20)
-        if r.status_code == 200:
-            data = r.json()
-            until = data.get("keeps_access_until")
-            if until:
-                await target_msg(update).reply_text(f"Auto-renew cancelled. Premium active until: {until}")
-            else:
-                await target_msg(update).reply_text("Auto-renew cancelled. Premium remains active till end of period.")
-        else:
-            await target_msg(update).reply_text(f"Cancel failed: {r.text}")
-    except Exception as e:
-        await target_msg(update).reply_text(f"Cancel error: {e}")
 
 def _require_admin(update: Update) -> bool:
     tg_id = str(update.effective_user.id)
@@ -504,7 +504,7 @@ async def cmd_listalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = session.execute(text("""
             SELECT a.id, a.symbol, a.rule, a.value, a.enabled, a.last_fired_at, a.last_met
             FROM alerts a
-            ORDER BY a.id DESC
+            ORDER BY id DESC
             LIMIT 20
         """)).all()
     if not rows:
@@ -593,29 +593,18 @@ async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chunk in safe_chunks("\n".join(lines)):
         await target_msg(update).reply_text(chunk)
 
-async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     if not is_admin(tg_id):
         await target_msg(update).reply_text("Admins only."); return
-    if not context.args:
-        await target_msg(update).reply_text("Usage: /claim <subscription_id>"); return
-    sub_id = context.args[0]
-    if not WEB_URL or not ADMIN_KEY:
-        await target_msg(update).reply_text("Server not configured (WEB_URL/ADMIN_KEY)."); return
-    try:
-        url = f"{WEB_URL}/billing/paypal/claim"
-        params = {"subscription_id": sub_id, "tg": tg_id, "key": ADMIN_KEY}
-        r = requests.post(url, params=params, timeout=25)
-        if r.status_code == 200 and r.json().get("ok"):
-            cpe = r.json().get("current_period_end")
-            st = r.json().get("status")
-            await target_msg(update).reply_text(f"Claim OK: {sub_id}\nstatus={st}\nperiod_end={cpe}")
-        else:
-            await target_msg(update).reply_text(f"Claim failed: {r.status_code} {r.text[:200]}")
-    except Exception as e:
-        await target_msg(update).reply_text(f"Claim exception: {e}")
+    if len(context.args) < 2:
+        await target_msg(update).reply_text("Usage: /reply <tg_id> <message>"); return
+    target = context.args[0]
+    text_msg = " ".join(context.args[1:]).strip()
+    code, body = send_message(target, f"💬 Support reply:\n{text_msg}")
+    await target_msg(update).reply_text(f"Reply sent → {target}\nstatus={code}\n{body[:160]}")
 
-# ───────── Callback handler (menu + delete buttons) ─────────
+# ───────── Callback handler ─────────
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -638,13 +627,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"{pair}: {price:.6f} USDT")
         return
     if data == "go:setalerthelp":
-        await query.message.reply_text("Examples:\n• /setalert BTC > 110000\n• /setalert ETH < 2000\n\nOps: >, <  (number in USD).")
-        return
+        await query.message.reply_text("Examples:\n• /setalert BTC > 110000\n• /setalert ETH < 2000\n\nOps: >, <  (number in USD)."); return
     if data == "go:support":
-        await query.message.reply_text("Στείλε μήνυμα στην υποστήριξη:\n/support <το μήνυμά σου>", reply_markup=upgrade_keyboard(tg_id))
-        return
+        await query.message.reply_text("Στείλε μήνυμα στην υποστήριξη:\n/support <το μήνυμά σου>", reply_markup=upgrade_keyboard(tg_id)); return
 
-    # validate premium/admin for delete
     with session_scope() as session:
         user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         is_premium = bool(user and user.is_premium) or is_admin(tg_id)
@@ -666,10 +652,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.edit_message_text("You can delete only your own alerts."); return
             res = session.execute(text("DELETE FROM alerts WHERE id=:id"), {"id": aid})
             deleted = res.rowcount or 0
-        if deleted:
-            await query.edit_message_text(f"✅ Deleted alert #{aid}.")
-        else:
-            await query.edit_message_text("Nothing deleted. Maybe it was already removed?")
+        await query.edit_message_text(f"✅ Deleted alert #{aid}." if deleted else "Nothing deleted. Maybe it was already removed?")
 
 # ───────── Alerts loop (background) ─────────
 def alerts_loop():
@@ -699,18 +682,14 @@ def delete_webhook_if_any():
 
 # ───────── Main ─────────
 def main():
-    # Start health server (bind $PORT for Render)
     start_health_server()
-
-    # Start alerts loop in background
+    threading.Thread(target=bot_heartbeat_loop, daemon=True).start()
     threading.Thread(target=alerts_loop, daemon=True).start()
 
-    # Start bot (polling) in main thread if we have the lock
     if not RUN_BOT:
         print({"msg": "bot_disabled_env"}); return
     if not try_advisory_lock(BOT_LOCK_ID):
         print({"msg": "bot_lock_skipped"})
-        # Keep process alive so health endpoint continues to respond
         while True:
             time.sleep(3600)
 
@@ -718,7 +697,7 @@ def main():
     delete_webhook_if_any()
 
     app = Application.builder().token(BOT_TOKEN).build()
-    # Commands
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("adminhelp", cmd_adminhelp))
@@ -732,7 +711,6 @@ def main():
     app.add_handler(CommandHandler("support", cmd_support))
     app.add_handler(CommandHandler("reply", cmd_reply))
     app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
-    # Admin
     app.add_handler(CommandHandler("adminstats", cmd_adminstats))
     app.add_handler(CommandHandler("adminsubs", cmd_adminsubs))
     app.add_handler(CommandHandler("admincheck", cmd_admincheck))
@@ -741,17 +719,19 @@ def main():
     app.add_handler(CommandHandler("resetalert", cmd_resetalert))
     app.add_handler(CommandHandler("forcealert", cmd_forcealert))
     app.add_handler(CommandHandler("runalerts", cmd_runalerts))
-    app.add_handler(CommandHandler("claim", cmd_claim))
-    # Callback buttons
     app.add_handler(CallbackQueryHandler(on_callback))
 
     print({"msg": "bot_start"})
     while True:
         try:
-            app.run_polling(allowed_updates=None, drop_pending_updates=False)
+            app.run_polling(
+                allowed_updates=None,
+                drop_pending_updates=True,
+                poll_interval=0.5,
+                timeout=10
+            )
             break
         except Conflict as e:
-            # Another poller? backoff and retry (but better ensure WEB_CONCURRENCY=1)
             print({"msg": "bot_conflict_retry", "error": str(e)})
             time.sleep(30)
 
