@@ -35,14 +35,12 @@ def resolve_symbol(sym: Optional[str]) -> Optional[str]:
     return f"{s}{DEFAULT_QUOTE}"
 
 def fetch_price(symbol: str) -> float:
-    """Fetch price from Binance for a pair like BTCUSDT."""
     r = requests.get(BINANCE_URL, params={"symbol": symbol.upper()}, timeout=8)
     r.raise_for_status()
     data = r.json()
     return float(data["price"])
 
 def fetch_price_binance(symbol_pair: str) -> float:
-    """Alias used by daemon/server_combined."""
     return fetch_price(symbol_pair)
 
 def condition_met(alert: Alert, price: float) -> bool:
@@ -53,7 +51,6 @@ def condition_met(alert: Alert, price: float) -> bool:
     return False
 
 def send_telegram(chat_id: int, text: str, reply_markup: Optional[dict] = None) -> Dict[str, Any]:
-    """Send a Telegram message directly via Bot API, optional inline keyboard."""
     if not BOT_TOKEN:
         log.warning("BOT_TOKEN not set; skipping telegram send")
         return {"ok": False, "reason": "no_token"}
@@ -78,12 +75,8 @@ def send_telegram(chat_id: int, text: str, reply_markup: Optional[dict] = None) 
 def run_alert_cycle(session: Session) -> Dict[str, int]:
     """
     Evaluate all active alerts once.
-
-    Behavior:
-    - Fires whenever the condition is True AND the alert is not in cooldown.
-    - Does NOT require False→True crossing (so 'BTC > 11' will re-fire every cooldown).
-    - Updates last_met for diagnostics.
-    - Adds inline buttons: [✅ Keep] [🗑️ Delete] for each fired alert.
+    Fires whenever the condition is True and the alert is not in cooldown.
+    Adds inline buttons: [✅ Keep] [🗑️ Delete].
     """
     rows = session.execute(
         select(Alert, User).join(User, Alert.user_id == User.id).where(Alert.enabled == True)  # noqa: E712
@@ -116,27 +109,25 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
 
         met_now = condition_met(alert, price)
 
-        # Cooldown check
+        # cooldown
         if alert.last_fired_at:
             next_ok = alert.last_fired_at + timedelta(seconds=alert.cooldown_seconds)
             in_cooldown = now < next_ok
         else:
             in_cooldown = False
 
-        # Fire whenever True (no crossing), as long as we're not in cooldown
         should_send = (met_now and (not in_cooldown))
 
         if should_send:
             try:
                 op = ">" if alert.rule == "price_above" else "<"
                 msg = (
-                    f"🔔 <b>Alert #U{user.id} • A{alert.id}</b>\n"
+                    f"🔔 <b>Alert #{alert.id}</b>\n"
                     f"Symbol: <b>{alert.symbol}</b>\n"
                     f"Rule: <code>{op} {alert.value}</code>\n"
                     f"Price: <b>{price}</b>\n"
                     f"Time: <code>{now.isoformat(timespec='seconds')}Z</code>"
                 )
-                # Inline keyboard with Keep/Delete
                 reply_markup = {
                     "inline_keyboard": [[
                         {"text": "✅ Keep", "callback_data": f"ack:keep:{alert.id}"},
@@ -150,7 +141,6 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
                 log.exception("alert_send_error id=%s err=%s", alert.id, e)
                 errors += 1
 
-        # Keep diagnostic of current truth value
         alert.last_met = bool(met_now)
 
     session.flush()
