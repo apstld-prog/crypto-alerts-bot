@@ -74,7 +74,14 @@ def send_telegram(chat_id: int, text: str) -> Dict[str, Any]:
     return j
 
 def run_alert_cycle(session: Session) -> Dict[str, int]:
-    """Run one evaluation cycle across all active alerts."""
+    """
+    Evaluate all active alerts once.
+
+    BEHAVIOR:
+    - Fires whenever the condition is True AND the alert is not in cooldown.
+    - DOES NOT require False→True crossing (so 'BTC > 11' will re-fire every cooldown).
+    - Still updates last_met for diagnostics.
+    """
     rows = session.execute(
         select(Alert, User).join(User, Alert.user_id == User.id).where(Alert.enabled == True)  # noqa: E712
     ).all()
@@ -106,15 +113,15 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
 
         met_now = should_fire(alert, price)
 
-        # Cooldown logic
+        # Cooldown check
         if alert.last_fired_at:
             next_ok = alert.last_fired_at + timedelta(seconds=alert.cooldown_seconds)
             in_cooldown = now < next_ok
         else:
             in_cooldown = False
 
-        # Fire only when crossing condition True and not in cooldown
-        should_send = (met_now and (not alert.last_met) and (not in_cooldown))
+        # NEW: fire whenever True (no crossing), as long as we're not in cooldown
+        should_send = (met_now and (not in_cooldown))
 
         if should_send:
             try:
@@ -132,6 +139,7 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
                 log.exception("alert_send_error id=%s err=%s", alert.id, e)
                 errors += 1
 
+        # Keep diagnostic of current truth value (not used to gate firing)
         alert.last_met = bool(met_now)
 
     session.flush()
