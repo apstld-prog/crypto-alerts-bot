@@ -7,6 +7,6 @@ app = FastAPI()
 def root():
     return {"ok": True, "service": "crypto-alerts-bot"}
 
-@app.get("/health" )
+@app.get("/health")
 def health():
     return {"status": "ok"}
