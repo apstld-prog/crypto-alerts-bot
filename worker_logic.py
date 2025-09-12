@@ -45,25 +45,27 @@ def fetch_price_binance(symbol_pair: str) -> float:
     """Alias used by daemon/server_combined."""
     return fetch_price(symbol_pair)
 
-def should_fire(alert: Alert, price: float) -> bool:
+def condition_met(alert: Alert, price: float) -> bool:
     if alert.rule == "price_above":
         return price > alert.value
     if alert.rule == "price_below":
         return price < alert.value
     return False
 
-def send_telegram(chat_id: int, text: str) -> Dict[str, Any]:
-    """Send a Telegram message directly via Bot API."""
+def send_telegram(chat_id: int, text: str, reply_markup: Optional[dict] = None) -> Dict[str, Any]:
+    """Send a Telegram message directly via Bot API, optional inline keyboard."""
     if not BOT_TOKEN:
         log.warning("BOT_TOKEN not set; skipping telegram send")
         return {"ok": False, "reason": "no_token"}
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
+    payload: Dict[str, Any] = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     r = requests.post(url, json=payload, timeout=10)
     try:
         j = r.json()
@@ -77,10 +79,11 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
     """
     Evaluate all active alerts once.
 
-    BEHAVIOR:
+    Behavior:
     - Fires whenever the condition is True AND the alert is not in cooldown.
-    - DOES NOT require False→True crossing (so 'BTC > 11' will re-fire every cooldown).
-    - Still updates last_met for diagnostics.
+    - Does NOT require False→True crossing (so 'BTC > 11' will re-fire every cooldown).
+    - Updates last_met for diagnostics.
+    - Adds inline buttons: [✅ Keep] [🗑️ Delete] for each fired alert.
     """
     rows = session.execute(
         select(Alert, User).join(User, Alert.user_id == User.id).where(Alert.enabled == True)  # noqa: E712
@@ -111,7 +114,7 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
         if price is None:
             continue
 
-        met_now = should_fire(alert, price)
+        met_now = condition_met(alert, price)
 
         # Cooldown check
         if alert.last_fired_at:
@@ -120,26 +123,34 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
         else:
             in_cooldown = False
 
-        # NEW: fire whenever True (no crossing), as long as we're not in cooldown
+        # Fire whenever True (no crossing), as long as we're not in cooldown
         should_send = (met_now and (not in_cooldown))
 
         if should_send:
             try:
+                op = ">" if alert.rule == "price_above" else "<"
                 msg = (
-                    f"🔔 <b>Alert #{alert.id}</b>\n"
+                    f"🔔 <b>Alert #U{user.id}</b>\n"
                     f"Symbol: <b>{alert.symbol}</b>\n"
-                    f"Rule: <code>{'>' if alert.rule=='price_above' else '<'} {alert.value}</code>\n"
+                    f"Rule: <code>{op} {alert.value}</code>\n"
                     f"Price: <b>{price}</b>\n"
                     f"Time: <code>{now.isoformat(timespec='seconds')}Z</code>"
                 )
-                send_telegram(int(user.telegram_id), msg)
+                # Inline keyboard with Keep/Delete
+                reply_markup = {
+                    "inline_keyboard": [[
+                        {"text": "✅ Keep", "callback_data": f"ack:keep:{alert.id}"},
+                        {"text": "🗑️ Delete", "callback_data": f"ack:del:{alert.id}"},
+                    ]]
+                }
+                send_telegram(int(user.telegram_id), msg, reply_markup=reply_markup)
                 alert.last_fired_at = now
                 triggered += 1
             except Exception as e:
                 log.exception("alert_send_error id=%s err=%s", alert.id, e)
                 errors += 1
 
-        # Keep diagnostic of current truth value (not used to gate firing)
+        # Keep diagnostic of current truth value
         alert.last_met = bool(met_now)
 
     session.flush()

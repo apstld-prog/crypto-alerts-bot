@@ -704,6 +704,57 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Send a message to support:\n/support <your message>", reply_markup=upgrade_keyboard(tg_id))
         return
 
+    # NEW: Handle alert action buttons from worker notifications
+    if data.startswith("ack:"):
+        # ack:keep:<id>  or  ack:del:<id>
+        parts = data.split(":")
+        if len(parts) == 3:
+            action, _, sid = parts
+            try:
+                aid = int(sid)
+            except Exception:
+                await query.edit_message_text("Bad alert id.")
+                return
+            if action == "ack":
+                await query.edit_message_text("Bad action.")
+                return
+        else:
+            await query.edit_message_text("Bad format.")
+            return
+
+        action = parts[1]
+        try:
+            with session_scope() as session:
+                user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
+                if not user:
+                    await query.edit_message_text("User not found.")
+                    return
+                if action == "keep":
+                    # Just acknowledge; remove buttons
+                    await query.edit_message_reply_markup(reply_markup=None)
+                    await query.message.reply_text("✅ Kept. The alert will continue to run.")
+                    return
+                elif action == "del":
+                    # Delete only if it belongs to the user (admins can delete any)
+                    if is_admin(tg_id):
+                        res = session.execute(text("DELETE FROM alerts WHERE id=:id"), {"id": aid})
+                    else:
+                        res = session.execute(
+                            text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"),
+                            {"id": aid, "uid": user.id}
+                        )
+                    deleted = res.rowcount or 0
+                    await query.edit_message_reply_markup(reply_markup=None)
+                    await query.message.reply_text("🗑️ Deleted." if deleted else "Nothing deleted. Maybe it was already removed?")
+                    return
+                else:
+                    await query.edit_message_text("Unknown action.")
+                    return
+        except Exception as e:
+            await query.message.reply_text(f"Action error: {e}")
+            return
+
+    # Existing inline delete for /myalerts
     with session_scope() as session:
         user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         is_premium = bool(user and user.is_premium) or is_admin(tg_id)
