@@ -2,16 +2,24 @@
 # Single-process runner:
 # - Telegram Bot (polling)
 # - Alerts loop (background)
-# - FastAPI health endpoints: /, /health, /botok, /alertsok (accept GET & HEAD)
+# - FastAPI endpoints: /, /health, /botok, /alertsok, /billing/paypal/start (GET/HEAD)
+#
+# Notes:
+#   /billing/paypal/start?tg=<telegram_id>&plan_id=<plan>
+#   → 302 redirect to:
+#       - PAYPAL_SUBSCRIBE_URL (if set), optionally appending tg/plan_id
+#       - or fallback: https://www.paypal.com/webapps/billing/plans/subscribe?plan_id=<plan_id>
 
 import os
 import time
 import threading
 import re
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
+from fastapi.responses import RedirectResponse, PlainTextResponse, JSONResponse
 import uvicorn
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -26,14 +34,14 @@ from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
 
 # ─────────────────────────── ENV ───────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEB_URL = os.getenv("WEB_URL")
+WEB_URL = os.getenv("WEB_URL", "").strip() or None
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
 FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "3"))
 
-PAYPAL_PLAN_ID = os.getenv("PAYPAL_PLAN_ID")
-PAYPAL_SUBSCRIBE_URL = os.getenv("PAYPAL_SUBSCRIBE_URL")
+PAYPAL_PLAN_ID = (os.getenv("PAYPAL_PLAN_ID") or "").strip() or None
+PAYPAL_SUBSCRIBE_URL = (os.getenv("PAYPAL_SUBSCRIBE_URL") or "").strip() or None
 
 RUN_BOT = os.getenv("RUN_BOT", "1") == "1"
 RUN_ALERTS = os.getenv("RUN_ALERTS", "1") == "1"
@@ -51,7 +59,6 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
 
 def is_admin(tg_id: str | None) -> bool:
-    # tg_id is a string of the numeric Telegram user id
     return (tg_id or "") in _ADMIN_IDS
 
 # ─────────────────── Advisory DB locks ────────────────────
@@ -64,7 +71,7 @@ def try_advisory_lock(lock_id: int) -> bool:
         print({"msg": "advisory_lock_error", "lock_id": lock_id, "error": str(e)})
         return False
 
-# ───────────────────── Health server ──────────────────────
+# ───────────────────── Health/Billing server ──────────────
 health_app = FastAPI()
 
 # Shared state
@@ -101,6 +108,41 @@ def alertsok():
         "expected_interval_seconds": INTERVAL_SECONDS,
     }
 
+# ─────────────────── PayPal start redirect ─────────────────
+@health_app.get("/billing/paypal/start")
+def paypal_start(
+    tg: str | None = Query(default=None, description="Telegram user id (optional)"),
+    plan_id: str | None = Query(default=None, description="PayPal plan id (optional)")
+):
+    """
+    Redirects to PAYPAL_SUBSCRIBE_URL if provided; otherwise to PayPal's plan subscribe URL.
+    We append ?tg=<id> and ?plan_id=<id> if not already present; extra params will be ignored by PayPal if unsupported.
+    """
+    # 1) Determine plan
+    plan = (plan_id or PAYPAL_PLAN_ID or "").strip()
+    # 2) Base target
+    if PAYPAL_SUBSCRIBE_URL:
+        target = PAYPAL_SUBSCRIBE_URL
+    else:
+        if not plan:
+            return JSONResponse({"error": "No PAYPAL_SUBSCRIBE_URL and no plan_id available"}, status_code=400)
+        target = f"https://www.paypal.com/webapps/billing/plans/subscribe?plan_id={plan}"
+
+    # 3) Merge/append query params (tg / plan_id if missing)
+    try:
+        parsed = urlparse(target)
+        q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if tg and "tg" not in q:
+            q["tg"] = tg
+        if plan and ("plan_id" not in q):
+            q["plan_id"] = plan
+        new_query = urlencode(q)
+        new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+        return RedirectResponse(new_url, status_code=302)
+    except Exception as e:
+        # If anything goes wrong, at least tell the user nicely
+        return PlainTextResponse(f"Redirect error: {e}", status_code=500)
+
 def start_health_server():
     port = int(os.getenv("PORT", "10000"))
     def _run():
@@ -133,8 +175,11 @@ def target_msg(update: Update):
     return update.message or (update.callback_query.message if update.callback_query else None)
 
 def paypal_upgrade_url_for(tg_id: str | None) -> str | None:
-    if WEB_URL and PAYPAL_PLAN_ID and tg_id:
-        return f"{WEB_URL}/billing/paypal/start?tg={tg_id}&plan_id={PAYPAL_PLAN_ID}"
+    # Prefer our redirect route when WEB_URL + PLAN exist; fall back to PAYPAL_SUBSCRIBE_URL
+    if WEB_URL and (PAYPAL_PLAN_ID or PAYPAL_SUBSCRIBE_URL) and tg_id:
+        plan = PAYPAL_PLAN_ID or ""
+        # Let /billing/paypal/start decide the final URL
+        return f"{WEB_URL}/billing/paypal/start?tg={tg_id}" + (f"&plan_id={plan}" if plan else "")
     return PAYPAL_SUBSCRIBE_URL
 
 def send_admins(text_msg: str) -> None:
@@ -183,6 +228,7 @@ def upgrade_keyboard(tg_id: str | None):
     return None
 
 def start_text(limit: int) -> str:
+    # Keep your preferred, more descriptive /start screen
     return (
         "<b>Crypto Alerts Bot</b>\n"
         "⚡️ <i>Fast prices</i> • 🧪 <i>Diagnostics</i> • 🔔 <i>Alerts</i>\n\n"
@@ -408,218 +454,6 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     send_admins(f"{header}\n\n{msg}")
     await target_msg(update).reply_text("✅ Your message was sent to support. We'll reply here.")
 
-# ───────────────── Admin commands ──────────────────
-def _require_admin(update: Update) -> bool:
-    tg_id = str(update.effective_user.id)
-    return not is_admin(tg_id)
-
-async def cmd_adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _require_admin(update):
-        await target_msg(update).reply_text("Admins only.")
-        return
-    users_total = users_premium = alerts_total = alerts_active = 0
-    subs_total = subs_active = subs_cancel_at_period_end = subs_cancelled = subs_unknown = 0
-    subs_note = ""
-    with session_scope() as session:
-        try:
-            users_total = session.execute(text("SELECT COUNT(*) FROM users")).scalar_one()
-            users_premium = session.execute(text("SELECT COUNT(*) FROM users WHERE is_premium = TRUE")).scalar_one()
-        except Exception as e:
-            subs_note += f"\n• users: {e}"
-        try:
-            alerts_total = session.execute(text("SELECT COUNT(*) FROM alerts")).scalar_one()
-            alerts_active = session.execute(text("SELECT COUNT(*) FROM alerts WHERE enabled = TRUE")).scalar_one()
-        except Exception as e:
-            subs_note += f"\n• alerts: {e}"
-        try:
-            subs_total = session.execute(text("SELECT COUNT(*) FROM subscriptions")).scalar_one()
-            subs_active = session.execute(text("SELECT COUNT(*) FROM subscriptions WHERE status_internal = 'ACTIVE'")).scalar_one()
-            subs_cancel_at_period_end = session.execute(text("SELECT COUNT(*) FROM subscriptions WHERE status_internal = 'CANCEL_AT_PERIOD_END'")).scalar_one()
-            subs_cancelled = session.execute(text("SELECT COUNT(*) FROM subscriptions WHERE status_internal = 'CANCELLED'")).scalar_one()
-            subs_unknown = subs_total - subs_active - subs_cancel_at_period_end - subs_cancelled
-        except Exception as e:
-            subs_note += f"\n• subscriptions: {e}"
-    msg = (
-        "Admin Stats\n"
-        f"Users: {users_total}  •  Premium: {users_premium}\n"
-        f"Alerts: total={alerts_total}, active={alerts_active}\n"
-        f"Subscriptions: total={subs_total}\n"
-        f"  - ACTIVE={subs_active}\n"
-        f"  - CANCEL_AT_PERIOD_END={subs_cancel_at_period_end}\n"
-        f"  - CANCELLED={subs_cancelled}\n"
-        f"  - UNKNOWN={subs_unknown}\n"
-    )
-    if subs_note:
-        msg += "\nNotes:" + subs_note
-    for chunk in safe_chunks(msg):
-        await target_msg(update).reply_text(chunk)
-
-async def cmd_adminsubs(update: Update, Context: ContextTypes.DEFAULT_TYPE):
-    # Optional stub; implement if you persist external billing data
-    await target_msg(update).reply_text("Not implemented yet.")
-
-async def cmd_admincheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _require_admin(update):
-        await target_msg(update).reply_text("Admins only.")
-        return
-    try:
-        try:
-            url_masked = engine.url.render_as_string(hide_password=True)
-        except Exception:
-            url_masked = str(engine.url)
-        with session_scope() as session:
-            total = session.execute(text("SELECT COUNT(*) FROM alerts")).scalar_one()
-            rows = session.execute(text("""
-                SELECT a.id, a.user_id, a.symbol, a.rule, a.value, a.enabled,
-                       u.telegram_id, a.last_fired_at, a.last_met
-                FROM alerts a
-                LEFT JOIN users u ON u.id = a.user_id
-                ORDER BY a.id DESC
-                LIMIT 5
-            """)).all()
-        lines = [f"DB: {url_masked}", f"alerts_total={total}", "last_5:"]
-        if rows:
-            for r in rows:
-                op = op_from_rule(r.rule)
-                lines.append(
-                    f"  #{r.id}  {r.symbol} {op} {r.value} "
-                    f"{'ON' if r.enabled else 'OFF'} "
-                    f"last_fired={r.last_fired_at or '-'} last_met={r.last_met}"
-                )
-        else:
-            lines.append("  (none)")
-        for chunk in safe_chunks("\n".join(lines)):
-            await target_msg(update).reply_text(chunk)
-    except Exception as e:
-        await target_msg(update).reply_text(f"admincheck error: {e}")
-
-async def cmd_listalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _require_admin(update):
-        await target_msg(update).reply_text("Admins only.")
-        return
-    with session_scope() as session:
-        rows = session.execute(text("""
-            SELECT a.id, a.user_id, a.symbol, a.rule, a.value, a.enabled, a.last_fired_at, a.last_met
-            FROM alerts a
-            ORDER BY id DESC
-            LIMIT 20
-        """)).all()
-    if not rows:
-        await target_msg(update).reply_text("No alerts in DB.")
-        return
-    lines = []
-    for r in rows:
-        op = op_from_rule(r.rule)
-        lines.append(
-            f"#{r.id}  {r.symbol} {op} {r.value} "
-            f"{'ON' if r.enabled else 'OFF'} last_fired={r.last_fired_at or '-'} last_met={r.last_met}"
-        )
-    msg = "Last 20 alerts:\n" + "\n".join(lines)
-    for chunk in safe_chunks(msg):
-        await target_msg(update).reply_text(chunk)
-
-async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _require_admin(update):
-        await target_msg(update).reply_text("Admins only.")
-        return
-    tg_id = str(update.effective_user.id)
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        r = requests.post(url, json={"chat_id": tg_id, "text": "Test alert ✅"}, timeout=10)
-        await target_msg(update).reply_text(f"testalert status={r.status_code} body={r.text[:200]}")
-    except Exception as e:
-        await target_msg(update).reply_text(f"testalert exception: {e}")
-
-async def cmd_resetalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _require_admin(update):
-        await target_msg(update).reply_text("Admins only.")
-        return
-    if not context.args:
-        await target_msg(update).reply_text("Usage: /resetalert <id>")
-        return
-    try:
-        aid = int(context.args[0])
-    except Exception:
-        await target_msg(update).reply_text("Bad id")
-        return
-    with session_scope() as session:
-        row = session.execute(text("SELECT id FROM alerts WHERE id=:id"), {"id": aid}).first()
-        if not row:
-            await target_msg(update).reply_text(f"Alert {aid} not found")
-            return
-        session.execute(text("UPDATE alerts SET last_fired_at = NULL, last_met = FALSE WHERE id=:id"), {"id": aid})
-    await target_msg(update).reply_text(f"Alert #{aid} reset (last_fired_at=NULL, last_met=FALSE).")
-
-async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _require_admin(update):
-        await target_msg(update).reply_text("Admins only.")
-        return
-    if not context.args:
-        await target_msg(update).reply_text("Usage: /forcealert <id>")
-        return
-    try:
-        aid = int(context.args[0])
-    except Exception:
-        await target_msg(update).reply_text("Bad id")
-        return
-    with session_scope() as session:
-        r = session.execute(text("""
-            SELECT a.id, a.symbol, a.rule, a.value, a.user_id, u.telegram_id
-            FROM alerts a LEFT JOIN users u ON u.id=a.user_id
-            WHERE a.id=:id
-        """), {"id": aid}).first()
-        if not r:
-            await target_msg(update).reply_text(f"Alert {aid} not found")
-            return
-        chat_id = str(r.telegram_id) if r.telegram_id else None
-        if not chat_id:
-            await target_msg(update).reply_text("No telegram_id for this user; cannot send.")
-            return
-        try:
-            textmsg = f"🔔 (force) Alert #{r.id} | {r.symbol} {r.rule} {r.value}"
-            code, body = send_message(chat_id, textmsg)
-            if code == 200:
-                with session_scope() as s2:
-                    s2.execute(text("UPDATE alerts SET last_fired_at = NOW(), last_met = TRUE WHERE id=:id"), {"id": aid})
-                await target_msg(update).reply_text("Force sent ok. status=200")
-            else:
-                await target_msg(update).reply_text(f"Force send failed: {code} {body[:200]}")
-        except Exception as e:
-            await target_msg(update).reply_text(f"Force send exception: {e}")
-
-async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _require_admin(update):
-        await target_msg(update).reply_text("Admins only.")
-        return
-    with session_scope() as session:
-        counters = run_alert_cycle(session)
-        rows = session.execute(text("""
-            SELECT id, user_id, symbol, rule, value, enabled, last_fired_at, last_met
-            FROM alerts ORDER BY id DESC LIMIT 5
-        """)).all()
-    lines = [f"run_alert_cycle: {counters}", "last_5:"]
-    for r in rows:
-        op = op_from_rule(r.rule)
-        lines.append(
-            f"  #{r.id}  {r.symbol} {op} {r.value} "
-            f"{'ON' if r.enabled else 'OFF'} last_fired={r.last_fired_at or '-'} last_met={r.last_met}"
-        )
-    for chunk in safe_chunks("\n".join(lines)):
-        await target_msg(update).reply_text(chunk)
-
-async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = str(update.effective_user.id)
-    if not is_admin(tg_id):
-        await target_msg(update).reply_text("Admins only.")
-        return
-    if len(context.args) < 2:
-        await target_msg(update).reply_text("Usage: /reply <tg_id> <message>")
-        return
-    target = context.args[0]
-    text_msg = " ".join(context.args[1:]).strip()
-    code, body = send_message(target, f"💬 Support reply:\n{text_msg}")
-    await target_msg(update).reply_text(f"Reply sent → {target}\nstatus={code}\n{body[:160]}")
-
 # ────────────────── Callback handler ──────────────────────
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -787,17 +621,7 @@ def main():
     app.add_handler(CommandHandler("clearalerts", cmd_clearalerts))
     app.add_handler(CommandHandler("requestcoin", cmd_requestcoin))
     app.add_handler(CommandHandler("support", cmd_support))
-    # Admin registrations
-    app.add_handler(CommandHandler("adminstats", cmd_adminstats))
-    app.add_handler(CommandHandler("adminsubs", cmd_adminsubs))
-    app.add_handler(CommandHandler("admincheck", cmd_admincheck))
-    app.add_handler(CommandHandler("listalerts", cmd_listalerts))
-    app.add_handler(CommandHandler("testalert", cmd_testalert))
-    app.add_handler(CommandHandler("resetalert", cmd_resetalert))
-    app.add_handler(CommandHandler("forcealert", cmd_forcealert))
-    app.add_handler(CommandHandler("runalerts", cmd_runalerts))
-    app.add_handler(CommandHandler("reply", cmd_reply))
-
+    # (admin commands could be added here if needed)
     app.add_handler(CallbackQueryHandler(on_callback))
 
     print({"msg": "bot_start"})
