@@ -234,9 +234,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_admin(tg_id) and not user.is_premium:
             user.is_premium = True
         session.add(user); session.flush()
-    lim = 9999 if is_admin(tg_id) else FREE_ALERT_LIMIT
+        user_limit = 9999 if is_admin(tg_id) else FREE_ALERT_LIMIT
     await target_msg(update).reply_text(
-        start_text(lim),
+        start_text(user_limit),
         reply_markup=main_menu_keyboard(tg_id),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True
@@ -262,7 +262,6 @@ async def cmd_adminhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-    role = "admin" if is_admin(tg_id) else "user"
     with session_scope() as session:
         user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         if not user:
@@ -271,6 +270,7 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.is_premium = True
         session.add(user); session.flush()
         prem = bool(user.is_premium)
+        role = "admin" if is_admin(tg_id) else "user"
     await target_msg(update).reply_text(f"You are: {role}\nPremium: {prem}")
 
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -302,6 +302,7 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     rule = "price_above" if op == ">" else "price_below"
     tg_id = str(update.effective_user.id)
+
     with session_scope() as session:
         user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         if not user:
@@ -309,19 +310,22 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_admin(tg_id):
             user.is_premium = True
         session.add(user); session.flush()
+        user_id = user.id  # capture before session closes
 
         if not user.is_premium and not is_admin(tg_id):
             active_alerts = session.execute(
                 text("SELECT COUNT(*) FROM alerts WHERE user_id=:uid AND enabled = TRUE"),
-                {"uid": user.id}
+                {"uid": user_id}
             ).scalar_one()
             if active_alerts >= FREE_ALERT_LIMIT:
                 await target_msg(update).reply_text(f"Free plan limit reached ({FREE_ALERT_LIMIT}). Upgrade for unlimited.")
                 return
 
-        alert = Alert(user_id=user.id, symbol=pair, rule=rule, value=val, cooldown_seconds=900)
+        alert = Alert(user_id=user_id, symbol=pair, rule=rule, value=val, cooldown_seconds=900)
         session.add(alert); session.flush()
-    display = f"#U{user.id} • A{alert.id}"
+        alert_id = alert.id  # capture
+
+    display = f"#U{user_id} • A{alert_id}"
     await target_msg(update).reply_text(f"✅ Alert {display} set: {pair} {op} {val}")
 
 def _alert_buttons(aid: int) -> InlineKeyboardMarkup:
@@ -334,25 +338,22 @@ async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user:
             await target_msg(update).reply_text("No alerts yet.")
             return
+        user_id = user.id  # capture
         rows = session.execute(text(
             "SELECT id, symbol, rule, value, enabled FROM alerts WHERE user_id=:uid ORDER BY id DESC LIMIT 20"
-        ), {"uid": user.id}).all()
+        ), {"uid": user_id}).all()
+
     if not rows:
         await target_msg(update).reply_text("No alerts in DB.")
         return
+
     for r in rows:
         op = op_from_rule(r.rule)
-        txt = f"#U{user.id} • A{r.id}  {r.symbol} {op} {r.value}  {'ON' if r.enabled else 'OFF'}"
+        txt = f"#U{user_id} • A{r.id}  {r.symbol} {op} {r.value}  {'ON' if r.enabled else 'OFF'}"
         await target_msg(update).reply_text(txt, reply_markup=_alert_buttons(r.id))
 
 async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-    with session_scope() as session:
-        user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
-        is_premium = bool(user and user.is_premium) or is_admin(tg_id)
-    if not is_premium:
-        await target_msg(update).reply_text("This feature is for Premium users. Upgrade to delete alerts.")
-        return
     if not context.args:
         await target_msg(update).reply_text("Usage: /delalert <id>")
         return
@@ -361,16 +362,21 @@ async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await target_msg(update).reply_text("Bad id")
         return
+
     with session_scope() as session:
         user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
-        if not user:
-            await target_msg(update).reply_text("User not found.")
+        is_premium = bool(user and user.is_premium) or is_admin(tg_id)
+        if not is_premium:
+            await target_msg(update).reply_text("This feature is for Premium users. Upgrade to delete alerts.")
             return
+        user_id = user.id if user else None
+
         if is_admin(tg_id):
             res = session.execute(text("DELETE FROM alerts WHERE id=:id"), {"id": aid})
         else:
-            res = session.execute(text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"), {"id": aid, "uid": user.id})
+            res = session.execute(text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"), {"id": aid, "uid": user_id})
         deleted = res.rowcount or 0
+
     await target_msg(update).reply_text(f"Alert A{aid} deleted." if deleted else "Nothing deleted. Check the id (or ownership).")
 
 async def cmd_clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -378,15 +384,11 @@ async def cmd_clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with session_scope() as session:
         user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
         is_premium = bool(user and user.is_premium) or is_admin(tg_id)
-    if not is_premium:
-        await target_msg(update).reply_text("This feature is for Premium users. Upgrade to clear alerts.")
-        return
-    with session_scope() as session:
-        user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
-        if not user:
-            await target_msg(update).reply_text("User not found.")
+        if not is_premium:
+            await target_msg(update).reply_text("This feature is for Premium users. Upgrade to clear alerts.")
             return
-        res = session.execute(text("DELETE FROM alerts WHERE user_id=:uid"), {"uid": user.id})
+        user_id = user.id if user else None
+        res = session.execute(text("DELETE FROM alerts WHERE user_id=:uid"), {"uid": user_id})
         deleted = res.rowcount or 0
     await target_msg(update).reply_text(f"Deleted {deleted} alert(s).")
 
@@ -480,9 +482,6 @@ async def cmd_adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += "\nNotes:" + subs_note
     for chunk in safe_chunks(msg):
         await target_msg(update).reply_text(chunk)
-
-async def cmd_adminsubs(update: Update, Context: ContextTypes.DEFAULT_TYPE):
-    pass  # left unchanged; not essential here
 
 async def cmd_admincheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _require_admin(update):
@@ -646,7 +645,6 @@ async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ────────────────── Callback handler ──────────────────────
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # Give quick feedback on button press
     await query.answer("Loading...", show_alert=False)
     data = (query.data or "").strip()
     tg_id = str(query.from_user.id)
@@ -658,8 +656,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
     if data == "go:myalerts":
-        await cmd_myalerts(update, context)
-        return
+        await cmd_myalerts(update, context); return
     if data.startswith("go:price:"):
         sym = data.split(":", 2)[2]
         pair = resolve_symbol(sym)
@@ -678,7 +675,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Handle alert action buttons from worker notifications
     if data.startswith("ack:"):
-        # Format: ack:<keep|del>:<id>
         try:
             _, action, sid = data.split(":", 2)
             aid = int(sid)
@@ -691,6 +687,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not user:
                     await query.edit_message_text("User not found.")
                     return
+                user_id = user.id
                 if action == "keep":
                     await query.edit_message_reply_markup(reply_markup=None)
                     await query.message.reply_text("✅ Kept. The alert will continue to run.")
@@ -701,7 +698,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         res = session.execute(
                             text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"),
-                            {"id": aid, "uid": user.id}
+                            {"id": aid, "uid": user_id}
                         )
                     deleted = res.rowcount or 0
                     await query.edit_message_reply_markup(reply_markup=None)
