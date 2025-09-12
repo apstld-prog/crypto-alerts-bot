@@ -1,8 +1,8 @@
 # server_combined.py
 # Single-process runner:
-# 1) Telegram Bot (polling)
-# 2) Alerts loop (background)
-# 3) FastAPI health endpoints: / (Render), /health, /botok (bot heartbeat)
+# - Telegram Bot (polling)
+# - Alerts loop (background)
+# - FastAPI health endpoints: /, /health, /botok, /alertsok
 
 import os
 import time
@@ -30,17 +30,17 @@ WEB_URL = os.getenv("WEB_URL")
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
 FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "3"))
-
 PAYPAL_PLAN_ID = os.getenv("PAYPAL_PLAN_ID")
 PAYPAL_SUBSCRIBE_URL = os.getenv("PAYPAL_SUBSCRIBE_URL")
-
 RUN_BOT = os.getenv("RUN_BOT", "1") == "1"
 RUN_ALERTS = os.getenv("RUN_ALERTS", "1") == "1"
-
 _ADMIN_IDS = {s.strip() for s in (os.getenv("ADMIN_TELEGRAM_IDS") or "").split(",") if s.strip()}
-
 BOT_LOCK_ID = int(os.getenv("BOT_LOCK_ID", "911001"))
 ALERTS_LOCK_ID = int(os.getenv("ALERTS_LOCK_ID", "911002"))
+
+# Health config
+_BOT_HEART_INTERVAL = int(os.getenv("BOT_HEART_INTERVAL_SECONDS", "60"))
+_BOT_HEART_TTL = int(os.getenv("BOT_HEART_TTL_SECONDS", "180"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
@@ -48,6 +48,7 @@ if not BOT_TOKEN:
 def is_admin(tg_id: str | None) -> bool:
     return (tg_id or "") in _ADMIN_IDS
 
+# ───────── Advisory lock helpers ─────────
 def try_advisory_lock(lock_id: int) -> bool:
     try:
         with engine.connect() as conn:
@@ -60,11 +61,11 @@ def try_advisory_lock(lock_id: int) -> bool:
 # ───────── Health server (FastAPI) ─────────
 health_app = FastAPI()
 
-# Shared state for bot heartbeat
+# Shared state for health
 _BOT_HEART_BEAT_AT: datetime | None = None
-_BOT_HEART_STATUS: str = "unknown"  # "ok" / "fail" / "unknown"
-_BOT_HEART_INTERVAL = int(os.getenv("BOT_HEART_INTERVAL_SECONDS", "60"))
-_BOT_HEART_TTL = int(os.getenv("BOT_HEART_TTL_SECONDS", "180"))  # grace window for OK
+_BOT_HEART_STATUS: str = "unknown"  # ok/fail/unknown
+_ALERTS_LAST_OK_AT: datetime | None = None
+_ALERTS_LAST_RESULT: dict | None = None
 
 @health_app.get("/")
 def root():
@@ -76,18 +77,21 @@ def health():
 
 @health_app.get("/botok")
 def botok():
-    """Returns cached bot heartbeat; no external calls here."""
-    global _BOT_HEART_BEAT_AT, _BOT_HEART_STATUS
     now = datetime.utcnow()
-    stale = (
-        (_BOT_HEART_BEAT_AT is None)
-        or ((now - _BOT_HEART_BEAT_AT) > timedelta(seconds=_BOT_HEART_TTL))
-    )
+    stale = (_BOT_HEART_BEAT_AT is None) or ((now - _BOT_HEART_BEAT_AT) > timedelta(seconds=_BOT_HEART_TTL))
     return {
         "bot": ("stale" if stale else _BOT_HEART_STATUS),
         "last": (_BOT_HEART_BEAT_AT.isoformat() + "Z") if _BOT_HEART_BEAT_AT else None,
         "ttl_seconds": _BOT_HEART_TTL,
         "interval_seconds": _BOT_HEART_INTERVAL,
+    }
+
+@health_app.get("/alertsok")
+def alertsok():
+    return {
+        "last_ok": (_ALERTS_LAST_OK_AT.isoformat() + "Z") if _ALERTS_LAST_OK_AT else None,
+        "last_result": _ALERTS_LAST_RESULT or {},
+        "expected_interval_seconds": INTERVAL_SECONDS,
     }
 
 def start_health_server():
@@ -99,7 +103,7 @@ def start_health_server():
     print({"msg": "health_server_started", "port": port})
 
 def bot_heartbeat_loop():
-    """Background: periodically ping Telegram getMe to verify bot reachability."""
+    """Ping Telegram getMe περιοδικά – ενημερώνει cache για /botok."""
     global _BOT_HEART_BEAT_AT, _BOT_HEART_STATUS
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
     print({"msg": "bot_heartbeat_started", "interval": _BOT_HEART_INTERVAL})
@@ -242,7 +246,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True
         )
 
-async def cmd_adminhelp(update: Update, Context: ContextTypes.DEFAULT_TYPE):
+async def cmd_adminhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     if not is_admin(tg_id):
         await target_msg(update).reply_text("Admins only."); return
@@ -266,29 +270,24 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = (context.args[0] if context.args else "BTC").upper()
     pair = resolve_symbol(symbol)
     if not pair:
-        await target_msg(update).reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, SHIB, PEPE ...")
-        return
+        await target_msg(update).reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, SHIB, PEPE ..."); return
     price = fetch_price_binance(pair)
     if price is None:
-        await target_msg(update).reply_text("Price fetch failed. Try again later.")
-        return
+        await target_msg(update).reply_text("Price fetch failed. Try again later."); return
     await target_msg(update).reply_text(f"{pair}: {price:.6f} USDT")
 
 ALERT_RE = re.compile(r"^(?P<sym>[A-Za-z0-9/]+)\s*(?P<op>>|<)\s*(?P<val>[0-9]+(\.[0-9]+)?)$")
 
 async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await target_msg(update).reply_text("Usage: /setalert <SYMBOL> <op> <value>\nExample: /setalert BTC > 110000")
-        return
+        await target_msg(update).reply_text("Usage: /setalert <SYMBOL> <op> <value>\nExample: /setalert BTC > 110000"); return
     m = ALERT_RE.match(" ".join(context.args))
     if not m:
-        await target_msg(update).reply_text("Format error. Example: /setalert BTC > 110000")
-        return
+        await target_msg(update).reply_text("Format error. Example: /setalert BTC > 110000"); return
     sym, op, val = m.group("sym"), m.group("op"), float(m.group("val"))
     pair = resolve_symbol(sym)
     if not pair:
-        await target_msg(update).reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, SHIB, PEPE ...")
-        return
+        await target_msg(update).reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, SHIB, PEPE ..."); return
     rule = "price_above" if op == ">" else "price_below"
     tg_id = str(update.effective_user.id)
     with session_scope() as session:
@@ -305,8 +304,7 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {"uid": user.id}
             ).scalar_one()
             if active_alerts >= FREE_ALERT_LIMIT:
-                await target_msg(update).reply_text(f"Free plan limit reached ({FREE_ALERT_LIMIT}). Upgrade for unlimited.")
-                return
+                await target_msg(update).reply_text(f"Free plan limit reached ({FREE_ALERT_LIMIT}). Upgrade for unlimited."); return
 
         alert = Alert(user_id=user.id, symbol=pair, rule=rule, value=val, cooldown_seconds=900)
         session.add(alert); session.flush()
@@ -383,7 +381,7 @@ async def cmd_requestcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     if not context.args:
-        await target_msg(update).reply_text("Στείλε: /support <μήνυμα σου προς τους διαχειριστές>"); return
+        await target_msg(update).reply_text("Στείλε: /support <το μήνυμά σου προς τους διαχειριστές>"); return
     msg = " ".join(context.args).strip()
     who = update.effective_user
     header = f"🆘 Support message\nFrom: {who.first_name or ''} (@{who.username}) id={tg_id}"
@@ -604,7 +602,7 @@ async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code, body = send_message(target, f"💬 Support reply:\n{text_msg}")
     await target_msg(update).reply_text(f"Reply sent → {target}\nstatus={code}\n{body[:160]}")
 
-# ───────── Callback handler ─────────
+# ───────── Callbacks ─────────
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -613,19 +611,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "go:help":
         for chunk in safe_chunks(HELP_TEXT_HTML):
-            await query.message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=upgrade_keyboard(tg_id))
-        return
+            await query.message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=upgrade_keyboard(tg_id)); return
     if data == "go:myalerts":
         await cmd_myalerts(update, context); return
     if data.startswith("go:price:"):
         sym = data.split(":", 2)[2]
         pair = resolve_symbol(sym)
         price = fetch_price_binance(pair) if pair else None
-        if price is None:
-            await query.message.reply_text("Price fetch failed. Try again later.")
-        else:
-            await query.message.reply_text(f"{pair}: {price:.6f} USDT")
-        return
+        await query.message.reply_text("Price fetch failed. Try again later." if price is None else f"{pair}: {price:.6f} USDT"); return
     if data == "go:setalerthelp":
         await query.message.reply_text("Examples:\n• /setalert BTC > 110000\n• /setalert ETH < 2000\n\nOps: >, <  (number in USD)."); return
     if data == "go:support":
@@ -656,6 +649,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ───────── Alerts loop (background) ─────────
 def alerts_loop():
+    global _ALERTS_LAST_OK_AT, _ALERTS_LAST_RESULT
     if not RUN_ALERTS:
         print({"msg": "alerts_disabled_env"}); return
     if not try_advisory_lock(ALERTS_LOCK_ID):
@@ -667,7 +661,9 @@ def alerts_loop():
         try:
             with session_scope() as session:
                 counters = run_alert_cycle(session)
-            print({"msg": "alert_cycle", "ts": ts, **counters})
+            _ALERTS_LAST_RESULT = {"ts": ts, **counters}
+            _ALERTS_LAST_OK_AT = datetime.utcnow()
+            print({"msg": "alert_cycle", **_ALERTS_LAST_RESULT})
         except Exception as e:
             print({"msg": "alert_cycle_error", "ts": ts, "error": str(e)})
         time.sleep(INTERVAL_SECONDS)
@@ -726,9 +722,9 @@ def main():
         try:
             app.run_polling(
                 allowed_updates=None,
-                drop_pending_updates=True,
-                poll_interval=0.5,
-                timeout=10
+                drop_pending_updates=True,  # καθαρίζει backlog παλιών updates
+                poll_interval=0.5,          # πιο «σφιχτό» polling
+                timeout=10                  # long polling
             )
             break
         except Conflict as e:

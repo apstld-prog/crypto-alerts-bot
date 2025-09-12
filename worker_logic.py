@@ -15,14 +15,11 @@ log = logging.getLogger("worker_logic")
 BINANCE_URL = "https://api.binance.com/api/v3/ticker/price"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Symbol resolve helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────── Symbol resolve ─────────
 DEFAULT_QUOTE = "USDT"
 KNOWN_QUOTES = {"USDT", "USDC", "FDUSD", "TUSD", "BUSD"}
 
 def resolve_symbol(sym: Optional[str]) -> Optional[str]:
-    """Normalize symbols to Binance format, e.g. 'BTC' -> 'BTCUSDT', 'BTC/USDT' -> 'BTCUSDT'."""
     if not sym:
         return None
     s = sym.strip().upper()
@@ -37,14 +34,12 @@ def resolve_symbol(sym: Optional[str]) -> Optional[str]:
     return f"{s}{DEFAULT_QUOTE}"
 
 def fetch_price(symbol: str) -> float:
-    """Fetch price from Binance for a pair like BTCUSDT."""
     r = requests.get(BINANCE_URL, params={"symbol": symbol.upper()}, timeout=8)
     r.raise_for_status()
     data = r.json()
     return float(data["price"])
 
 def fetch_price_binance(symbol_pair: str) -> float:
-    """Alias used by daemon/server_combined."""
     return fetch_price(symbol_pair)
 
 def should_fire(alert: Alert, price: float) -> bool:
@@ -59,12 +54,7 @@ def send_telegram(chat_id: int, text: str) -> Dict[str, Any]:
         log.warning("BOT_TOKEN not set; skipping telegram send")
         return {"ok": False, "reason": "no_token"}
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     r = requests.post(url, json=payload, timeout=10)
     try:
         j = r.json()
@@ -75,7 +65,6 @@ def send_telegram(chat_id: int, text: str) -> Dict[str, Any]:
     return j
 
 def run_alert_cycle(session: Session) -> Dict[str, int]:
-    """Run one evaluation cycle across all active alerts."""
     rows = session.execute(
         select(Alert, User).join(User, Alert.user_id == User.id).where(Alert.enabled == True)  # noqa: E712
     ).all()
@@ -84,7 +73,6 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
     triggered = 0
     errors = 0
 
-    # Fetch prices once per symbol (cache)
     symbols = {r.Alert.symbol for r in rows}
     price_cache: Dict[str, Optional[float]] = {}
     for sym in symbols:
@@ -107,14 +95,14 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
 
         met_now = should_fire(alert, price)
 
-        # Cooldown logic
+        # Cooldown
         if alert.last_fired_at:
             next_ok = alert.last_fired_at + timedelta(seconds=alert.cooldown_seconds)
             in_cooldown = now < next_ok
         else:
             in_cooldown = False
 
-        # Anti-spam: fire on crossing (False -> True) and not in cooldown
+        # Fire on crossing only, and outside cooldown
         should_send = (met_now and (not alert.last_met) and (not in_cooldown))
 
         if should_send:
