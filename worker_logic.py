@@ -130,7 +130,7 @@ def run_alert_cycle(session: Session) -> Dict[str, int]:
             try:
                 op = ">" if alert.rule == "price_above" else "<"
                 msg = (
-                    f"🔔 <b>Alert #U{user.id}</b>\n"
+                    f"🔔 <b>Alert #U{user.id} • A{alert.id}</b>\n"
                     f"Symbol: <b>{alert.symbol}</b>\n"
                     f"Rule: <code>{op} {alert.value}</code>\n"
                     f"Price: <b>{price}</b>\n"
