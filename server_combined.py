@@ -295,11 +295,13 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await target_msg(update).reply_text(f"Free plan limit reached ({FREE_ALERT_LIMIT}). Upgrade for unlimited.")
                     return
 
+            # IMPORTANT: insert with enabled=TRUE explicitly
             row = session.execute(text("""
-                INSERT INTO alerts (user_id, symbol, rule, value, cooldown_seconds, user_seq)
+                INSERT INTO alerts (user_id, symbol, rule, value, cooldown_seconds, user_seq, enabled)
                 VALUES (
                     :uid, :sym, :rule, :val, :cooldown,
-                    (SELECT COALESCE(MAX(user_seq), 0) + 1 FROM alerts WHERE user_id = :uid)
+                    (SELECT COALESCE(MAX(user_seq), 0) + 1 FROM alerts WHERE user_id = :uid),
+                    TRUE
                 )
                 RETURNING id, user_seq
             """), {"uid": user_id, "sym": pair, "rule": rule, "val": val, "cooldown": 900}).first()
@@ -377,21 +379,12 @@ async def cmd_requestcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await target_msg(update).reply_text("Usage: /requestcoin <SYMBOL>  e.g. /requestcoin ARKM"); return
     sym = (context.args[0] or "").upper().strip()
-    requester = update.effective_user
-    who = f"{requester.first_name or ''} (@{requester.username}) id={requester.id}"
-    msg = f"🆕 Coin request: {sym}\nFrom: {who}"
     await target_msg(update).reply_text(f"Got it! We'll review and add {sym} if possible.")
-    # optionally notify admins via sendMessage API here
 
 async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     if not context.args:
         await target_msg(update).reply_text("Send: /support <your message to the admins>"); return
-    msg = " ".join(context.args).strip()
-    who = update.effective_user
-    header = f"🆘 Support message\nFrom: {who.first_name or ''} (@{who.username}) id={tg_id}"
-    full = f"{header}\n\n{msg}"
-    # optionally notify admins via sendMessage API here
     await target_msg(update).reply_text("✅ Your message has been sent to the support team.")
 
 async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -544,7 +537,7 @@ async def cmd_listalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = session.execute(text("""
             SELECT a.id, a.symbol, a.rule, a.value, a.enabled, a.last_fired_at, a.last_met
             FROM alerts a
-            ORDER BY a.id DESC
+            ORDER BY id DESC
             LIMIT 20
         """)).all()
     if not rows:
@@ -578,7 +571,6 @@ async def cmd_resetalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         aid = int(context.args[0])
     except Exception:
         await target_msg(update).reply_text("Bad id"); return
-
     with session_scope() as session:
         row = session.execute(text("SELECT id FROM alerts WHERE id=:id"), {"id": aid}).first()
         if not row:
@@ -595,7 +587,6 @@ async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         aid = int(context.args[0])
     except Exception:
         await target_msg(update).reply_text("Bad id"); return
-
     with session_scope() as session:
         r = session.execute(text("""
             SELECT a.id, a.symbol, a.rule, a.value, a.user_id, u.telegram_id
@@ -740,10 +731,14 @@ def delete_webhook_if_any():
 def run_bot():
     if not RUN_BOT:
         print({"msg": "bot_disabled_env"}); return
+    # Advisory lock για τον bot poller (αποφυγή Conflict)
+    if not try_advisory_lock(BOT_LOCK_ID):
+        print({"msg": "bot_lock_skipped"}); return
     try:
         delete_webhook_if_any()
     except Exception:
         pass
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -767,10 +762,14 @@ def run_bot():
     app.add_handler(CommandHandler("runalerts", cmd_runalerts))
     app.add_handler(CallbackQueryHandler(on_callback))
     print({"msg": "bot_start"})
-    try:
-        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-    except Conflict as e:
-        print({"msg": "bot_conflict", "error": str(e)})
+
+    while True:
+        try:
+            app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+            break
+        except Conflict as e:
+            print({"msg": "bot_conflict_retry", "error": str(e)})
+            time.sleep(5)
 
 def main():
     init_db()
