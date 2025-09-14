@@ -37,6 +37,12 @@ def session_scope():
 def init_db():
     Base.metadata.create_all(bind=engine)
 
+def masked_db_url():
+    try:
+        return engine.url.render_as_string(hide_password=True)
+    except Exception:
+        return str(engine.url)
+
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
@@ -68,7 +74,7 @@ class Subscription(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     provider = Column(String(32), nullable=False, server_default=text("'paypal'"))
-    provider_sub_id = Column(String(128), nullable=True, index=True)
+    provider_sub_id = Column(String(128), nullable=True, index=True)   # <-- migration θα το προσθέσει αν λείπει
     status_internal = Column(String(64), nullable=True, index=True)
     created_at = Column(DateTime, nullable=False, server_default=text("NOW()"))
     updated_at = Column(DateTime, nullable=False, server_default=text("NOW()"))

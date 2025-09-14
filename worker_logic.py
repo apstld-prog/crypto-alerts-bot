@@ -60,14 +60,15 @@ def _send_alert_message(tg_id: str, seq: int, symbol: str, rule: str, value: flo
     }
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(
+        r = requests.post(
             url,
             json={"chat_id": tg_id, "text": text_msg, "parse_mode": "HTML",
                   "disable_web_page_preview": True, "reply_markup": kb},
             timeout=15,
         )
-    except Exception:
-        pass
+        print({"msg":"send_alert_message", "chat_id": tg_id, "status": r.status_code, "body": r.text[:120]})
+    except Exception as e:
+        print({"msg":"send_alert_exception", "error": str(e)})
 
 def resolve_price_for_alert(sym: str) -> float | None:
     return fetch_price_binance(sym)

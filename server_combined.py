@@ -155,7 +155,7 @@ def paypal_upgrade_url_for(tg_id: str | None) -> str | None:
 def op_from_rule(rule: str) -> str:
     return ">" if rule == "price_above" else "<"
 
-def safe_chunks(s: str, limit: int = 3800):
+def safe_chunks(s: str, limit:  int = 3800):
     while s:
         yield s[:limit]
         s = s[limit:]
@@ -295,7 +295,6 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await target_msg(update).reply_text(f"Free plan limit reached ({FREE_ALERT_LIMIT}). Upgrade for unlimited.")
                     return
 
-            # IMPORTANT: insert with enabled=TRUE explicitly
             row = session.execute(text("""
                 INSERT INTO alerts (user_id, symbol, rule, value, cooldown_seconds, user_seq, enabled)
                 VALUES (
@@ -306,7 +305,6 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 RETURNING id, user_seq
             """), {"uid": user_id, "sym": pair, "rule": rule, "val": val, "cooldown": 900}).first()
 
-            alert_id = row.id
             user_seq = row.user_seq
 
         await target_msg(update).reply_text(f"✅ Alert A{user_seq} set: {pair} {op} {val}")
@@ -492,7 +490,7 @@ async def cmd_adminsubs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     for r in rows:
         lines.append(f"#{r.id} uid={r.user_id or '-'} tg={r.telegram_id or '-'} "
-                     f"{r.status_internal} ref={r.provider_ref or '-'} created={r.created_at.isoformat() if r.created_at else '-'}")
+                     f"{r.status_internal or '-'} ref={r.provider_ref or '-'} created={r.created_at.isoformat() if r.created_at else '-'}")
     msg = "Last 20 subscriptions:\n" + "\n".join(lines)
     for chunk in safe_chunks(msg):
         await target_msg(update).reply_text(chunk)
