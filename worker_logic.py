@@ -11,25 +11,49 @@ BINANCE_REST = "https://api.binance.com/api/v3/ticker/price"
 ALERT_COOLDOWN_DEFAULT = 900  # seconds
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
+# ✅ Προστέθηκαν περισσότερα σύμβολα (Cosmos οικοσύστημα & δημοφιλή)
+#    TIP: Αν δεν υπάρχει εδώ κάτι, ο resolver δοκιμάζει fallback <SYMBOL>USDT
 SYMBOL_MAP = {
+    # Core
     "BTC": "BTCUSDT",
     "ETH": "ETHUSDT",
+    "BNB": "BNBUSDT",
     "SOL": "SOLUSDT",
     "XRP": "XRPUSDT",
     "ADA": "ADAUSDT",
     "DOGE": "DOGEUSDT",
+    "MATIC": "MATICUSDT",
+    "AVAX": "AVAXUSDT",
+    "DOT": "DOTUSDT",
+    "LINK": "LINKUSDT",
+    "NEAR": "NEARUSDT",
+    "TRX": "TRXUSDT",
+    "LTC": "LTCUSDT",
+    "BCH": "BCHUSDT",
+    "TON": "TONUSDT",
     "SHIB": "SHIBUSDT",
     "PEPE": "PEPEUSDT",
     "ARKM": "ARKMUSDT",
-}
 
-def resolve_symbol(sym: str | None) -> str | None:
-    if not sym:
-        return None
-    s = sym.upper().replace("/", "")
-    if s.endswith("USDT"):
-        return s
-    return SYMBOL_MAP.get(s)
+    # Cosmos family & σχετικά
+    "ATOM": "ATOMUSDT",
+    "INJ": "INJUSDT",
+    "SEI": "SEIUSDT",
+    "TIA": "TIAUSDT",
+    "DYDX": "DYDXUSDT",
+    "AKT": "AKTUSDT",
+    "OSMO": "OSMOUSDT",   # αν δεν υποστηρίζεται στο Binance, το fallback θα χειριστεί άλλα σύμβολα
+
+    # Layer2 / νέα δημοφιλή
+    "OP": "OPUSDT",
+    "ARB": "ARBUSDT",
+
+    # Others συχνά ζητούμενα
+    "APT": "APTUSDT",
+    "SUI": "SUIUSDT",
+    "RNDR": "RNDRUSDT",
+    "FET": "FETUSDT",     # (σε κάποιες πλατφόρμες αναφέρεται και ως ASI)
+}
 
 def fetch_price_binance(symbol: str) -> float | None:
     try:
@@ -38,6 +62,26 @@ def fetch_price_binance(symbol: str) -> float | None:
             return float(r.json()["price"])
     except Exception:
         pass
+    return None
+
+def resolve_symbol(sym: str | None) -> str | None:
+    """
+    Επιστρέφει το Binance pair (π.χ. BTCUSDT).
+    - Αν δοθεί ήδη σε μορφή *_USDT*, το δέχεται.
+    - Αν υπάρχει στον χάρτη, επιστρέφει τον χάρτη.
+    - Αλλιώς δοκιμάζει fallback: <SYM>USDT και *αν* υπάρχει τιμή, το κρατάει.
+    """
+    if not sym:
+        return None
+    s = sym.upper().replace("/", "").strip()
+    if s.endswith("USDT"):
+        return s
+    if s in SYMBOL_MAP:
+        return SYMBOL_MAP[s]
+    candidate = f"{s}USDT"
+    # Επαλήθευση ότι όντως υπάρχει στην Binance (με δοκιμή price)
+    if fetch_price_binance(candidate) is not None:
+        return candidate
     return None
 
 def _should_fire(rule: str, value: float, price: float) -> bool:
@@ -66,6 +110,7 @@ def _send_alert_message(tg_id: str, seq: int, symbol: str, rule: str, value: flo
                   "disable_web_page_preview": True, "reply_markup": kb},
             timeout=15,
         )
+        # DEBUG για διάγνωση αποστολής
         print({"msg":"send_alert_message", "chat_id": tg_id, "status": r.status_code, "body": r.text[:120]})
     except Exception as e:
         print({"msg":"send_alert_exception", "error": str(e)})
