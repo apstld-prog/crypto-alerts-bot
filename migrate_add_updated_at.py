@@ -1,12 +1,8 @@
 # migrate_add_updated_at.py
-# Adds users.updated_at if missing (idempotent), then verifies.
 from sqlalchemy import text
 from db import session_scope
 
-SQL = """
-ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
-"""
-
+SQL = "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();"
 CHECK = """
 SELECT column_name
 FROM information_schema.columns
