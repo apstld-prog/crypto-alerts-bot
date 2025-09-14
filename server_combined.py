@@ -36,6 +36,7 @@ FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "3"))
 
 PAYPAL_PLAN_ID = (os.getenv("PAYPAL_PLAN_ID") or "").strip() or None
 PAYPAL_SUBSCRIBE_URL = (os.getenv("PAYPAL_SUBSCRIBE_URL") or "").strip() or None
+PAYPAL_MANAGE_URL = (os.getenv("PAYPAL_MANAGE_URL") or "").strip() or None  # optional help link
 
 RUN_BOT = os.getenv("RUN_BOT", "1") == "1"
 RUN_ALERTS = os.getenv("RUN_ALERTS", "1") == "1"
@@ -445,6 +446,60 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     send_admins(f"{header}\n\n{msg}")
     await target_msg(update).reply_text("✅ Your message was sent to support. We'll reply here.")
 
+# ──────────────── User billing command ────────────────────
+async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Marks the user's active subscription (if any) as CANCEL_AT_PERIOD_END.
+    If none found, informs the user and points to PayPal management.
+    """
+    tg_id = str(update.effective_user.id)
+    with session_scope() as session:
+        user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
+        if not user:
+            await target_msg(update).reply_text("No account found.")
+            return
+        # Find an active or already scheduled-to-cancel subscription for this user
+        row = session.execute(text("""
+            SELECT id, status_internal
+            FROM subscriptions
+            WHERE user_id = :uid
+            ORDER BY id DESC
+            LIMIT 1
+        """), {"uid": user.id}).first()
+
+        if not row:
+            extra = f"\nManage in PayPal: {PAYPAL_MANAGE_URL}" if PAYPAL_MANAGE_URL else ""
+            await target_msg(update).reply_text("No active subscription found." + extra)
+            return
+
+        status = (row.status_internal or "").upper()
+        sid = row.id
+
+        if status == "ACTIVE":
+            session.execute(text("""
+                UPDATE subscriptions
+                SET status_internal = 'CANCEL_AT_PERIOD_END', updated_at = NOW()
+                WHERE id = :sid
+            """), {"sid": sid})
+            extra = (
+                "\n\nℹ️ It will remain active until the current period ends."
+                + (f"\nYou can also manage it in PayPal: {PAYPAL_MANAGE_URL}" if PAYPAL_MANAGE_URL else "")
+            )
+            await target_msg(update).reply_text("Auto-renew has been canceled for your subscription." + extra)
+            return
+
+        if status == "CANCEL_AT_PERIOD_END":
+            extra = f"\nManage in PayPal: {PAYPAL_MANAGE_URL}" if PAYPAL_MANAGE_URL else ""
+            await target_msg(update).reply_text("Auto-renew is already canceled. Your access remains until period end." + extra)
+            return
+
+        if status == "CANCELLED":
+            await target_msg(update).reply_text("Your subscription is already cancelled.")
+            return
+
+        # Unknown state
+        await target_msg(update).reply_text(f"Subscription status: {status or 'UNKNOWN'}. Please contact support with /support <message>.")
+
 # ───────────────── Admin commands ──────────────────
 def _require_admin(update: Update) -> bool:
     tg_id = str(update.effective_user.id)
@@ -504,6 +559,9 @@ async def cmd_admincheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
             url_masked = engine.url.render_as_string(hide_password=True)
         except Exception:
             url_masked = str(engine.url)
+    except Exception:
+        url_masked = "(mask failed)"
+    try:
         with session_scope() as session:
             total = session.execute(text("SELECT COUNT(*) FROM alerts")).scalar_one()
             rows = session.execute(text("""
@@ -817,6 +875,8 @@ def main():
     app.add_handler(CommandHandler("clearalerts", cmd_clearalerts))
     app.add_handler(CommandHandler("requestcoin", cmd_requestcoin))
     app.add_handler(CommandHandler("support", cmd_support))
+    app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
+
     # Register admin commands
     app.add_handler(CommandHandler("adminhelp", cmd_adminhelp))
     app.add_handler(CommandHandler("adminstats", cmd_adminstats))
