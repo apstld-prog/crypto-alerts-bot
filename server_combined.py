@@ -51,14 +51,26 @@ if not BOT_TOKEN:
 def is_admin(tg_id: str | None) -> bool:
     return (tg_id or "") in _ADMIN_IDS
 
-def try_advisory_lock(lock_id: int) -> bool:
+# ───────── Persistent advisory locks (keep connection open) ─────────
+def acquire_advisory_lock(lock_id: int, name: str):
+    """
+    Try to acquire a session-level advisory lock and KEEP the connection open
+    so the lock persists for the lifetime of the thread.
+    Returns a SQLAlchemy Connection if acquired, else None.
+    """
     try:
-        with engine.connect() as conn:
-            res = conn.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id}).scalar()
-            return bool(res)
+        conn = engine.connect()
+        res = conn.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id}).scalar()
+        if res:
+            print({"msg": "advisory_lock_acquired", "lock": name, "id": lock_id})
+            return conn  # keep it open
+        else:
+            print({"msg": "advisory_lock_busy", "lock": name, "id": lock_id})
+            conn.close()
+            return None
     except Exception as e:
-        print({"msg": "advisory_lock_error", "lock_id": lock_id, "error": str(e)})
-        return False
+        print({"msg": "advisory_lock_error", "lock": name, "id": lock_id, "error": str(e)})
+        return None
 
 # ───────── Health server ─────────
 health_app = FastAPI()
@@ -189,9 +201,9 @@ def start_text(limit: int) -> str:
         "• <code>/myalerts</code> — list your active alerts (with delete buttons)\n"
         "• <code>/help</code> — instructions\n"
         "• <code>/support &lt;message&gt;</code> — contact admin support\n\n"
-        "💎 <b>Premium</b>: unlimited alerts <i>(only 7€ / month)</i>\n"
+        "💎 <b>Premium</b>: unlimited alerts\n"
         f"🆓 <b>Free</b>: up to <b>{limit}</b> alerts.\n\n"
-        "🧩 <i>Supported:</i> τα περισσότερα USDT pairs (BTC, ETH, SOL, XRP, ATOM, OSMO, INJ, DYDX, SEI, TIA, RUNE, KAVA, …)."
+        "🧩 <i>Supported:</i> most USDT pairs (BTC, ETH, SOL, XRP, ATOM, OSMO, INJ, DYDX, SEI, TIA, RUNE, KAVA, AKT, DOT, LINK, AVAX, MATIC, TON, SHIB, PEPE, ...)."
     )
 
 # ───────── Commands ─────────
@@ -253,7 +265,7 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = (context.args[0] if context.args else "BTC").upper()
     pair = resolve_symbol(symbol)
     if not pair:
-        await target_msg(update).reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, ATOM, OSMO, INJ, DYDX, SEI, TIA, RUNE, KAVA ..."); return
+        await target_msg(update).reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, ATOM, OSMO, INJ, DYDX, SEI, TIA, RUNE, KAVA, AKT, DOT, LINK, AVAX, MATIC, TON, SHIB, PEPE ..."); return
     price = fetch_price_binance(pair)
     if price is None:
         await target_msg(update).reply_text("Price fetch failed. Try again later."); return
@@ -271,7 +283,7 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sym, op, val = m.group("sym"), m.group("op"), float(m.group("val"))
     pair = resolve_symbol(sym)
     if not pair:
-        await target_msg(update).reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, ATOM, OSMO, INJ, DYDX, SEI, TIA, RUNE, KAVA ..."); return
+        await target_msg(update).reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, ATOM, OSMO, INJ, DYDX, SEI, TIA, RUNE, KAVA, AKT, DOT, LINK, AVAX, MATIC, TON, SHIB, PEPE ..."); return
 
     rule = "price_above" if op == ">" else "price_below"
     tg_id = str(update.effective_user.id)
@@ -413,7 +425,6 @@ ADMIN_HELP = (
     "• /resetalert <id> — last_fired=NULL, last_met=FALSE\n"
     "• /forcealert <id> — send alert now & set last_met=TRUE\n"
     "• /testalert — quick DM test\n"
-    "• /reply <tg_id> <message> — reply to a user’s /support\n"
 )
 
 async def cmd_adminhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -702,21 +713,31 @@ def alerts_loop():
     global _ALERTS_LAST_OK_AT, _ALERTS_LAST_RESULT
     if not RUN_ALERTS:
         print({"msg": "alerts_disabled_env"}); return
-    if not try_advisory_lock(ALERTS_LOCK_ID):
+
+    # Acquire and keep the advisory lock for the entire lifetime of this thread
+    lock_conn = acquire_advisory_lock(ALERTS_LOCK_ID, "alerts")
+    if not lock_conn:
         print({"msg": "alerts_lock_skipped"}); return
+
     print({"msg": "alerts_loop_start", "interval": INTERVAL_SECONDS})
     init_db()
-    while True:
-        ts = datetime.utcnow().isoformat()
+    try:
+        while True:
+            ts = datetime.utcnow().isoformat()
+            try:
+                with session_scope() as session:
+                    counters = run_alert_cycle(session)
+                _ALERTS_LAST_RESULT = {"ts": ts, **counters}
+                _ALERTS_LAST_OK_AT = datetime.utcnow()
+                print({"msg": "alert_cycle", **_ALERTS_LAST_RESULT})
+            except Exception as e:
+                print({"msg": "alert_cycle_error", "ts": ts, "error": str(e)})
+            time.sleep(INTERVAL_SECONDS)
+    finally:
         try:
-            with session_scope() as session:
-                counters = run_alert_cycle(session)
-            _ALERTS_LAST_RESULT = {"ts": ts, **counters}
-            _ALERTS_LAST_OK_AT = datetime.utcnow()
-            print({"msg": "alert_cycle", **_ALERTS_LAST_RESULT})
-        except Exception as e:
-            print({"msg": "alert_cycle_error", "ts": ts, "error": str(e)})
-        time.sleep(INTERVAL_SECONDS)
+            lock_conn.close()
+        except Exception:
+            pass
 
 def delete_webhook_if_any():
     try:
@@ -729,45 +750,54 @@ def delete_webhook_if_any():
 def run_bot():
     if not RUN_BOT:
         print({"msg": "bot_disabled_env"}); return
-    # Advisory lock για τον bot poller (αποφυγή Conflict)
-    if not try_advisory_lock(BOT_LOCK_ID):
+
+    # Acquire and keep the advisory lock for the entire lifetime of the poller
+    lock_conn = acquire_advisory_lock(BOT_LOCK_ID, "bot")
+    if not lock_conn:
         print({"msg": "bot_lock_skipped"}); return
+
     try:
-        delete_webhook_if_any()
-    except Exception:
-        pass
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("whoami", cmd_whoami))
-    app.add_handler(CommandHandler("price", cmd_price))
-    app.add_handler(CommandHandler("setalert", cmd_setalert))
-    app.add_handler(CommandHandler("myalerts", cmd_myalerts))
-    app.add_handler(CommandHandler("delalert", cmd_delalert))
-    app.add_handler(CommandHandler("clearalerts", cmd_clearalerts))
-    app.add_handler(CommandHandler("requestcoin", cmd_requestcoin))
-    app.add_handler(CommandHandler("support", cmd_support))
-    app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
-    app.add_handler(CommandHandler("adminhelp", cmd_adminhelp))
-    app.add_handler(CommandHandler("adminstats", cmd_adminstats))
-    app.add_handler(CommandHandler("adminsubs", cmd_adminsubs))
-    app.add_handler(CommandHandler("admincheck", cmd_admincheck))
-    app.add_handler(CommandHandler("listalerts", cmd_listalerts))
-    app.add_handler(CommandHandler("testalert", cmd_testalert))
-    app.add_handler(CommandHandler("resetalert", cmd_resetalert))
-    app.add_handler(CommandHandler("forcealert", cmd_forcealert))
-    app.add_handler(CommandHandler("runalerts", cmd_runalerts))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    print({"msg": "bot_start"})
-
-    while True:
         try:
-            app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-            break
-        except Conflict as e:
-            print({"msg": "bot_conflict_retry", "error": str(e)})
-            time.sleep(5)
+            delete_webhook_if_any()
+        except Exception:
+            pass
+
+        app = Application.builder().token(BOT_TOKEN).build()
+        app.add_handler(CommandHandler("start", cmd_start))
+        app.add_handler(CommandHandler("help", cmd_help))
+        app.add_handler(CommandHandler("whoami", cmd_whoami))
+        app.add_handler(CommandHandler("price", cmd_price))
+        app.add_handler(CommandHandler("setalert", cmd_setalert))
+        app.add_handler(CommandHandler("myalerts", cmd_myalerts))
+        app.add_handler(CommandHandler("delalert", cmd_delalert))
+        app.add_handler(CommandHandler("clearalerts", cmd_clearalerts))
+        app.add_handler(CommandHandler("requestcoin", cmd_requestcoin))
+        app.add_handler(CommandHandler("support", cmd_support))
+        app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
+        app.add_handler(CommandHandler("adminhelp", cmd_adminhelp))
+        app.add_handler(CommandHandler("adminstats", cmd_adminstats))
+        app.add_handler(CommandHandler("adminsubs", cmd_adminsubs))
+        app.add_handler(CommandHandler("admincheck", cmd_admincheck))
+        app.add_handler(CommandHandler("listalerts", cmd_listalerts))
+        app.add_handler(CommandHandler("testalert", cmd_testalert))
+        app.add_handler(CommandHandler("resetalert", cmd_resetalert))
+        app.add_handler(CommandHandler("forcealert", cmd_forcealert))
+        app.add_handler(CommandHandler("runalerts", cmd_runalerts))
+        app.add_handler(CallbackQueryHandler(on_callback))
+        print({"msg": "bot_start"})
+
+        while True:
+            try:
+                app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+                break
+            except Conflict as e:
+                print({"msg": "bot_conflict_retry", "error": str(e)})
+                time.sleep(5)
+    finally:
+        try:
+            lock_conn.close()
+        except Exception:
+            pass
 
 def main():
     init_db()
