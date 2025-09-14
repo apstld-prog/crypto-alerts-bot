@@ -11,7 +11,7 @@ BINANCE_REST = "https://api.binance.com/api/v3/ticker/price"
 ALERT_COOLDOWN_DEFAULT = 900  # seconds
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# Γνωστά pairs (όπου έχει νόημα να τα χαρτογραφήσουμε ρητά)
+# Explicit symbol map for convenience/popular pairs.
 SYMBOL_MAP = {
     # Top caps
     "BTC": "BTCUSDT",
@@ -25,21 +25,20 @@ SYMBOL_MAP = {
     "BCH": "BCHUSDT",
     "TON": "TONUSDT",
     "LINK": "LINKUSDT",
-    "MATIC": "MATICUSDT",  # (a.k.a POL)
+    "MATIC": "MATICUSDT",  # aka POL elsewhere
 
-    # Cosmos / Cosmos-like & γύρω απ’ αυτό (όσα υπάρχουν στο Binance)
+    # Cosmos / related
     "ATOM": "ATOMUSDT",
     "OSMO": "OSMOUSDT",
     "INJ":  "INJUSDT",
     "DYDX": "DYDXUSDT",
     "SEI":  "SEIUSDT",
-    "TIA":  "TIAUSDT",     # (Celestia)
+    "TIA":  "TIAUSDT",     # Celestia
     "RUNE": "RUNEUSDT",    # THORChain
     "KAVA": "KAVAUSDT",
-    "AKT":  "AKTUSDT",     # Akash (διαθέσιμο στο Binance)
-    # (Αν θες κι άλλα της Cosmos που δεν είναι στο Binance, θα αποτύχουν στο fetch — βλέπε fallback παρακάτω)
+    "AKT":  "AKTUSDT",     # Akash
 
-    # Άλλα δημοφιλή
+    # Other popular
     "AVAX": "AVAXUSDT",
     "DOT":  "DOTUSDT",
     "APT":  "APTUSDT",
@@ -62,10 +61,10 @@ def fetch_price_binance(symbol: str) -> float | None:
 
 def resolve_symbol(sym: str | None) -> str | None:
     """
-    Επιστρέφει το Binance pair (π.χ. BTCUSDT).
-    - Αν δοθεί ήδη σε μορφή *_USDT*, το δέχεται.
-    - Αν υπάρχει στον χάρτη, επιστρέφει τον χάρτη.
-    - Αλλιώς δοκιμάζει fallback: <SYM>USDT και *αν* παίρνει τιμή από Binance, το κρατάει.
+    Resolve user input to a Binance pair (e.g., BTC -> BTCUSDT).
+    - If already ends with USDT, accept it as-is.
+    - If in SYMBOL_MAP, return mapped pair.
+    - Else try fallback "<SYM>USDT" and verify by fetching a price.
     """
     if not sym:
         return None
@@ -105,7 +104,6 @@ def _send_alert_message(tg_id: str, seq: int, symbol: str, rule: str, value: flo
                   "disable_web_page_preview": True, "reply_markup": kb},
             timeout=15,
         )
-        # DEBUG: να βλέπουμε ότι στάλθηκε
         print({"msg":"send_alert_message", "chat_id": tg_id, "status": r.status_code, "body": r.text[:120]})
     except Exception as e:
         print({"msg":"send_alert_exception", "error": str(e)})
