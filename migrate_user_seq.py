@@ -1,5 +1,4 @@
 # migrate_user_seq.py
-# Idempotent migration: adds alerts.user_seq, backfills per-user sequence, creates unique index.
 from sqlalchemy import text
 from db import session_scope
 
@@ -7,7 +6,7 @@ SQL = """
 -- 1) Add column if missing
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS user_seq INTEGER;
 
--- 2) Backfill per-user sequence based on creation order (id)
+-- 2) Backfill per-user sequence based on creation order
 WITH ranked AS (
   SELECT id, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY id) AS rn
   FROM alerts
@@ -18,12 +17,11 @@ FROM ranked r
 WHERE a.id = r.id
   AND (a.user_seq IS NULL OR a.user_seq <> r.rn);
 
--- 3) Create unique index (user_id, user_seq) if missing
+-- 3) Create unique index if not exists
 DO $$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM pg_indexes
-    WHERE schemaname = 'public' AND indexname = 'uniq_alerts_user_seq'
+    SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'uniq_alerts_user_seq'
   ) THEN
     CREATE UNIQUE INDEX uniq_alerts_user_seq ON alerts (user_id, user_seq);
   END IF;
@@ -31,10 +29,7 @@ END$$;
 """
 
 CHECKS = """
-SELECT
-  COUNT(*) AS alerts_total,
-  COUNT(user_seq) AS alerts_with_seq
-FROM alerts;
+SELECT COUNT(*) AS alerts_total, COUNT(user_seq) AS alerts_with_seq FROM alerts;
 """
 
 if __name__ == "__main__":
