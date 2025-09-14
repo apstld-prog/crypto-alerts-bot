@@ -155,7 +155,7 @@ def paypal_upgrade_url_for(tg_id: str | None) -> str | None:
 def op_from_rule(rule: str) -> str:
     return ">" if rule == "price_above" else "<"
 
-def safe_chunks(s: str, limit:  int = 3800):
+def safe_chunks(s: str, limit: int = 3800):
     while s:
         yield s[:limit]
         s = s[limit:]
@@ -191,7 +191,7 @@ def start_text(limit: int) -> str:
         "• <code>/support &lt;message&gt;</code> — contact admin support\n\n"
         "💎 <b>Premium</b>: unlimited alerts <i>(only 7€ / month)</i>\n"
         f"🆓 <b>Free</b>: up to <b>{limit}</b> alerts.\n\n"
-        "🧩 <i>Missing a coin?</i> Send <code>/requestcoin &lt;SYMBOL&gt;</code>."
+        "🧩 <i>Supported:</i> τα περισσότερα USDT pairs (π.χ. BTC, ETH, SOL, XRP, ATOM, INJ, SEI, TIA, DYDX, AKT, OP, ARB, …)."
     )
 
 # ───────── Commands ─────────
@@ -253,7 +253,7 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = (context.args[0] if context.args else "BTC").upper()
     pair = resolve_symbol(symbol)
     if not pair:
-        await target_msg(update).reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, SHIB, PEPE ..."); return
+        await target_msg(update).reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, ATOM, INJ, SEI, TIA, DYDX, AKT..."); return
     price = fetch_price_binance(pair)
     if price is None:
         await target_msg(update).reply_text("Price fetch failed. Try again later."); return
@@ -271,7 +271,7 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sym, op, val = m.group("sym"), m.group("op"), float(m.group("val"))
     pair = resolve_symbol(sym)
     if not pair:
-        await target_msg(update).reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, SHIB, PEPE ..."); return
+        await target_msg(update).reply_text("Unknown symbol. Try BTC, ETH, SOL, XRP, ATOM, INJ, SEI, TIA, DYDX, AKT..."); return
 
     rule = "price_above" if op == ">" else "price_below"
     tg_id = str(update.effective_user.id)
@@ -506,275 +506,4 @@ async def cmd_admincheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with session_scope() as session:
             total = session.execute(text("SELECT COUNT(*) FROM alerts")).scalar_one()
             rows = session.execute(text("""
-                SELECT a.id, a.user_id, a.symbol, a.rule, a.value, a.enabled, u.telegram_id, a.last_fired_at, a.last_met
-                FROM alerts a
-                LEFT JOIN users u ON u.id = a.user_id
-                ORDER BY a.id DESC
-                LIMIT 5
-            """)).all()
-        lines = [f"DB: {url_masked}", f"alerts_total={total}", "last_5:"]
-        if rows:
-            for r in rows:
-                op = op_from_rule(r.rule)
-                lines.append(
-                    f"  #{r.id} uid={r.user_id} tg={r.telegram_id or '-'} "
-                    f"{r.symbol} {op} {r.value} {'ON' if r.enabled else 'OFF'} "
-                    f"last_fired={r.last_fired_at} last_met={r.last_met}"
-                )
-        else:
-            lines.append("  (none)")
-        for chunk in safe_chunks("\n".join(lines)):
-            await target_msg(update).reply_text(chunk)
-    except Exception as e:
-        await target_msg(update).reply_text(f"admincheck error: {e}")
-
-async def cmd_listalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _require_admin(update):
-        await target_msg(update).reply_text("Admins only."); return
-    with session_scope() as session:
-        rows = session.execute(text("""
-            SELECT a.id, a.symbol, a.rule, a.value, a.enabled, a.last_fired_at, a.last_met
-            FROM alerts a
-            ORDER BY id DESC
-            LIMIT 20
-        """)).all()
-    if not rows:
-        await target_msg(update).reply_text("No alerts in DB."); return
-    lines = []
-    for r in rows:
-        op = op_from_rule(r.rule)
-        lines.append(
-            f"#{r.id} {r.symbol} {op} {r.value} "
-            f"{'ON' if r.enabled else 'OFF'} last_fired={r.last_fired_at or '-'} last_met={r.last_met}"
-        )
-    msg = "Last 20 alerts:\n" + "\n".join(lines)
-    for chunk in safe_chunks(msg):
-        await target_msg(update).reply_text(chunk)
-
-async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = str(update.effective_user.id)
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        r = requests.post(url, json={"chat_id": tg_id, "text": "Test alert ✅"}, timeout=10)
-        await target_msg(update).reply_text(f"testalert status={r.status_code} body={r.text[:200]}")
-    except Exception as e:
-        await target_msg(update).reply_text(f"testalert exception: {e}")
-
-async def cmd_resetalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _require_admin(update):
-        await target_msg(update).reply_text("Admins only."); return
-    if not context.args:
-        await target_msg(update).reply_text("Usage: /resetalert <id>"); return
-    try:
-        aid = int(context.args[0])
-    except Exception:
-        await target_msg(update).reply_text("Bad id"); return
-    with session_scope() as session:
-        row = session.execute(text("SELECT id FROM alerts WHERE id=:id"), {"id": aid}).first()
-        if not row:
-            await target_msg(update).reply_text(f"Alert {aid} not found"); return
-        session.execute(text("UPDATE alerts SET last_fired_at = NULL, last_met = FALSE WHERE id=:id"), {"id": aid})
-    await target_msg(update).reply_text(f"Alert (ID {aid}) reset (last_fired_at=NULL, last_met=FALSE).")
-
-async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _require_admin(update):
-        await target_msg(update).reply_text("Admins only."); return
-    if not context.args:
-        await target_msg(update).reply_text("Usage: /forcealert <id>"); return
-    try:
-        aid = int(context.args[0])
-    except Exception:
-        await target_msg(update).reply_text("Bad id"); return
-    with session_scope() as session:
-        r = session.execute(text("""
-            SELECT a.id, a.symbol, a.rule, a.value, a.user_id, u.telegram_id
-            FROM alerts a LEFT JOIN users u ON u.id=a.user_id
-            WHERE a.id=:id
-        """), {"id": aid}).first()
-        if not r:
-            await target_msg(update).reply_text(f"Alert {aid} not found"); return
-        chat_id = str(r.telegram_id) if r.telegram_id else None
-        if not chat_id:
-            await target_msg(update).reply_text("No telegram_id for this user; cannot send."); return
-        try:
-            textmsg = f"🔔 (force) Alert (ID {r.id}) | {r.symbol} {r.rule} {r.value}"
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-            rr = requests.post(url, json={"chat_id": chat_id, "text": textmsg}, timeout=10)
-            if rr.status_code == 200:
-                with session_scope() as s2:
-                    s2.execute(text("UPDATE alerts SET last_fired_at = NOW(), last_met = TRUE WHERE id=:id"), {"id": aid})
-                await target_msg(update).reply_text("Force sent ok. status=200")
-            else:
-                await target_msg(update).reply_text(f"Force send failed: {rr.status_code} {rr.text[:200]}")
-        except Exception as e:
-            await target_msg(update).reply_text(f"Force send exception: {e}")
-
-async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _require_admin(update):
-        await target_msg(update).reply_text("Admins only."); return
-    with session_scope() as session:
-        counters = run_alert_cycle(session)
-        rows = session.execute(text("""
-            SELECT id, user_id, symbol, rule, value, enabled, last_fired_at, last_met
-            FROM alerts ORDER BY id DESC LIMIT 5
-        """)).all()
-    lines = [f"run_alert_cycle: {counters}", "last_5:"]
-    for r in rows:
-        op = op_from_rule(r.rule)
-        lines.append(
-            f"  #{r.id}  {r.symbol} {op} {r.value} "
-            f"{'ON' if r.enabled else 'OFF'} last_fired={r.last_fired_at or '-'} last_met={r.last_met}"
-        )
-    for chunk in safe_chunks("\n".join(lines)):
-        await target_msg(update).reply_text(chunk)
-
-# ───────── Callbacks ─────────
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Loading...", show_alert=False)
-    data = (query.data or "").strip()
-    tg_id = str(query.from_user.id)
-
-    if data == "go:help":       await cmd_help(update, context); return
-    if data == "go:myalerts":   await cmd_myalerts(update, context); return
-    if data.startswith("go:price:"):
-        sym = data.split(":", 2)[2]
-        pair = resolve_symbol(sym)
-        price = fetch_price_binance(pair) if pair else None
-        if price is None:
-            await query.message.reply_text("Price fetch failed. Try again later.")
-        else:
-            await query.message.reply_text(f"{pair}: {price:.6f} USDT")
-        return
-    if data == "go:setalerthelp":
-        await query.message.reply_text("Examples:\n• /setalert BTC > 110000\n• /setalert ETH < 2000\nOps: >, < (USD number)."); return
-    if data == "go:support":
-        await query.message.reply_text("Send a message to support:\n/support <your message>", reply_markup=upgrade_keyboard(tg_id)); return
-
-    if data.startswith("ack:"):
-        try:
-            _, action, sid = data.split(":", 2)
-            aid = int(sid)
-        except Exception:
-            await query.edit_message_text("Bad action format."); return
-        try:
-            with session_scope() as session:
-                user = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
-                if not user:
-                    await query.edit_message_text("User not found."); return
-                user_id = user.id
-                if action == "keep":
-                    await query.edit_message_reply_markup(reply_markup=None)
-                    await query.message.reply_text("✅ Kept. The alert will continue to run."); return
-                elif action == "del":
-                    row = session.execute(text("SELECT user_seq FROM alerts WHERE id=:id AND user_id=:uid"),
-                                          {"id": aid, "uid": user_id}).first()
-                    if not row:
-                        await query.message.reply_text("Not yours or not found."); return
-                    seq_txt = f"A{row.user_seq}" if (row and row.user_seq is not None) else f"#{aid}"
-                    session.execute(text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"),
-                                    {"id": aid, "uid": user_id})
-                    await query.edit_message_reply_markup(reply_markup=None)
-                    await query.message.reply_text(f"🗑️ Deleted {seq_txt}."); return
-                else:
-                    await query.edit_message_text("Unknown action."); return
-        except Exception as e:
-            await query.message.reply_text(f"Action error: {e}"); return
-
-    if data.startswith("del:"):
-        try:
-            aid = int(data.split(":", 1)[1])
-        except Exception:
-            await query.edit_message_text("Bad id."); return
-        with session_scope() as session:
-            owner = session.execute(text("SELECT user_id, user_seq FROM alerts WHERE id=:id"), {"id": aid}).first()
-            if not owner:
-                await query.edit_message_text("Alert not found."); return
-            seq_txt = f"A{owner.user_seq}" if owner.user_seq is not None else f"#{aid}"
-            u = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
-            if not u or owner.user_id != u.id:
-                await query.edit_message_text("You can delete only your own alerts."); return
-            session.execute(text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"), {"id": aid, "uid": u.id})
-        await query.edit_message_text(f"✅ Deleted alert {seq_txt}.")
-
-# ───────── Loops ─────────
-def alerts_loop():
-    global _ALERTS_LAST_OK_AT, _ALERTS_LAST_RESULT
-    if not RUN_ALERTS:
-        print({"msg": "alerts_disabled_env"}); return
-    if not try_advisory_lock(ALERTS_LOCK_ID):
-        print({"msg": "alerts_lock_skipped"}); return
-    print({"msg": "alerts_loop_start", "interval": INTERVAL_SECONDS})
-    init_db()
-    while True:
-        ts = datetime.utcnow().isoformat()
-        try:
-            with session_scope() as session:
-                counters = run_alert_cycle(session)
-            _ALERTS_LAST_RESULT = {"ts": ts, **counters}
-            _ALERTS_LAST_OK_AT = datetime.utcnow()
-            print({"msg": "alert_cycle", **_ALERTS_LAST_RESULT})
-        except Exception as e:
-            print({"msg": "alert_cycle_error", "ts": ts, "error": str(e)})
-        time.sleep(INTERVAL_SECONDS)
-
-def delete_webhook_if_any():
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
-        r = requests.get(url, timeout=10)
-        print({"msg": "delete_webhook", "status": r.status_code, "body": r.text[:200]})
-    except Exception as e:
-        print({"msg": "delete_webhook_exception", "error": str(e)})
-
-def run_bot():
-    if not RUN_BOT:
-        print({"msg": "bot_disabled_env"}); return
-    # Advisory lock για τον bot poller (αποφυγή Conflict)
-    if not try_advisory_lock(BOT_LOCK_ID):
-        print({"msg": "bot_lock_skipped"}); return
-    try:
-        delete_webhook_if_any()
-    except Exception:
-        pass
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("whoami", cmd_whoami))
-    app.add_handler(CommandHandler("price", cmd_price))
-    app.add_handler(CommandHandler("setalert", cmd_setalert))
-    app.add_handler(CommandHandler("myalerts", cmd_myalerts))
-    app.add_handler(CommandHandler("delalert", cmd_delalert))
-    app.add_handler(CommandHandler("clearalerts", cmd_clearalerts))
-    app.add_handler(CommandHandler("requestcoin", cmd_requestcoin))
-    app.add_handler(CommandHandler("support", cmd_support))
-    app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
-    app.add_handler(CommandHandler("adminhelp", cmd_adminhelp))
-    app.add_handler(CommandHandler("adminstats", cmd_adminstats))
-    app.add_handler(CommandHandler("adminsubs", cmd_adminsubs))
-    app.add_handler(CommandHandler("admincheck", cmd_admincheck))
-    app.add_handler(CommandHandler("listalerts", cmd_listalerts))
-    app.add_handler(CommandHandler("testalert", cmd_testalert))
-    app.add_handler(CommandHandler("resetalert", cmd_resetalert))
-    app.add_handler(CommandHandler("forcealert", cmd_forcealert))
-    app.add_handler(CommandHandler("runalerts", cmd_runalerts))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    print({"msg": "bot_start"})
-
-    while True:
-        try:
-            app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-            break
-        except Conflict as e:
-            print({"msg": "bot_conflict_retry", "error": str(e)})
-            time.sleep(5)
-
-def main():
-    init_db()
-    start_health_server()
-    threading.Thread(target=bot_heartbeat_loop, daemon=True).start()
-    threading.Thread(target=alerts_loop, daemon=True).start()
-    run_bot()
-
-if __name__ == "__main__":
-    main()
+                SELECT a.id, a.user_id, a.symbol, a.rule, a.value,
