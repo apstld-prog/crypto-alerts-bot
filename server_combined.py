@@ -360,14 +360,23 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await target_msg(update).reply_text(f"Free plan limit reached ({FREE_ALERT_LIMIT}). Upgrade for unlimited.")
                 return
 
-        alert = Alert(user_id=user_id, symbol=pair, rule=rule, value=val, cooldown_seconds=900)
+        # compute next user_seq for this user
+        next_seq = session.execute(
+            text("SELECT COALESCE(MAX(user_seq), 0) + 1 FROM alerts WHERE user_id = :uid"),
+            {"uid": user_id}
+        ).scalar_one()
+
+        alert = Alert(user_id=user_id, symbol=pair, rule=rule, value=val, cooldown_seconds=900, user_seq=next_seq)
         session.add(alert); session.flush()
+
         alert_id = alert.id
+        user_seq = alert.user_seq
 
-    await target_msg(update).reply_text(f"✅ Alert #{alert_id} set: {pair} {op} {val}")
+    await target_msg(update).reply_text(f"✅ Alert A{user_seq} set: {pair} {op} {val}")
 
-def _alert_buttons(aid: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(f"🗑️ Delete #{aid}", callback_data=f"del:{aid}")]])
+def _alert_buttons(aid: int, seq: int) -> InlineKeyboardMarkup:
+    # Display A{seq}; callback carries the internal numeric id
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"🗑️ Delete A{seq}", callback_data=f"del:{aid}")]])
 
 async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
@@ -378,15 +387,16 @@ async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         user_id = user.id
         rows = session.execute(text(
-            "SELECT id, symbol, rule, value, enabled FROM alerts WHERE user_id=:uid ORDER BY id DESC LIMIT 20"
+            "SELECT id, user_seq, symbol, rule, value, enabled "
+            "FROM alerts WHERE user_id=:uid ORDER BY id DESC LIMIT 20"
         ), {"uid": user_id}).all()
     if not rows:
         await target_msg(update).reply_text("No alerts in DB.")
         return
     for r in rows:
         op = op_from_rule(r.rule)
-        txt = f"#{r.id}  {r.symbol} {op} {r.value}  {'ON' if r.enabled else 'OFF'}"
-        await target_msg(update).reply_text(txt, reply_markup=_alert_buttons(r.id))
+        txt = f"A{r.user_seq}  {r.symbol} {op} {r.value}  {'ON' if r.enabled else 'OFF'}"
+        await target_msg(update).reply_text(txt, reply_markup=_alert_buttons(r.id, r.user_seq))
 
 async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
@@ -405,12 +415,19 @@ async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await target_msg(update).reply_text("Premium required to delete alerts.")
             return
         user_id = user.id if user else None
+
+        # fetch user_seq before delete for nice message
         if is_admin(tg_id):
+            row = session.execute(text("SELECT user_seq FROM alerts WHERE id=:id"), {"id": aid}).first()
             res = session.execute(text("DELETE FROM alerts WHERE id=:id"), {"id": aid})
         else:
-            res = session.execute(text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"), {"id": aid, "uid": user_id})
+            row = session.execute(text("SELECT user_seq FROM alerts WHERE id=:id AND user_id=:uid"),
+                                  {"id": aid, "uid": user_id}).first()
+            res = session.execute(text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"),
+                                  {"id": aid, "uid": user_id})
         deleted = res.rowcount or 0
-    await target_msg(update).reply_text(f"Alert #{aid} deleted." if deleted else "Nothing deleted.")
+        seq_txt = f"A{row.user_seq}" if (row and row.user_seq is not None) else f"#{aid}"
+    await target_msg(update).reply_text(f"Alert {seq_txt} deleted." if deleted else "Nothing deleted.")
 
 async def cmd_clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
@@ -458,7 +475,6 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
         if not user:
             await target_msg(update).reply_text("No account found.")
             return
-        # Find most recent subscription (adjust logic if you support multiple concurrently)
         row = session.execute(text("""
             SELECT id, status_internal
             FROM subscriptions
@@ -476,7 +492,6 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
         sid = row.id
 
         if status == "ACTIVE":
-            # FIX: do not reference 'updated_at' (column may not exist)
             session.execute(text("""
                 UPDATE subscriptions
                 SET status_internal = 'CANCEL_AT_PERIOD_END'
@@ -498,7 +513,6 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
             await target_msg(update).reply_text("Your subscription is already cancelled.")
             return
 
-        # Unknown state
         await target_msg(update).reply_text(f"Subscription status: {status or 'UNKNOWN'}. Please contact support with /support <message>.")
 
 # ───────────────── Admin commands ──────────────────
@@ -548,7 +562,6 @@ async def cmd_adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await target_msg(update).reply_text(chunk)
 
 async def cmd_adminsubs(update: Update, Context: ContextTypes.DEFAULT_TYPE):
-    # Optional stub; implement if you persist external billing data
     await target_msg(update).reply_text("Not implemented yet.")
 
 async def cmd_admincheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -768,12 +781,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.message.reply_text("✅ Kept. The alert will continue to run.")
                     return
                 elif action == "del":
+                    # fetch seq first
+                    row = session.execute(text("SELECT user_seq FROM alerts WHERE id=:id"), {"id": aid}).first()
+                    seq_txt = f"A{row.user_seq}" if (row and row.user_seq is not None) else f"#{aid}"
                     if is_admin(tg_id):
                         session.execute(text("DELETE FROM alerts WHERE id=:id"), {"id": aid})
                     else:
-                        session.execute(text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"), {"id": aid, "uid": user_id})
+                        session.execute(text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"),
+                                        {"id": aid, "uid": user_id})
                     await query.edit_message_reply_markup(reply_markup=None)
-                    await query.message.reply_text("🗑️ Deleted.")
+                    await query.message.reply_text(f"🗑️ Deleted {seq_txt}.")
                     return
                 else:
                     await query.edit_message_text("Unknown action.")
@@ -797,17 +814,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Premium required to delete alerts.")
             return
         with session_scope() as session:
-            owner = session.execute(text("SELECT user_id FROM alerts WHERE id=:id"), {"id": aid}).first()
+            owner = session.execute(text("SELECT user_id, user_seq FROM alerts WHERE id=:id"), {"id": aid}).first()
             if not owner:
                 await query.edit_message_text("Alert not found.")
                 return
+            seq_txt = f"A{owner.user_seq}" if owner.user_seq is not None else f"#{aid}"
             if not is_admin(tg_id):
                 u = session.execute(select(User).where(User.telegram_id == tg_id)).scalar_one_or_none()
                 if not u or owner.user_id != u.id:
                     await query.edit_message_text("You can delete only your own alerts.")
                     return
             session.execute(text("DELETE FROM alerts WHERE id=:id"), {"id": aid})
-        await query.edit_message_text(f"✅ Deleted alert #{aid}.")
+        await query.edit_message_text(f"✅ Deleted alert {seq_txt}.")
 
 # ───────────────── Alerts loop (background) ───────────────
 def alerts_loop():
