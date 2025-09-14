@@ -458,7 +458,7 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
         if not user:
             await target_msg(update).reply_text("No account found.")
             return
-        # Find an active or already scheduled-to-cancel subscription for this user
+        # Find most recent subscription (adjust logic if you support multiple concurrently)
         row = session.execute(text("""
             SELECT id, status_internal
             FROM subscriptions
@@ -476,9 +476,10 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
         sid = row.id
 
         if status == "ACTIVE":
+            # FIX: do not reference 'updated_at' (column may not exist)
             session.execute(text("""
                 UPDATE subscriptions
-                SET status_internal = 'CANCEL_AT_PERIOD_END', updated_at = NOW()
+                SET status_internal = 'CANCEL_AT_PERIOD_END'
                 WHERE id = :sid
             """), {"sid": sid})
             extra = (
@@ -611,7 +612,7 @@ async def cmd_listalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     msg = "Last 20 alerts:\n" + "\n".join(lines)
     for chunk in safe_chunks(msg):
-        await target_msg(update).reply_text(chunk)
+        await target_msg(update).reply_text(msg)
 
 async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _require_admin(update):
