@@ -1,5 +1,6 @@
 # commands_extra.py
 # Extra commands for Crypto Alerts bot
+# Includes: /feargreed, /funding, /topgainers, /toplosers, /chart, /news, /dca, /pumplive, /dailynews
 # NOTE: /whale is disabled (temporary) and only returns a friendly message.
 
 import os
@@ -10,14 +11,14 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from features_market import (
-    get_fear_greed,             # () -> Optional[dict]
-    get_funding,                # (symbol: Optional[str]) -> str
-    get_top_movers,             # (direction: str, limit: int = 10) -> List[Tuple[str,float]]
-    make_quickchart_url,        # (symbol: str) -> Optional[str]
-    get_news_headlines,         # (limit: int) -> List[Tuple[str, str]]
+    get_fear_greed,
+    get_funding,
+    get_top_movers,
+    make_quickchart_url,
+    get_news_headlines,
 )
-from models_extras import get_user_setting, set_user_setting  # user opt-ins for pump alerts
-
+from models_extras import get_user_setting, set_user_setting
+from plans import build_plan_info  # used for plan-aware /news
 
 # ---------- Utilities ----------
 def _reply_chunked(update: Update, text: str, limit: int = 3800):
@@ -29,7 +30,6 @@ def _reply_chunked(update: Update, text: str, limit: int = 3800):
         part = s[:limit]
         s = s[limit:]
         msg.reply_text(part, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
 
 # ---------- Commands ----------
 async def cmd_feargreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -77,20 +77,60 @@ async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await (update.message or update.effective_message).reply_text("Chart not available for this symbol right now."); return
     await (update.message or update.effective_message).reply_text(f"📊 <b>{symbol} 24h</b>\n{url}", parse_mode=ParseMode.HTML, disable_web_page_preview=False)
 
+# ---- NEWS (plan-aware, keywords, limits) ----
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    limit = 5
+    user_id = str(update.effective_user.id)
+    # In this context we don't need admin set; build_plan_info will still return is_premium from DB
+    plan = build_plan_info(user_id, set())
+
+    # Args:
+    # /news                 -> default limits per plan
+    # /news 10              -> request 10 items
+    # /news btc             -> keyword filter (default limit per plan)
+    # /news btc 15          -> keyword + limit
+    keyword: Optional[str] = None
+    requested_limit: Optional[int] = None
+
     if context.args:
-        try:
-            limit = max(1, min(15, int(context.args[0])))
-        except Exception:
-            pass
-    items = get_news_headlines(limit)
+        if len(context.args) == 1:
+            a0 = context.args[0]
+            try:
+                requested_limit = max(1, int(a0))
+            except Exception:
+                keyword = a0
+        else:
+            keyword = context.args[0]
+            try:
+                requested_limit = max(1, int(context.args[1]))
+            except Exception:
+                requested_limit = None
+
+    # Plan-based limits
+    if plan.has_unlimited:
+        limit = requested_limit if requested_limit is not None else 10
+        limit = max(1, min(30, limit))
+    else:
+        limit = 3
+
+    items = get_news_headlines(limit=limit, keyword=keyword)
     if not items:
-        await (update.message or update.effective_message).reply_text("News not available right now."); return
-    lines = ["🗞️ <b>Latest Crypto Headlines</b>"]
-    for title, link in items:
-        lines.append(f"• <a href=\"{link}\">{title}</a>")
-    await (update.message or update.effective_message).reply_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=False)
+        await (update.message or update.effective_message).reply_text("News not available right now.")
+        return
+
+    title = "🗞️ <b>Latest Crypto Headlines</b>"
+    if keyword:
+        title = f"🗞️ <b>Crypto Headlines</b> — <i>{keyword.upper()}</i>"
+
+    lines = [title]
+    for t, link in items:
+        safe_title = t.replace("\n", " ").strip()
+        lines.append(f"• <a href=\"{link}\">{safe_title}</a>")
+
+    await (update.message or update.effective_message).reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=False
+    )
 
 async def cmd_dca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 3:
@@ -104,6 +144,7 @@ async def cmd_dca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = amt * n
     await (update.message or update.effective_message).reply_text(f"🧮 <b>DCA</b>\nBuys: {n}\nPer buy: {amt}\nTotal: <b>{total}</b>\nSymbol: {sym}", parse_mode=ParseMode.HTML)
 
+# Pump alerts opt-in using user_settings table via models_extras helpers
 async def cmd_pumplive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.message or update.effective_message
     if not context.args:
@@ -132,7 +173,28 @@ async def cmd_pumplive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await chat.reply_text("Usage: /pumplive on|off [threshold%]")
 
-# ---------- Disabled Whale ----------
+# ---- Daily news opt-in/out ----
+async def cmd_dailynews(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.message or update.effective_message
+    uid = str(update.effective_user.id)
+
+    if not context.args:
+        cur = get_user_setting(uid, "dailynews") or "off"
+        hour = os.getenv("DAILYNEWS_HOUR_UTC", "9")
+        await chat.reply_text(f"Usage: /dailynews on|off\nCurrent: {cur}\nDelivery time: {hour}:00 UTC")
+        return
+
+    action = (context.args[0] or "").lower().strip()
+    if action == "on":
+        set_user_setting(uid, "dailynews", "on")
+        await chat.reply_text("✅ Daily news enabled. You'll get a digest every day at 09:00 UTC.")
+    elif action == "off":
+        set_user_setting(uid, "dailynews", "off")
+        await chat.reply_text("✅ Daily news disabled.")
+    else:
+        await chat.reply_text("Usage: /dailynews on|off")
+
+# Whale disabled
 async def cmd_whale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await (update.message or update.effective_message).reply_text(
         "🐋 Whale alerts are temporarily disabled.\n"
@@ -140,7 +202,7 @@ async def cmd_whale(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
-# ---------- Register ----------
+# ---------- Registration ----------
 def register_extra_handlers(app: Application):
     app.add_handler(CommandHandler("feargreed", cmd_feargreed))
     app.add_handler(CommandHandler("funding", cmd_funding))
@@ -150,4 +212,5 @@ def register_extra_handlers(app: Application):
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CommandHandler("dca", cmd_dca))
     app.add_handler(CommandHandler("pumplive", cmd_pumplive))
-    app.add_handler(CommandHandler("whale", cmd_whale))  # still registered but disabled
+    app.add_handler(CommandHandler("dailynews", cmd_dailynews))
+    app.add_handler(CommandHandler("whale", cmd_whale))  # registered, but disabled
