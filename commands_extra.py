@@ -1,150 +1,147 @@
+# commands_extra.py
+# Extra commands for Crypto Alerts bot
+# NOTE: /whale is disabled (temporary) and only returns a friendly message.
 
 import os
-from typing import Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CommandHandler, ContextTypes
+from typing import Optional, List, Tuple
+
+from telegram import Update
 from telegram.constants import ParseMode
-from sqlalchemy import select, text
-from db import session_scope, User
-from features_market import top_movers, funding_rate, fear_greed, klines_close_series, quickchart_url_from_series, fetch_news, whale_recent
-from models_extras import SessionLocalExtra
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-def _msg_target(update: Update):
-    return (update.message or (update.callback_query.message if update.callback_query else None))
+from features_market import (
+    get_fear_greed,             # () -> Optional[dict]
+    get_funding,                # (symbol: Optional[str]) -> str
+    get_top_movers,             # (direction: str, limit: int = 10) -> List[Tuple[str,float]]
+    make_quickchart_url,        # (symbol: str) -> Optional[str]
+    get_news_headlines,         # (limit: int) -> List[Tuple[str, str]]
+)
+from models_extras import get_user_setting, set_user_setting  # user opt-ins for pump alerts
 
-async def cmd_feargreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d = fear_greed()
-    if not d or not d.get("value"):
-        await _msg_target(update).reply_text("Fear & Greed data not available right now.")
+
+# ---------- Utilities ----------
+def _reply_chunked(update: Update, text: str, limit: int = 3800):
+    msg = update.message or (update.callback_query.message if update.callback_query else None)
+    if not msg:
         return
-    await _msg_target(update).reply_text(f"📊 Fear & Greed Index: {d['value']} — {d['classification']}")
+    s = text
+    while s:
+        part = s[:limit]
+        s = s[limit:]
+        msg.reply_text(part, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+# ---------- Commands ----------
+async def cmd_feargreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = get_fear_greed()
+    if not data:
+        await (update.message or update.effective_message).reply_text("Fear & Greed not available right now.")
+        return
+    index_val = data.get("value")
+    classification = data.get("value_classification")
+    ts = data.get("timestamp")
+    txt = f"🧭 <b>Fear &amp; Greed Index</b>\nValue: <b>{index_val}</b> ({classification})\n"
+    if ts:
+        txt += f"Updated: {ts}\n"
+    await (update.message or update.effective_message).reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sym = (context.args[0].upper() if context.args else None)
-    data = funding_rate(sym)
-    if "error" in data:
-        await _msg_target(update).reply_text("❌ " + data["error"]); return
-    if sym:
-        await _msg_target(update).reply_text(f"🧮 Funding {data['symbol']}: {data['funding']:.6f}")
-    else:
-        lines = ["🧲 Top |funding| extremes:"]
-        for d in data["extremes"][:10]:
-            lines.append(f"• {d['symbol']}: {d['lastFundingRate']:.6f}")
-        await _msg_target(update).reply_text("\n".join(lines))
+    symbol = (context.args[0].upper() if context.args else None)
+    out = get_funding(symbol)
+    _reply_chunked(update, out)
 
 async def cmd_topgainers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gainers, losers = top_movers(10)
-    g = "\n".join([f"• {r['symbol']}: {float(r['priceChangePercent']):+.2f}%" for r in gainers])
-    await _msg_target(update).reply_text("🚀 Top 24h Gainers (USDT):\n" + g)
+    rows = get_top_movers("gainers", limit=10)
+    if not rows:
+        await (update.message or update.effective_message).reply_text("No data right now."); return
+    lines = ["📈 <b>Top Gainers (24h)</b>"]
+    for sym, pct in rows:
+        lines.append(f"• <code>{sym}</code>  +{pct:.2f}%")
+    await (update.message or update.effective_message).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def cmd_toplosers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gainers, losers = top_movers(10)
-    l = "\n".join([f"• {r['symbol']}: {float(r['priceChangePercent']):+.2f}%" for r in losers])
-    await _msg_target(update).reply_text("📉 Top 24h Losers (USDT):\n" + l)
+    rows = get_top_movers("losers", limit=10)
+    if not rows:
+        await (update.message or update.effective_message).reply_text("No data right now."); return
+    lines = ["📉 <b>Top Losers (24h)</b>"]
+    for sym, pct in rows:
+        lines.append(f"• <code>{sym}</code>  {pct:.2f}%")
+    await (update.message or update.effective_message).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await _msg_target(update).reply_text("Usage: /chart <SYMBOL>  e.g. /chart BTC"); return
-    sym = context.args[0].upper()
-    pair = sym + "USDT"
-    try:
-        data = klines_close_series(pair, interval="1h", limit=24)
-    except Exception as e:
-        await _msg_target(update).reply_text(f"Chart data error: {e}"); return
-    url = quickchart_url_from_series(data, title=f"{pair} (24h)")
-    await _msg_target(update).reply_text(f"🖼️ Mini chart for {pair}:\n{url}", disable_web_page_preview=False)
+        await (update.message or update.effective_message).reply_text("Usage: /chart <SYMBOL>\nExample: /chart BTC"); return
+    symbol = context.args[0].upper()
+    url = make_quickchart_url(symbol)
+    if not url:
+        await (update.message or update.effective_message).reply_text("Chart not available for this symbol right now."); return
+    await (update.message or update.effective_message).reply_text(f"📊 <b>{symbol} 24h</b>\n{url}", parse_mode=ParseMode.HTML, disable_web_page_preview=False)
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    n = 5
+    limit = 5
     if context.args:
         try:
-            n = max(1, min(15, int(context.args[0])))
+            limit = max(1, min(15, int(context.args[0])))
         except Exception:
             pass
-    items = fetch_news(n=n)
+    items = get_news_headlines(limit)
     if not items:
-        await _msg_target(update).reply_text("News not available right now."); return
-    lines = ["📰 Latest crypto headlines:"]
-    for t, l in items:
-        lines.append(f"• {t}\n{l}")
-    await _msg_target(update).reply_text("\n\n".join(lines), disable_web_page_preview=False)
+        await (update.message or update.effective_message).reply_text("News not available right now."); return
+    lines = ["🗞️ <b>Latest Crypto Headlines</b>"]
+    for title, link in items:
+        lines.append(f"• <a href=\"{link}\">{title}</a>")
+    await (update.message or update.effective_message).reply_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=False)
 
 async def cmd_dca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 3:
-        await _msg_target(update).reply_text("Usage: /dca <amount_per_buy> <buys> <symbol>\nExample: /dca 20 12 BTC"); return
+        await (update.message or update.effective_message).reply_text("Usage: /dca <amount_per_buy> <buys> <symbol>\nExample: /dca 20 12 BTC"); return
     try:
-        amount = float(context.args[0]); buys = int(context.args[1]); sym = context.args[2].upper()
+        amt = float(context.args[0])
+        n   = int(context.args[1])
+        sym = context.args[2].upper()
     except Exception:
-        await _msg_target(update).reply_text("Bad parameters. Example: /dca 20 12 BTC"); return
-    pair = sym + "USDT"
-    try:
-        closes = klines_close_series(pair, interval="1h", limit=1)
-        price = closes[-1]
-    except Exception:
-        await _msg_target(update).reply_text("Price not available right now."); return
-    invested = amount * buys
-    est_qty = invested / price if price else 0.0
-    await _msg_target(update).reply_text(
-        f"🧮 DCA Plan for {sym}\n"
-        f"• Buys: {buys} × {amount:.2f} = {invested:.2f} USDT\n"
-        f"• Est. current qty at {price:.6f}: {est_qty:.6f} {sym}\n"
-        f"(Note: This uses current price only for a quick estimate.)"
-    )
+        await (update.message or update.effective_message).reply_text("Bad parameters. Example: /dca 20 12 BTC"); return
+    total = amt * n
+    await (update.message or update.effective_message).reply_text(f"🧮 <b>DCA</b>\nBuys: {n}\nPer buy: {amt}\nTotal: <b>{total}</b>\nSymbol: {sym}", parse_mode=ParseMode.HTML)
 
-# user settings: /pumplive on|off [threshold%]
 async def cmd_pumplive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_user.id)
+    chat = update.message or update.effective_message
     if not context.args:
-        await _msg_target(update).reply_text("Usage: /pumplive on|off [threshold_percent]"); return
+        cur = get_user_setting(str(update.effective_user.id), "pump_optin") or "off"
+        thr = get_user_setting(str(update.effective_user.id), "pump_threshold") or os.getenv("PUMP_THRESHOLD_PERCENT", "10")
+        await chat.reply_text(f"Usage: /pumplive on|off [threshold%]\nCurrent: {cur}  threshold={thr}%")
+        return
+
     action = context.args[0].lower()
-    thr = None
+    threshold = None
     if len(context.args) >= 2:
         try:
-            thr = int(context.args[1])
+            threshold = max(1, min(50, int(float(context.args[1]))))
         except Exception:
-            thr = None
-    with SessionLocalExtra() as s:
-        row = s.execute(text("SELECT id FROM user_settings WHERE user_id=:uid"), {"uid": chat_id}).first()
-        if action == "on":
-            if row:
-                s.execute(text("UPDATE user_settings SET pump_live=TRUE, pump_threshold_percent=:thr WHERE user_id=:uid"),
-                          {"uid": chat_id, "thr": thr})
-            else:
-                s.execute(text("INSERT INTO user_settings (user_id, pump_live, pump_threshold_percent) VALUES (:uid, TRUE, :thr)"),
-                          {"uid": chat_id, "thr": thr})
-            s.commit()
-            await _msg_target(update).reply_text(f"✅ Pump alerts enabled. Threshold: {thr or os.getenv('PUMP_THRESHOLD_PERCENT','10')}%")
-        elif action == "off":
-            if row:
-                s.execute(text("UPDATE user_settings SET pump_live=FALSE WHERE user_id=:uid"), {"uid": chat_id})
-                s.commit()
-            await _msg_target(update).reply_text("🛑 Pump alerts disabled.")
-        else:
-            await _msg_target(update).reply_text("Usage: /pumplive on|off [threshold_percent]")
+            threshold = None
 
+    uid = str(update.effective_user.id)
+    if action == "on":
+        set_user_setting(uid, "pump_optin", "on")
+        if threshold is not None:
+            set_user_setting(uid, "pump_threshold", str(threshold))
+        await chat.reply_text(f"✅ Pump alerts ON{(' at ' + str(threshold) + '%') if threshold is not None else ''}.")
+    elif action == "off":
+        set_user_setting(uid, "pump_optin", "off")
+        await chat.reply_text("✅ Pump alerts OFF.")
+    else:
+        await chat.reply_text("Usage: /pumplive on|off [threshold%]")
+
+# ---------- Disabled Whale ----------
 async def cmd_whale(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    min_usd = 250000
-    if context.args:
-        try:
-            min_usd = int(context.args[0])
-        except Exception:
-            pass
-    data = whale_recent(min_usd=min_usd)
-    if "error" in data:
-        await _msg_target(update).reply_text("ℹ️ " + data["error"]); return
-    txs = (data.get("transactions") or [])[:10]
-    if not txs:
-        await _msg_target(update).reply_text("No recent whale transactions above your threshold."); return
-    lines = [f"🐋 Recent whale tx (>{min_usd} USD):"]
-    for t in txs:
-        amt = t.get("amount_usd") or t.get("amount")
-        sym = (t.get("symbol") or "").upper()
-        src = (t.get("from") or {}).get("owner_type") or "unknown"
-        dst = (t.get("to") or {}).get("owner_type") or "unknown"
-        lines.append(f"• {sym} ~ ${amt:,.0f} — {src} → {dst}")
-    await _msg_target(update).reply_text("\n".join(lines))
+    await (update.message or update.effective_message).reply_text(
+        "🐋 Whale alerts are temporarily disabled.\n"
+        "We will enable this feature again once API access is available.",
+        parse_mode=ParseMode.HTML
+    )
 
-def register_extra_handlers(app):
+# ---------- Register ----------
+def register_extra_handlers(app: Application):
     app.add_handler(CommandHandler("feargreed", cmd_feargreed))
     app.add_handler(CommandHandler("funding", cmd_funding))
     app.add_handler(CommandHandler("topgainers", cmd_topgainers))
@@ -153,4 +150,4 @@ def register_extra_handlers(app):
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CommandHandler("dca", cmd_dca))
     app.add_handler(CommandHandler("pumplive", cmd_pumplive))
-    app.add_handler(CommandHandler("whale", cmd_whale))
+    app.add_handler(CommandHandler("whale", cmd_whale))  # still registered but disabled
