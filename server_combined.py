@@ -3,6 +3,7 @@
 # - FastAPI health server
 # - Telegram Bot (polling)
 # - Alerts loop (background)
+# - Extra features (Fear&Greed, Funding, Gainers/Losers, Chart, News, DCA, Pump alerts, Whale)
 
 import os, time, threading, re
 from datetime import datetime, timedelta
@@ -22,13 +23,22 @@ from sqlalchemy import select, text
 from db import init_db, session_scope, User, Alert, Subscription, engine
 from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
 
+# ---- Extra features pack imports ----
+# Make sure these files exist (from the extra pack):
+# - commands_extra.py
+# - worker_extra.py
+# - models_extras.py
+from commands_extra import register_extra_handlers
+from worker_extra import start_pump_watcher
+from models_extras import init_extras
+
 # ───────── ENV ─────────
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 WEB_URL = (os.getenv("WEB_URL") or "").strip() or None
 ADMIN_KEY = (os.getenv("ADMIN_KEY") or "").strip() or None
 
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
-FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "3"))
+FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "10"))  # default Free limit = 10
 
 PAYPAL_PLAN_ID = (os.getenv("PAYPAL_PLAN_ID") or "").strip() or None
 PAYPAL_SUBSCRIBE_URL = (os.getenv("PAYPAL_SUBSCRIBE_URL") or "").strip() or None
@@ -237,8 +247,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/cancel_autorenew</code> → stop future billing (keeps access till period end)\n"
         "• <code>/support &lt;message&gt;</code> → send a message to admins\n"
         "• <code>/whoami</code> → shows if you are admin/premium\n"
-        "• <code>/requestcoin &lt;SYMBOL&gt;</code> → ask admins to add a coin (e.g. <code>/requestcoin ATOM</code>)\n"
-        "• <code>/adminhelp</code> → admin commands (admins only)\n"
+        "• <code>/requestcoin &lt;SYMBOL&gt;</code> → ask admins to add a coin\n"
+        "• <code>/adminhelp</code> → admin commands (admins only)\n\n"
+        "<b>Extra Features</b>\n"
+        "• <code>/feargreed</code> → current Fear &amp; Greed Index\n"
+        "• <code>/funding [SYMBOL]</code> → futures funding rate or top extremes\n"
+        "• <code>/topgainers</code>, <code>/toplosers</code> → 24h movers\n"
+        "• <code>/chart &lt;SYMBOL&gt;</code> → mini chart (24h)\n"
+        "• <code>/news [N]</code> → latest crypto headlines\n"
+        "• <code>/dca &lt;amount_per_buy&gt; &lt;buys&gt; &lt;symbol&gt;</code>\n"
+        "• <code>/pumplive on|off [threshold%]</code> → live pump alerts opt-in\n"
+        "• <code>/whale [min_usd]</code> → recent whale transactions\n"
     )
     for chunk in safe_chunks(help_html):
         await target_msg(update).reply_text(
@@ -763,6 +782,8 @@ def run_bot():
             pass
 
         app = Application.builder().token(BOT_TOKEN).build()
+
+        # Core commands
         app.add_handler(CommandHandler("start", cmd_start))
         app.add_handler(CommandHandler("help", cmd_help))
         app.add_handler(CommandHandler("whoami", cmd_whoami))
@@ -774,6 +795,8 @@ def run_bot():
         app.add_handler(CommandHandler("requestcoin", cmd_requestcoin))
         app.add_handler(CommandHandler("support", cmd_support))
         app.add_handler(CommandHandler("cancel_autorenew", cmd_cancel_autorenew))
+
+        # Admin commands
         app.add_handler(CommandHandler("adminhelp", cmd_adminhelp))
         app.add_handler(CommandHandler("adminstats", cmd_adminstats))
         app.add_handler(CommandHandler("adminsubs", cmd_adminsubs))
@@ -783,6 +806,10 @@ def run_bot():
         app.add_handler(CommandHandler("resetalert", cmd_resetalert))
         app.add_handler(CommandHandler("forcealert", cmd_forcealert))
         app.add_handler(CommandHandler("runalerts", cmd_runalerts))
+
+        # Extra feature commands
+        register_extra_handlers(app)
+
         app.add_handler(CallbackQueryHandler(on_callback))
         print({"msg": "bot_start"})
 
@@ -800,10 +827,21 @@ def run_bot():
             pass
 
 def main():
+    # Core DB init + extras DB (user_settings)
     init_db()
+    init_extras()
+
+    # Health & heartbeats (single service)
     start_health_server()
     threading.Thread(target=bot_heartbeat_loop, daemon=True).start()
+
+    # Alerts evaluator loop
     threading.Thread(target=alerts_loop, daemon=True).start()
+
+    # Optional: background pump watcher (reads user opt-ins from user_settings)
+    start_pump_watcher()
+
+    # Telegram bot
     run_bot()
 
 if __name__ == "__main__":
