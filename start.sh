@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-# Safety: make sure we are in repo root
+# Move to repo root (where this script lives)
 cd "$(dirname "$0")"
 
-# Show versions (handy in Render logs)
+# Diagnostics
 python -V
 pip -V
 
-# Run the single-process server:
-# - starts FastAPI health server (binds $PORT)
-# - runs Telegram bot (polling)
-# - runs alerts loop
+# Run the single-process server (bot + alerts + health + alerts loop)
 exec python server_combined.py
