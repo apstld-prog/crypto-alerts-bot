@@ -4,7 +4,9 @@
 # - Funding rates (Binance futures)
 # - Top movers (24h, Binance spot)
 # - Quick chart URL helper
-# - Crypto news from RSS (CoinDesk, Cointelegraph by default)
+# - Crypto news from RSS (with graceful fallbacks to curated links)
+
+from __future__ import annotations
 
 import os
 import time
@@ -40,9 +42,8 @@ def _http_get_text(url: str, params: dict | None = None, headers: dict | None = 
         return None
 
 # ---------- Fear & Greed ----------
-# Using alternative API with simple JSON response
 def get_fear_greed() -> Optional[dict]:
-    # Try alternative free source (feargreedindices.com mirror API)
+    # Simple, free source
     url = "https://api.alternative.me/fng/"
     data = _http_get_json(url, params={"limit": 1})
     if not data or "data" not in data or not data["data"]:
@@ -81,11 +82,9 @@ def _binance_funding_rate(symbol: Optional[str] = None) -> Optional[List[dict]]:
     # API returns dict for one symbol, or list for all
     return data if isinstance(data, list) else [data]
 
-# Symbol normalization
 def _is_usdt_pair(sym: str) -> bool:
     return sym.endswith("USDT")
 
-# External resolver can map BTC -> BTCUSDT, but provide a basic one here as fallback
 def normalize_symbol(sym: str) -> Optional[str]:
     s = (sym or "").upper().strip()
     if not s:
@@ -162,18 +161,32 @@ def get_top_movers(direction: str, limit: int = 10) -> List[Tuple[str, float]]:
 
 # ---------- Quick chart ----------
 def make_quickchart_url(symbol: str) -> Optional[str]:
-    # We will just produce a link to Binance 1h klines (24 points) rendered by quickchart.io
-    # Simpler: return a TradingView mini chart link if you prefer. For now, return None if symbol invalid.
     sym = normalize_symbol(symbol)
     if not sym:
         return None
-    # QuickView: provide a simple Binance symbol page as a fallback link
+    # simple public page (safe for Telegram previews)
     return f"https://www.binance.com/en/trade/{sym[:-4]}_USDT"
 
 # ---------- News (RSS) ----------
+# You can override these from .env via NEWS_FEEDS="url1,url2, ..."
 _DEFAULT_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "https://cointelegraph.com/rss"
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+    "https://cryptoslate.com/feed/",
+    "https://bitcoinmagazine.com/.rss/full/",
+    "https://www.theblock.co/rss",           # some items may be paywalled
+]
+
+# If ALL feeds fail, we still return a curated list of portals.
+_FALLBACK_PORTALS: List[Tuple[str, str]] = [
+    ("CoinDesk — Latest", "https://www.coindesk.com/"),
+    ("Cointelegraph — Latest", "https://cointelegraph.com/"),
+    ("Decrypt — News", "https://decrypt.co/news"),
+    ("Bitcoin Magazine — News", "https://bitcoinmagazine.com/"),
+    ("CryptoSlate — News", "https://cryptoslate.com/news/"),
+    ("The Block — News", "https://www.theblock.co/"),
+    ("Binance Blog", "https://www.binance.com/en/blog"),
 ]
 
 def _get_news_feeds() -> List[str]:
@@ -197,7 +210,7 @@ def _parse_rss(xml_text: str) -> List[Tuple[str, str, Optional[str]]]:
         return []
     items: List[Tuple[str, str, Optional[str]]] = []
 
-    # Try RSS 2.0
+    # RSS 2.0
     for item in root.findall(".//item"):
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
@@ -205,7 +218,7 @@ def _parse_rss(xml_text: str) -> List[Tuple[str, str, Optional[str]]]:
         if title and link:
             items.append((html.unescape(title), link, html.unescape(desc) if desc else None))
 
-    # Try Atom
+    # Atom
     if not items:
         ns = {"a": "http://www.w3.org/2005/Atom"}
         for entry in root.findall(".//a:entry", ns):
@@ -219,11 +232,22 @@ def _parse_rss(xml_text: str) -> List[Tuple[str, str, Optional[str]]]:
 
     return items
 
+def _fallback_links(limit: int) -> List[Tuple[str, str]]:
+    # Return curated portals (title, url)
+    out: List[Tuple[str, str]] = []
+    for title, url in _FALLBACK_PORTALS:
+        out.append((title, url))
+        if len(out) >= max(1, limit):
+            break
+    return out
+
 def get_news_headlines(limit: int = 5, keyword: Optional[str] = None) -> List[Tuple[str, str]]:
     """
     Fetch crypto news from RSS feeds. If keyword provided, filter by it.
     Returns list of (title, url).
+    If all feeds fail, returns curated portal links so /news always shows something useful.
     """
+    limit = max(1, min(50, int(limit or 5)))
     feeds = _get_news_feeds()
     results: List[Tuple[str, str]] = []
     key = (keyword or "").lower().strip()
@@ -238,9 +262,14 @@ def get_news_headlines(limit: int = 5, keyword: Optional[str] = None) -> List[Tu
                 continue
             # Deduplicate by link
             if not any(link == r[1] for r in results):
-                results.append((title, link))
-            if len(results) >= max(50, limit):  # keep plenty; final trim happens below
+                results.append((title.replace("\n", " ").strip(), link))
+            if len(results) >= limit:
                 break
+        if len(results) >= limit:
+            break
 
-    # Final trim to requested limit
+    # Fallback to curated portals if nothing retrieved
+    if not results:
+        return _fallback_links(limit)
+
     return results[:limit]
