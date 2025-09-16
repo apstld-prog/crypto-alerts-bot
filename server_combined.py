@@ -9,6 +9,7 @@
 # Includes:
 # - /start with all features sections
 # - /listalts + /price fallback for off-Binance tokens (altcoins_info.py)
+# - FIX: commit on inline Delete to ensure alert removal
 
 from __future__ import annotations
 
@@ -355,7 +356,10 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await target_msg(update).reply_text(f"❌ Could not create alert: {e}")
 
 def _alert_buttons(aid: int, seq: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(f"🗑️ Delete A{seq}", callback_data=f"del:{aid}")]])
+    # Inline "Delete" button uses callback_data with the alert id
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️ Delete", callback_data=f"del:{aid}")]
+    ])
 
 async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
@@ -389,6 +393,7 @@ async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     with session_scope() as session:
         res = session.execute(text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"), {"id": aid, "uid": plan.user_id})
+        session.commit()
         deleted = res.rowcount or 0
     await target_msg(update).reply_text("Alert (ID {0}) deleted.".format(aid) if deleted else "Nothing deleted. Check the id (or ownership).")
 
@@ -400,6 +405,7 @@ async def cmd_clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     with session_scope() as session:
         res = session.execute(text("DELETE FROM alerts WHERE user_id=:uid"), {"uid": plan.user_id})
+        session.commit()
         deleted = res.rowcount or 0
     await target_msg(update).reply_text(f"Deleted {deleted} alert(s).")
 
@@ -630,6 +636,7 @@ async def cmd_resetalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await target_msg(update).reply_text(f"Alert {aid} not found")
             return
         session.execute(text("UPDATE alerts SET last_fired_at = NULL, last_met = FALSE WHERE id=:id"), {"id": aid})
+        session.commit()
     await target_msg(update).reply_text(f"Alert (ID {aid}) reset (last_fired_at=NULL, last_met=FALSE).")
 
 async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -680,22 +687,36 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Send a message to support:\n/support <your message>", reply_markup=upgrade_keyboard(tg_id))
         return
 
+    # Inline delete
     if data.startswith("del:"):
         try:
             aid = int(data.split(":", 1)[1])
         except Exception:
             await query.edit_message_text("Bad id.")
             return
+
         with session_scope() as session:
-            owner = session.execute(text("SELECT user_id, user_seq FROM alerts WHERE id=:id"), {"id": aid}).first()
+            owner = session.execute(
+                text("SELECT user_id, user_seq FROM alerts WHERE id=:id"),
+                {"id": aid}
+            ).first()
             if not owner:
                 await query.edit_message_text("Alert not found.")
                 return
             if owner.user_id != plan.user_id:
                 await query.edit_message_text("You can delete only your own alerts.")
                 return
-            session.execute(text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"), {"id": aid, "uid": plan.user_id})
-        await query.edit_message_text(f"✅ Deleted alert A{owner.user_seq if owner.user_seq is not None else aid}.")
+
+            res = session.execute(
+                text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"),
+                {"id": aid, "uid": plan.user_id}
+            )
+            session.commit()  # <<< ensure deletion persists
+
+        await query.edit_message_text(
+            f"✅ Deleted alert A{owner.user_seq if owner.user_seq is not None else aid}."
+        )
+        return
 
 # ───────── Loops ─────────
 def alerts_loop():
@@ -760,7 +781,7 @@ def run_bot():
         app.add_handler(CommandHandler("help", cmd_help))
         app.add_handler(CommandHandler("whoami", cmd_whoami))
         app.add_handler(CommandHandler("price", cmd_price))
-        app.add_handler(CommandHandler("listalts", cmd_listalts))  # ensure handler exists
+        app.add_handler(CommandHandler("listalts", cmd_listalts))  # off-Binance list
         app.add_handler(CommandHandler("setalert", cmd_setalert))
         app.add_handler(CommandHandler("myalerts", cmd_myalerts))
         app.add_handler(CommandHandler("delalert", cmd_delalert))
@@ -778,7 +799,7 @@ def run_bot():
         app.add_handler(CommandHandler("testalert", cmd_testalert))
         app.add_handler(CommandHandler("runalerts", cmd_runalerts))
 
-        # Extra features
+        # Extra feature commands
         register_extra_handlers(app)
 
         app.add_handler(CallbackQueryHandler(on_callback))
