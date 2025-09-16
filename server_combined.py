@@ -199,7 +199,7 @@ def start_text() -> str:
         "<b>Crypto Alerts Bot</b>\n"
         "⚡ Fast prices • 🧪 Diagnostics • 🔔 Alerts\n\n"
         "<b>Getting Started</b>\n"
-        "• <a href=\"tg://resolve?domain=\">/price BTC</a> — current price\n"
+        "• <code>/price BTC</code> — current price\n"
         "• <code>/setalert BTC &gt; 110000</code> — alert when condition is met\n"
         "• <code>/myalerts</code> — list your active alerts (with delete buttons)\n"
         "• <code>/help</code> — instructions\n"
