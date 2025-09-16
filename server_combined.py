@@ -4,12 +4,11 @@
 # - Telegram Bot (polling)
 # - Alerts loop (background)
 # - Extra features (Fear&Greed, Funding, Gainers/Losers, Chart, News, DCA, Pump alerts, Daily news)
-# - Free plan (10 alerts) vs Premium (unlimited), via plans.py
+# - Free plan (10 alerts) vs Premium (unlimited)
 #
-# Notes:
-# - /whale command is disabled in commands_extra.py and removed from /help text.
-# - /start message shows Getting Started, Extra Features (incl. futures tools), Premium/Free, Supported pairs.
-# - Off-Binance tokens supported via /listalts and /price fallback (altcoins_info.py).
+# Includes:
+# - /start with all features sections
+# - /listalts + /price fallback for off-Binance tokens (altcoins_info.py)
 
 from __future__ import annotations
 
@@ -51,7 +50,7 @@ WEB_URL = (os.getenv("WEB_URL") or "").strip() or None
 ADMIN_KEY = (os.getenv("ADMIN_KEY") or "").strip() or None
 
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
-FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "10"))  # shown in /start
+FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "10"))
 
 PAYPAL_PLAN_ID = (os.getenv("PAYPAL_PLAN_ID") or "").strip() or None
 PAYPAL_SUBSCRIBE_URL = (os.getenv("PAYPAL_SUBSCRIBE_URL") or "").strip() or None
@@ -200,7 +199,6 @@ def upgrade_keyboard(tg_id: str | None):
     return None
 
 def start_text() -> str:
-    # Rich welcome with Getting Started + Extra Features (incl. futures) + Plans + Supported pairs + Off-Binance section
     return (
         "<b>Crypto Alerts Bot</b>\n"
         "⚡ Fast prices • 🧪 Diagnostics • 🔔 Alerts\n\n"
@@ -261,13 +259,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/requestcoin &lt;SYMBOL&gt;</code> → request new coin\n"
         "• <code>/adminhelp</code> → admin commands\n\n"
         "<b>Extra Features</b>\n"
-        "• <code>/feargreed</code> → Fear &amp; Greed Index\n"
-        "• <code>/funding [SYMBOL]</code> → futures funding rate\n"
-        "• <code>/topgainers</code>, <code>/toplosers</code>\n"
-        "• <code>/chart &lt;SYMBOL&gt;</code> → mini 24h chart\n"
-        "• <code>/news [N]</code> → latest crypto headlines\n"
+        "• <code>/feargreed</code> • <code>/funding [SYMBOL]</code>\n"
+        "• <code>/topgainers</code> • <code>/toplosers</code>\n"
+        "• <code>/chart &lt;SYMBOL&gt;</code> • <code>/news [N]</code>\n"
         "• <code>/dca &lt;amount&gt; &lt;buys&gt; &lt;symbol&gt;</code>\n"
-        "• <code>/pumplive on|off [threshold%]</code> → live pump alerts\n"
+        "• <code>/pumplive on|off [threshold%]</code>\n"
         "• <code>/listalts</code> → curated off-Binance tokens\n"
     )
     for chunk in safe_chunks(help_html):
@@ -438,6 +434,20 @@ async def cmd_cancel_autorenew(update: Update, context: ContextTypes.DEFAULT_TYP
             await target_msg(update).reply_text(f"Cancel failed: {r.text}")
     except Exception as e:
         await target_msg(update).reply_text(f"Cancel error: {e}")
+
+# --- NEW: /listalts ---
+async def cmd_listalts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    syms = list_off_binance()
+    if not syms:
+        await target_msg(update).reply_text("No curated off-Binance tokens configured yet.")
+        return
+    lines = ["🌱 <b>Curated Off-Binance Tokens</b>"]
+    for s in syms:
+        info = get_off_binance_info(s)
+        name = info.get("name", s) if info else s
+        lines.append(f"• <code>{s}</code> — {name}")
+    lines.append("\nTip: try <code>/price HYPER</code> or <code>/price OZ</code> for info links.")
+    await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 ADMIN_HELP = (
     "Admin Commands\n\n"
@@ -750,7 +760,7 @@ def run_bot():
         app.add_handler(CommandHandler("help", cmd_help))
         app.add_handler(CommandHandler("whoami", cmd_whoami))
         app.add_handler(CommandHandler("price", cmd_price))
-        app.add_handler(CommandHandler("listalts", cmd_listalts))  # Off-Binance list
+        app.add_handler(CommandHandler("listalts", cmd_listalts))  # ensure handler exists
         app.add_handler(CommandHandler("setalert", cmd_setalert))
         app.add_handler(CommandHandler("myalerts", cmd_myalerts))
         app.add_handler(CommandHandler("delalert", cmd_delalert))
@@ -768,7 +778,7 @@ def run_bot():
         app.add_handler(CommandHandler("testalert", cmd_testalert))
         app.add_handler(CommandHandler("runalerts", cmd_runalerts))
 
-        # Extra feature commands (feargreed, funding, topgainers/losers, chart, news, dca, pumplive, dailynews, whale-disabled)
+        # Extra features
         register_extra_handlers(app)
 
         app.add_handler(CallbackQueryHandler(on_callback))
@@ -788,21 +798,16 @@ def run_bot():
             pass
 
 def main():
-    # Core DB init + extras DB (user_settings)
     init_db()
     init_extras()
 
-    # Health & heartbeats (single service)
     start_health_server()
     threading.Thread(target=bot_heartbeat_loop, daemon=True).start()
 
-    # Alerts evaluator loop
     threading.Thread(target=alerts_loop, daemon=True).start()
 
-    # Optional: background pump watcher (also starts daily news scheduler)
     start_pump_watcher()
 
-    # Telegram bot
     run_bot()
 
 if __name__ == "__main__":
