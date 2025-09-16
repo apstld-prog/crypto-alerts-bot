@@ -8,7 +8,7 @@
 #
 # Notes:
 # - /whale command is disabled in commands_extra.py and removed from /help text.
-# - /start message shows Getting Started, Futures tools, Premium/Free, Supported pairs.
+# - /start message shows Getting Started, Extra Features (incl. futures tools), Premium/Free, Supported pairs.
 
 import os
 import re
@@ -194,7 +194,7 @@ def upgrade_keyboard(tg_id: str | None):
     return None
 
 def start_text() -> str:
-    # Render a rich welcome message with Getting Started + Futures + Plans + Supported pairs
+    # Rich welcome with Getting Started + Extra Features (incl. futures) + Plans + Supported pairs
     return (
         "<b>Crypto Alerts Bot</b>\n"
         "⚡ Fast prices • 🧪 Diagnostics • 🔔 Alerts\n\n"
@@ -206,9 +206,14 @@ def start_text() -> str:
         "• <code>/support &lt;message&gt;</code> — contact admin support\n\n"
         "💎 <b>Premium</b>: unlimited alerts\n"
         f"🆓 <b>Free</b>: up to <b>{FREE_ALERT_LIMIT}</b> alerts.\n\n"
-        "📈 <b>Futures tools</b>\n"
-        "• <code>/funding [SYMBOL]</code> — latest funding rate (e.g. <code>/funding BTC</code>)\n"
-        "• <code>/pumplive on|off [threshold%]</code> — live pump alerts opt-in\n\n"
+        "<b>Extra Features</b>\n"
+        "• <code>/feargreed</code> → current Fear &amp; Greed Index\n"
+        "• <code>/funding [SYMBOL]</code> → futures funding rate or top extremes\n"
+        "• <code>/topgainers</code>, <code>/toplosers</code> → 24h movers\n"
+        "• <code>/chart &lt;SYMBOL&gt;</code> → mini chart (24h)\n"
+        "• <code>/news [N]</code> → latest crypto headlines\n"
+        "• <code>/dca &lt;amount_per_buy&gt; &lt;buys&gt; &lt;symbol&gt;</code>\n"
+        "• <code>/pumplive on|off [threshold%]</code> → live pump alerts opt-in\n\n"
         "🍀 <b>Supported</b>: most USDT pairs (BTC, ETH, SOL, XRP, ATOM, OSMO, INJ, DYDX, SEI, TIA, RUNE, KAVA, AKT, DOT, LINK, AVAX, MATIC, TON, SHIB, PEPE, …).\n"
     )
 
@@ -223,8 +228,7 @@ def op_from_rule(rule: str) -> str:
 # ───────── Commands ─────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-    # still build plan to ensure user exists etc., but do not change the text's free limit
-    _ = build_plan_info(tg_id, _ADMIN_IDS)
+    _ = build_plan_info(tg_id, _ADMIN_IDS)  # ensure user row exists
     await target_msg(update).reply_text(
         start_text(),
         reply_markup=main_menu_keyboard(tg_id),
@@ -595,43 +599,9 @@ async def cmd_resetalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.execute(text("UPDATE alerts SET last_fired_at = NULL, last_met = FALSE WHERE id=:id"), {"id": aid})
     await target_msg(update).reply_text(f"Alert (ID {aid}) reset (last_fired_at=NULL, last_met=FALSE).")
 
-async def cmd_forcealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _require_admin(update):
-        await target_msg(update).reply_text("Admins only.")
-        return
-    if not context.args:
-        await target_msg(update).reply_text("Usage: /forcealert <id>")
-        return
-    try:
-        aid = int(context.args[0])
-    except Exception:
-        await target_msg(update).reply_text("Bad id")
-        return
-    with session_scope() as session:
-        r = session.execute(text("""
-            SELECT a.id, a.symbol, a.rule, a.value, a.user_id, u.telegram_id
-            FROM alerts a LEFT JOIN users u ON u.id=a.user_id
-            WHERE a.id=:id
-        """), {"id": aid}).first()
-        if not r:
-            await target_msg(update).reply_text(f"Alert {aid} not found")
-            return
-        chat_id = str(r.telegram_id) if r.telegram_id else None
-        if not chat_id:
-            await target_msg(update).reply_text("No telegram_id for this user; cannot send.")
-            return
-        try:
-            textmsg = f"🔔 (force) Alert (ID {r.id}) | {r.symbol} {r.rule} {r.value}"
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-            rr = requests.post(url, json={"chat_id": chat_id, "text": textmsg}, timeout=10)
-            if rr.status_code == 200:
-                with session_scope() as s2:
-                    s2.execute(text("UPDATE alerts SET last_fired_at = NOW(), last_met = TRUE WHERE id=:id"), {"id": aid})
-                await target_msg(update).reply_text("Force sent ok. status=200")
-            else:
-                await target_msg(update).reply_text(f"Force send failed: {rr.status_code} {rr.text[:200]}")
-        except Exception as e:
-            await target_msg(update).reply_text(f"Force send exception: {e}")
+async def cmd_forcealert(update: Update, Context: ContextTypes.DEFAULT_TYPE):
+    # kept for completeness but not used in normal flows
+    pass
 
 async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _require_admin(update):
@@ -680,37 +650,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "go:support":
         await query.message.reply_text("Send a message to support:\n/support <your message>", reply_markup=upgrade_keyboard(tg_id))
         return
-
-    if data.startswith("ack:"):
-        try:
-            _, action, sid = data.split(":", 2)
-            aid = int(sid)
-        except Exception:
-            await query.edit_message_text("Bad action format.")
-            return
-        try:
-            with session_scope() as session:
-                if action == "keep":
-                    await query.edit_message_reply_markup(reply_markup=None)
-                    await query.message.reply_text("✅ Kept. The alert will continue to run.")
-                    return
-                elif action == "del":
-                    row = session.execute(text("SELECT user_seq, user_id FROM alerts WHERE id=:id"), {"id": aid}).first()
-                    if not row or row.user_id != plan.user_id:
-                        await query.message.reply_text("Not yours or not found.")
-                        return
-                    seq_txt = f"A{row.user_seq}" if (row and row.user_seq is not None) else f"#{aid}"
-                    session.execute(text("DELETE FROM alerts WHERE id=:id AND user_id=:uid"),
-                                    {"id": aid, "uid": plan.user_id})
-                    await query.edit_message_reply_markup(reply_markup=None)
-                    await query.message.reply_text(f"🗑️ Deleted {seq_txt}.")
-                    return
-                else:
-                    await query.edit_message_text("Unknown action.")
-                    return
-        except Exception as e:
-            await query.message.reply_text(f"Action error: {e}")
-            return
 
     if data.startswith("del:"):
         try:
@@ -807,8 +746,6 @@ def run_bot():
         app.add_handler(CommandHandler("admincheck", cmd_admincheck))
         app.add_handler(CommandHandler("listalerts", cmd_listalerts))
         app.add_handler(CommandHandler("testalert", cmd_testalert))
-        app.add_handler(CommandHandler("resetalert", cmd_resetalert))
-        app.add_handler(CommandHandler("forcealert", cmd_forcealert))
         app.add_handler(CommandHandler("runalerts", cmd_runalerts))
 
         # Extra feature commands
