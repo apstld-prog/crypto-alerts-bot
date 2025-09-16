@@ -9,6 +9,9 @@
 # Notes:
 # - /whale command is disabled in commands_extra.py and removed from /help text.
 # - /start message shows Getting Started, Extra Features (incl. futures tools), Premium/Free, Supported pairs.
+# - Off-Binance tokens supported via /listalts and /price fallback (altcoins_info.py).
+
+from __future__ import annotations
 
 import os
 import re
@@ -38,6 +41,9 @@ from models_extras import init_extras
 
 # ---- Plans ----
 from plans import build_plan_info, can_create_alert, plan_status_line
+
+# ---- Off-Binance info tokens ----
+from altcoins_info import get_off_binance_info, list_off_binance
 
 # ───────── ENV ─────────
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
@@ -194,7 +200,7 @@ def upgrade_keyboard(tg_id: str | None):
     return None
 
 def start_text() -> str:
-    # Rich welcome with Getting Started + Extra Features (incl. futures) + Plans + Supported pairs
+    # Rich welcome with Getting Started + Extra Features (incl. futures) + Plans + Supported pairs + Off-Binance section
     return (
         "<b>Crypto Alerts Bot</b>\n"
         "⚡ Fast prices • 🧪 Diagnostics • 🔔 Alerts\n\n"
@@ -214,6 +220,9 @@ def start_text() -> str:
         "• <code>/news [N]</code> → latest crypto headlines\n"
         "• <code>/dca &lt;amount_per_buy&gt; &lt;buys&gt; &lt;symbol&gt;</code>\n"
         "• <code>/pumplive on|off [threshold%]</code> → live pump alerts opt-in\n\n"
+        "🌱 <b>New &amp; Off-Binance</b>\n"
+        "• <code>/listalts</code> — curated off-Binance tokens (presales/community)\n"
+        "• <code>/price HYPER</code> or <code>/price OZ</code> → info links if not on Binance yet\n\n"
         "🍀 <b>Supported</b>: most USDT pairs (BTC, ETH, SOL, XRP, ATOM, OSMO, INJ, DYDX, SEI, TIA, RUNE, KAVA, AKT, DOT, LINK, AVAX, MATIC, TON, SHIB, PEPE, …).\n"
     )
 
@@ -259,6 +268,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/news [N]</code> → latest crypto headlines\n"
         "• <code>/dca &lt;amount&gt; &lt;buys&gt; &lt;symbol&gt;</code>\n"
         "• <code>/pumplive on|off [threshold%]</code> → live pump alerts\n"
+        "• <code>/listalts</code> → curated off-Binance tokens\n"
     )
     for chunk in safe_chunks(help_html):
         await target_msg(update).reply_text(
@@ -278,16 +288,29 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = (context.args[0] if context.args else "BTC").upper()
     pair = resolve_symbol(symbol)
-    if not pair:
-        await target_msg(update).reply_text(
-            "Unknown symbol. Try BTC, ETH, SOL, XRP, ATOM, OSMO, INJ, DYDX, SEI, TIA, RUNE, KAVA, AKT, DOT, LINK, AVAX, MATIC, TON, SHIB, PEPE ..."
-        )
+
+    if pair:
+        price = fetch_price_binance(pair)
+        if price is None:
+            await target_msg(update).reply_text("Price fetch failed. Try again later.")
+            return
+        await target_msg(update).reply_text(f"{pair}: {price:.6f} USDT")
         return
-    price = fetch_price_binance(pair)
-    if price is None:
-        await target_msg(update).reply_text("Price fetch failed. Try again later.")
+
+    # Fallback: Off-Binance info coin
+    info = get_off_binance_info(symbol)
+    if info:
+        lines = [f"ℹ️ <b>{info.get('name', symbol)}</b>\n{info.get('note','')}".strip()]
+        for title, url in info.get("links", []):
+            lines.append(f"• <a href=\"{url}\">{title}</a>")
+        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=False)
         return
-    await target_msg(update).reply_text(f"{pair}: {price:.6f} USDT")
+
+    await target_msg(update).reply_text(
+        "Unknown symbol for Binance price. Try BTC, ETH, SOL, ...\n"
+        "Or see <code>/listalts</code> for off-Binance tokens.",
+        parse_mode=ParseMode.HTML
+    )
 
 ALERT_RE = re.compile(r"^(?P<sym>[A-Za-z0-9/]+)\s*(?P<op>>|<)\s*(?P<val>[0-9]+(\.[0-9]+)?)$")
 
@@ -599,10 +622,6 @@ async def cmd_resetalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.execute(text("UPDATE alerts SET last_fired_at = NULL, last_met = FALSE WHERE id=:id"), {"id": aid})
     await target_msg(update).reply_text(f"Alert (ID {aid}) reset (last_fired_at=NULL, last_met=FALSE).")
 
-async def cmd_forcealert(update: Update, Context: ContextTypes.DEFAULT_TYPE):
-    # kept for completeness but not used in normal flows
-    pass
-
 async def cmd_runalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _require_admin(update):
         await target_msg(update).reply_text("Admins only.")
@@ -731,6 +750,7 @@ def run_bot():
         app.add_handler(CommandHandler("help", cmd_help))
         app.add_handler(CommandHandler("whoami", cmd_whoami))
         app.add_handler(CommandHandler("price", cmd_price))
+        app.add_handler(CommandHandler("listalts", cmd_listalts))  # Off-Binance list
         app.add_handler(CommandHandler("setalert", cmd_setalert))
         app.add_handler(CommandHandler("myalerts", cmd_myalerts))
         app.add_handler(CommandHandler("delalert", cmd_delalert))
@@ -748,7 +768,7 @@ def run_bot():
         app.add_handler(CommandHandler("testalert", cmd_testalert))
         app.add_handler(CommandHandler("runalerts", cmd_runalerts))
 
-        # Extra feature commands
+        # Extra feature commands (feargreed, funding, topgainers/losers, chart, news, dca, pumplive, dailynews, whale-disabled)
         register_extra_handlers(app)
 
         app.add_handler(CallbackQueryHandler(on_callback))
