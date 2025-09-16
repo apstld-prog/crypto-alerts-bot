@@ -3,12 +3,12 @@
 # - FastAPI health server
 # - Telegram Bot (polling)
 # - Alerts loop (background)
-# - Extra features (Fear&Greed, Funding, Gainers/Losers, Chart, News, DCA, Pump alerts)
+# - Extra features (Fear&Greed, Funding, Gainers/Losers, Chart, News, DCA, Pump alerts, Daily news)
 # - Free plan (10 alerts) vs Premium (unlimited), via plans.py
 #
 # Notes:
 # - /whale command is disabled in commands_extra.py and removed from /help text.
-# - /start message now includes a "Futures tools" section so users see futures capabilities.
+# - /start message shows Getting Started, Futures tools, Premium/Free, Supported pairs.
 
 import os
 import re
@@ -45,7 +45,7 @@ WEB_URL = (os.getenv("WEB_URL") or "").strip() or None
 ADMIN_KEY = (os.getenv("ADMIN_KEY") or "").strip() or None
 
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
-FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "10"))
+FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "10"))  # shown in /start
 
 PAYPAL_PLAN_ID = (os.getenv("PAYPAL_PLAN_ID") or "").strip() or None
 PAYPAL_SUBSCRIBE_URL = (os.getenv("PAYPAL_SUBSCRIBE_URL") or "").strip() or None
@@ -193,28 +193,23 @@ def upgrade_keyboard(tg_id: str | None):
         return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade with PayPal", url=u)]])
     return None
 
-def start_text(limit: int) -> str:
-    # Start message includes Futures tools so users see the capability.
+def start_text() -> str:
+    # Render a rich welcome message with Getting Started + Futures + Plans + Supported pairs
     return (
         "<b>Crypto Alerts Bot</b>\n"
-        "⚡️ <i>Fast prices</i> • 🧪 <i>Diagnostics</i> • 🔔 <i>Alerts</i>\n\n"
-        "<b>Plans</b>\n"
-        f"🆓 <b>Free</b>: up to <b>{limit}</b> active alerts\n"
-        "💎 <b>Premium</b>: unlimited alerts\n\n"
-        "<b>Core</b>\n"
-        "• <code>/price BTC</code> — current price\n"
+        "⚡ Fast prices • 🧪 Diagnostics • 🔔 Alerts\n\n"
+        "<b>Getting Started</b>\n"
+        "• <a href=\"tg://resolve?domain=\">/price BTC</a> — current price\n"
         "• <code>/setalert BTC &gt; 110000</code> — alert when condition is met\n"
-        "• <code>/myalerts</code> — manage your alerts\n"
-        "• <code>/help</code> — all commands\n\n"
-        "<b>Futures tools</b>\n"
+        "• <code>/myalerts</code> — list your active alerts (with delete buttons)\n"
+        "• <code>/help</code> — instructions\n"
+        "• <code>/support &lt;message&gt;</code> — contact admin support\n\n"
+        "💎 <b>Premium</b>: unlimited alerts\n"
+        f"🆓 <b>Free</b>: up to <b>{FREE_ALERT_LIMIT}</b> alerts.\n\n"
+        "📈 <b>Futures tools</b>\n"
         "• <code>/funding [SYMBOL]</code> — latest funding rate (e.g. <code>/funding BTC</code>)\n"
-        "• <code>/pumplive on|off [threshold%]</code> — live pump alerts opt-in (default 10%)\n\n"
-        "<b>More tools</b>\n"
-        "• <code>/feargreed</code> — Fear &amp; Greed Index\n"
-        "• <code>/topgainers</code>, <code>/toplosers</code> — 24h movers\n"
-        "• <code>/chart &lt;SYMBOL&gt;</code> — mini 24h chart\n"
-        "• <code>/news [N]</code> — latest crypto headlines\n"
-        "• <code>/dca &lt;amount&gt; &lt;buys&gt; &lt;symbol&gt;</code>\n"
+        "• <code>/pumplive on|off [threshold%]</code> — live pump alerts opt-in\n\n"
+        "🍀 <b>Supported</b>: most USDT pairs (BTC, ETH, SOL, XRP, ATOM, OSMO, INJ, DYDX, SEI, TIA, RUNE, KAVA, AKT, DOT, LINK, AVAX, MATIC, TON, SHIB, PEPE, …).\n"
     )
 
 def safe_chunks(s: str, limit: int = 3800):
@@ -228,10 +223,10 @@ def op_from_rule(rule: str) -> str:
 # ───────── Commands ─────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-    plan = build_plan_info(tg_id, _ADMIN_IDS)
-    user_limit = 9999 if plan.has_unlimited else plan.free_limit
+    # still build plan to ensure user exists etc., but do not change the text's free limit
+    _ = build_plan_info(tg_id, _ADMIN_IDS)
     await target_msg(update).reply_text(
-        start_text(user_limit),
+        start_text(),
         reply_markup=main_menu_keyboard(tg_id),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True
@@ -667,11 +662,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plan = build_plan_info(tg_id, _ADMIN_IDS)
 
     if data == "go:help":
-        await cmd_help(update, context)
-        return
+        await cmd_help(update, context); return
     if data == "go:myalerts":
-        await cmd_myalerts(update, context)
-        return
+        await cmd_myalerts(update, context); return
     if data.startswith("go:price:"):
         sym = data.split(":", 2)[2]
         pair = resolve_symbol(sym)
@@ -849,7 +842,7 @@ def main():
     # Alerts evaluator loop
     threading.Thread(target=alerts_loop, daemon=True).start()
 
-    # Optional: background pump watcher (reads user opt-ins from user_settings)
+    # Optional: background pump watcher (also starts daily news scheduler)
     start_pump_watcher()
 
     # Telegram bot
