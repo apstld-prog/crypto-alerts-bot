@@ -84,16 +84,13 @@ def resolve_symbol_auto(symbol: str | None) -> str | None:
     if not symbol:
         return None
     symbol = symbol.upper().strip()
-    # 1) Existing mapping
     pair = resolve_symbol(symbol)
     if pair:
         return pair
-    # 2) Try cached Binance pairs
     _refresh_binance_symbols()
     pair = _BINANCE_SYMBOLS.get(symbol)
     if pair:
         return pair
-    # 3) Force refresh once
     _refresh_binance_symbols(force=True)
     return _BINANCE_SYMBOLS.get(symbol)
 
@@ -154,9 +151,7 @@ def safe_chunks(s: str, limit: int = 3800):
 def op_from_rule(rule: str) -> str:
     return ">" if rule == "price_above" else "<"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# FastAPI health
-
+# ── FastAPI health ──
 health_app = FastAPI()
 _BOT_HEART_BEAT_AT = None
 _BOT_HEART_STATUS = "unknown"
@@ -228,9 +223,7 @@ def bot_heartbeat_loop():
         _BOT_HEART_BEAT_AT = datetime.utcnow()
         time.sleep(_BOT_HEART_INTERVAL)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Commands
-
+# ── Commands ──
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     _ = build_plan_info(tg_id, _ADMIN_IDS)  # ensure user exists
@@ -445,7 +438,7 @@ async def cmd_listpresales(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await target_msg(update).reply_text(f"Error: {e}")
 
-# ── Callback buttons (delete, keep, menu) ──
+# ── Callback buttons ──
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Loading...", show_alert=False)
@@ -571,7 +564,6 @@ def run_bot():
         app = (
             Application.builder()
             .token(BOT_TOKEN)
-            .get_updates_request_timeout(35)
             .read_timeout(40)
             .connect_timeout(15)
             .build()
@@ -619,15 +611,11 @@ def run_bot():
 
 def main():
     init_db(); init_extras()
-    # Health + heart
     port = int(os.getenv("PORT", "10000"))
     threading.Thread(target=lambda: uvicorn.run(health_app, host="0.0.0.0", port=port, log_level="info"), daemon=True).start()
     threading.Thread(target=bot_heartbeat_loop, daemon=True).start()
-    # Alerts loop
     threading.Thread(target=alerts_loop, daemon=True).start()
-    # Pump watcher
     start_pump_watcher()
-    # Bot
     run_bot()
 
 if __name__ == "__main__":
