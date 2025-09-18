@@ -1,11 +1,15 @@
 # server_combined.py
 from __future__ import annotations
 
-import os, re, time, threading
+import os
+import re
+import time
+import threading
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
 
-import requests, uvicorn
+import requests
+import uvicorn
 from fastapi import FastAPI, Query
 from fastapi.responses import RedirectResponse, PlainTextResponse, JSONResponse
 
@@ -15,17 +19,19 @@ from telegram.error import Conflict, TimedOut as TgTimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 from sqlalchemy import text
+
+# Local modules
 from db import init_db, session_scope, engine
 from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
-
 from commands_extra import register_extra_handlers
 from worker_extra import start_pump_watcher
 from models_extras import init_extras
-
 from plans import build_plan_info, can_create_alert, plan_status_line
 from altcoins_info import get_off_binance_info, list_off_binance, list_presales
+from commands_admin import register_admin_handlers  # Admin module
 
-# ── ENV ──
+# ─────────────────────────── ENV / CONFIG ───────────────────────────
+
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 WEB_URL = (os.getenv("WEB_URL") or "").strip() or None
 ADMIN_KEY = (os.getenv("ADMIN_KEY") or "").strip() or None
@@ -49,14 +55,14 @@ _BOT_HEART_TTL = int(os.getenv("BOT_HEART_TTL_SECONDS", "180"))
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Binance symbols cache (auto-detect new USDT listings)
+# ───────────────── Binance symbols cache (auto-detect) ──────────────
 
 _BINANCE_SYMBOLS: dict[str, str] = {}   # base → pair (e.g., BTC -> BTCUSDT)
 _BINANCE_LAST_FETCH = 0.0
 _BINANCE_TTL = int(os.getenv("BINANCE_EXCHANGEINFO_TTL", "3600"))  # seconds
 
 def _refresh_binance_symbols(force: bool = False):
+    """Refresh Binance USDT trading pairs and keep a base->symbol map."""
     global _BINANCE_LAST_FETCH, _BINANCE_SYMBOLS
     now = time.time()
     if (not force) and (now - _BINANCE_LAST_FETCH < _BINANCE_TTL) and _BINANCE_SYMBOLS:
@@ -81,21 +87,27 @@ def _refresh_binance_symbols(force: bool = False):
         print({"msg": "binance_symbols_error", "error": str(e)})
 
 def resolve_symbol_auto(symbol: str | None) -> str | None:
+    """Try current mapping, otherwise ask Binance (cached) for new listings."""
     if not symbol:
         return None
     symbol = symbol.upper().strip()
+    # 1) your static mapping (worker_logic.resolve_symbol)
     pair = resolve_symbol(symbol)
     if pair:
         return pair
+    # 2) cached Binance listing
     _refresh_binance_symbols()
     pair = _BINANCE_SYMBOLS.get(symbol)
     if pair:
         return pair
+    # 3) force refresh once
     _refresh_binance_symbols(force=True)
     return _BINANCE_SYMBOLS.get(symbol)
 
-# ── Small helpers ──
+# ───────────────────────── Small helpers ─────────────────────────────
+
 def target_msg(update: Update):
+    """Return a message target compatible with commands & callbacks."""
     return update.message or (update.callback_query.message if update.callback_query else None)
 
 def paypal_upgrade_url_for(tg_id: str | None) -> str | None:
@@ -151,7 +163,8 @@ def safe_chunks(s: str, limit: int = 3800):
 def op_from_rule(rule: str) -> str:
     return ">" if rule == "price_above" else "<"
 
-# ── FastAPI health ──
+# ─────────────────────────── FastAPI Health ─────────────────────────
+
 health_app = FastAPI()
 _BOT_HEART_BEAT_AT = None
 _BOT_HEART_STATUS = "unknown"
@@ -203,13 +216,6 @@ def paypal_start(tg: str | None = Query(None), plan_id: str | None = Query(None)
     except Exception as e:
         return PlainTextResponse(f"Redirect error: {e}", status_code=500)
 
-def start_health_server():
-    port = int(os.getenv("PORT", "10000"))
-    def _run():
-        uvicorn.run(health_app, host="0.0.0.0", port=port, log_level="info")
-    threading.Thread(target=_run, daemon=True).start()
-    print({"msg": "health_server_started", "port": port})
-
 def bot_heartbeat_loop():
     global _BOT_HEART_BEAT_AT, _BOT_HEART_STATUS
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
@@ -223,7 +229,8 @@ def bot_heartbeat_loop():
         _BOT_HEART_BEAT_AT = datetime.utcnow()
         time.sleep(_BOT_HEART_INTERVAL)
 
-# ── Commands ──
+# ─────────────────────────── Bot Commands ──────────────────────────
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     _ = build_plan_info(tg_id, _ADMIN_IDS)  # ensure user exists
@@ -277,7 +284,6 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await target_msg(update).reply_text(f"{pair}: {price:.6f} USDT")
         return
-    # Fallback to curated info
     info = get_off_binance_info(symbol)
     if info:
         lines = [f"ℹ️ <b>{info.get('name', symbol)}</b>\n{info.get('note','')}".strip()]
@@ -394,7 +400,8 @@ async def cmd_clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.commit()
     await target_msg(update).reply_text("All your alerts were deleted.")
 
-# ── Alts / Presales ──
+# ─────────────────────────── Alts / Presales ───────────────────────
+
 async def cmd_alts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not context.args:
@@ -438,7 +445,8 @@ async def cmd_listpresales(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await target_msg(update).reply_text(f"Error: {e}")
 
-# ── Callback buttons ──
+# ────────────────────── Callback buttons (inline) ───────────────────
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Loading...", show_alert=False)
@@ -512,7 +520,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("Deleted.")
             return
 
-# ── Worker loop ──
+# ─────────────────────────── Worker loop ───────────────────────────
+
 def alerts_loop():
     global _ALERTS_LAST_OK_AT, _ALERTS_LAST_RESULT
     if not RUN_ALERTS:
@@ -547,6 +556,8 @@ def delete_webhook_if_any():
     except Exception as e:
         print({"msg": "delete_webhook_exception", "error": str(e)})
 
+# ─────────────────────────── Run bot (polling) ─────────────────────
+
 def run_bot():
     if not RUN_BOT:
         print({"msg": "bot_disabled_env"}); return
@@ -569,7 +580,7 @@ def run_bot():
             .build()
         )
 
-        # Core
+        # Core commands
         app.add_handler(CommandHandler("start", cmd_start))
         app.add_handler(CommandHandler("help", cmd_help))
         app.add_handler(CommandHandler("whoami", cmd_whoami))
@@ -582,10 +593,15 @@ def run_bot():
         app.add_handler(CommandHandler("delalert", cmd_delalert))
         app.add_handler(CommandHandler("clearalerts", cmd_clearalerts))
 
-        # Extras
+        # Extras (funding/topgainers/chart/news/dca/pumplive etc.)
         register_extra_handlers(app)
 
+        # Admin module
+        register_admin_handlers(app, _ADMIN_IDS)
+
+        # Callback queries (inline buttons)
         app.add_handler(CallbackQueryHandler(on_callback))
+
         print({"msg": "bot_start"})
 
         backoff = 5
@@ -609,13 +625,27 @@ def run_bot():
         except Exception:
             pass
 
+# ─────────────────────────── Entry point ───────────────────────────
+
 def main():
-    init_db(); init_extras()
+    init_db()
+    init_extras()
+
+    # Health server & heartbeat
     port = int(os.getenv("PORT", "10000"))
-    threading.Thread(target=lambda: uvicorn.run(health_app, host="0.0.0.0", port=port, log_level="info"), daemon=True).start()
+    threading.Thread(
+        target=lambda: uvicorn.run(health_app, host="0.0.0.0", port=port, log_level="info"),
+        daemon=True
+    ).start()
     threading.Thread(target=bot_heartbeat_loop, daemon=True).start()
+
+    # Alerts worker
     threading.Thread(target=alerts_loop, daemon=True).start()
+
+    # Pump watcher (extra)
     start_pump_watcher()
+
+    # Bot (polling)
     run_bot()
 
 if __name__ == "__main__":
