@@ -5,6 +5,7 @@ import os
 import re
 import time
 import threading
+import html
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
 
@@ -31,22 +32,16 @@ from plans import build_plan_info, can_create_alert, plan_status_line
 from altcoins_info import get_off_binance_info, list_off_binance, list_presales
 from commands_admin import register_admin_handlers
 from commands_plus import register_plus_handlers
-
-# Advisor + feedback services
 from commands_advisor import register_advisor_handlers
 from advisor_features import start_advisor_scheduler
 from feedback_followup import start_feedback_scheduler
-
-# NEW: usage limits (trial per command)
 from usage_limits import increment_and_check, DEFAULT_FREE_LIMIT
-
-# ─────────────────────────── ENV / CONFIG ───────────────────────────
 
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 WEB_URL = (os.getenv("WEB_URL") or "").strip() or None
 
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
-FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "10"))  # still used for alert count gating if needed
+FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "10"))
 
 PAYPAL_PLAN_ID = (os.getenv("PAYPAL_PLAN_ID") or "").strip() or None
 PAYPAL_SUBSCRIBE_URL = (os.getenv("PAYPAL_SUBSCRIBE_URL") or "").strip() or None
@@ -66,11 +61,10 @@ TRIAL_LIMIT_PER_COMMAND = int(os.getenv("TRIAL_LIMIT_PER_COMMAND", str(DEFAULT_F
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
 
-# ───────────────── Binance symbols cache (auto-detect) ──────────────
-
-_BINANCE_SYMBOLS: dict[str, str] = {}   # base → pair (e.g., BTC -> BTCUSDT)
+# ───────────────── Binance symbols cache ─────────────────
+_BINANCE_SYMBOLS: dict[str, str] = {}
 _BINANCE_LAST_FETCH = 0.0
-_BINANCE_TTL = int(os.getenv("BINANCE_EXCHANGEINFO_TTL", "3600"))  # seconds
+_BINANCE_TTL = int(os.getenv("BINANCE_EXCHANGEINFO_TTL", "3600"))
 
 def _refresh_binance_symbols(force: bool = False):
     global _BINANCE_LAST_FETCH, _BINANCE_SYMBOLS
@@ -110,8 +104,7 @@ def resolve_symbol_auto(symbol: str | None) -> str | None:
     _refresh_binance_symbols(force=True)
     return _BINANCE_SYMBOLS.get(symbol)
 
-# ───────────────────────── Small helpers ─────────────────────────────
-
+# ──────────────── Helpers / UI ────────────────
 def target_msg(update: Update):
     return update.message or (update.callback_query.message if update.callback_query else None)
 
@@ -149,12 +142,6 @@ def start_text() -> str:
         "• Advisor (persistent): <code>/setadvisor</code>, <code>/myadvisor</code>, <code>/rebalance_now</code>\n"
         "• Alerts feedback: automatic follow-up +2h/+6h\n"
         "• Alts & Presales: <code>/listalts</code>, <code>/listpresales</code>, <code>/alts &lt;SYMBOL&gt;</code>\n\n"
-        "<b>Getting Started</b>\n"
-        "• <code>/price BTC</code> — current price\n"
-        "• <code>/setalert BTC &gt; 110000</code> — alert when condition is met\n"
-        "• <code>/myalerts</code> — list your active alerts (with delete buttons)\n"
-        "• <code>/help</code> — instructions\n"
-        "• <code>/support &lt;message&gt;</code> — contact admin support\n\n"
         "💎 <b>Premium</b>: unlimited usage on all commands\n"
         f"🆓 <b>Free trial</b>: up to <b>{TRIAL_LIMIT_PER_COMMAND}</b> uses per command.\n"
     )
@@ -167,8 +154,7 @@ def safe_chunks(s: str, limit: int = 3800):
 def op_from_rule(rule: str) -> str:
     return ">" if rule == "price_above" else "<"
 
-# ─────────────────────────── FastAPI Health ─────────────────────────
-
+# ─────────────── FastAPI health ───────────────
 health_app = FastAPI()
 _BOT_HEART_BEAT_AT = None
 _BOT_HEART_STATUS = "unknown"
@@ -233,61 +219,41 @@ def bot_heartbeat_loop():
         _BOT_HEART_BEAT_AT = datetime.utcnow()
         time.sleep(_BOT_HEART_INTERVAL)
 
-# ─────────────────────────── GLOBAL USAGE GUARD ─────────────────────
-
+# ─────────────── Trial guard ───────────────
+from usage_limits import increment_and_check
 async def pre_command_usage_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Runs BEFORE any command handler. Enforces per-command trial limit for Free users.
-    If limit exceeded, it notifies and stops handler propagation.
-    """
     try:
         msg = update.effective_message
-        text = (msg.text or msg.caption or "").strip()
-        if not text.startswith("/"):
-            return
-
-        # Parse command name (strip bot username part)
-        raw = text.split()[0]
+        text_msg = (msg.text or msg.caption or "").strip()
+        if not text_msg.startswith("/"): return
+        raw = text_msg.split()[0]
         name = raw[1:]
-        if "@" in name:
-            name = name.split("@", 1)[0]
+        if "@" in name: name = name.split("@", 1)[0]
         cmd = name.lower()
 
-        # Skip admin-only commands for admins (no blocking)
         tg_id = str(update.effective_user.id)
         plan = build_plan_info(tg_id, _ADMIN_IDS)
-        if plan.is_admin:
-            return
+        if plan.is_admin: return
 
-        # Premium → unlimited
         res = increment_and_check(plan.user_id, cmd, is_premium=plan.is_premium, limit=TRIAL_LIMIT_PER_COMMAND)
-        if res.allowed:
-            # Optional: inform remaining on first few calls
-            return
+        if res.allowed: return
 
-        # Block & upsell
         upsell = (
             f"🚫 You’ve used /{cmd} {res.limit} times on the Free trial.\n"
             f"💎 Upgrade to Premium for unlimited usage on all commands."
         )
-        kb = None
-        u = paypal_upgrade_url_for(tg_id)
-        if u:
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade with PayPal", url=u)]])
+        kb = upgrade_keyboard(tg_id)
         await msg.reply_text(upsell, reply_markup=kb)
-        # Stop other handlers from running
         raise ApplicationHandlerStop()
     except ApplicationHandlerStop:
         raise
     except Exception as e:
-        # Fail-open: don't block command if guard errors
         print({"msg": "usage_guard_error", "error": str(e)})
 
-# ─────────────────────────── Bot Commands (core) ────────────────────
-
+# ─────────────── Commands ───────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-    _ = build_plan_info(tg_id, _ADMIN_IDS)  # ensure user exists
+    _ = build_plan_info(tg_id, _ADMIN_IDS)
     await target_msg(update).reply_text(
         start_text(),
         reply_markup=main_menu_keyboard(tg_id),
@@ -345,10 +311,10 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     info = get_off_binance_info(symbol)
     if info:
-        lines = [f"ℹ️ <b>{info.get('name', symbol)}</b>\n{info.get('note','')}".strip()]
+        lines = [f"ℹ️ <b>{html.escape(info.get('name', symbol))}</b>\n{html.escape(info.get('note',''))}".strip()]
         for title, url in info.get("links", []):
-            lines.append(f"• <a href=\"{url}\">{title}</a>")
-        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+            lines.append(f"• <a href=\"{html.escape(url)}\">{html.escape(title)}</a>")
+        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         return
     await target_msg(update).reply_text(
         "Unknown symbol. Try BTC, ETH, SOL… or <code>/alts SYMBOL</code>.",
@@ -377,7 +343,7 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     tg_id = str(update.effective_user.id)
     plan = build_plan_info(tg_id, _ADMIN_IDS)
-    allowed, denial, remaining = can_create_alert(plan)  # you can keep or remove this if you only want per-command trial
+    allowed, denial, remaining = can_create_alert(plan)
     if not allowed:
         await target_msg(update).reply_text(denial)
         return
@@ -456,8 +422,7 @@ async def cmd_clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.commit()
     await target_msg(update).reply_text("All your alerts were deleted.")
 
-# ─────────────────────────── Alts / Presales ───────────────────────
-
+# ─────────────── Alts / Presales (HTML-safe) ───────────────
 async def cmd_alts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not context.args:
@@ -468,10 +433,10 @@ async def cmd_alts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not info:
             await target_msg(update).reply_text("No curated info for that symbol.")
             return
-        lines = [f"ℹ️ <b>{info.get('name', sym)}</b>\n{info.get('note','')}".strip()]
+        lines = [f"ℹ️ <b>{html.escape(info.get('name', sym))}</b>\n{html.escape(info.get('note',''))}".strip()]
         for title, url in info.get("links", []):
-            lines.append(f"• <a href=\"{url}\">{title}</a>")
-        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+            lines.append(f"• <a href=\"{html.escape(url)}\">{html.escape(title)}</a>")
+        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except Exception as e:
         await target_msg(update).reply_text(f"Error: {e}")
 
@@ -482,9 +447,9 @@ async def cmd_listalts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await target_msg(update).reply_text("No curated tokens configured yet.")
             return
         lines = ["🌱 <b>Curated Off-Binance & Community</b>"]
-        lines += [f"• <code>{s}</code>" for s in syms]
-        lines.append("\nTip: /alts <SYMBOL> for notes & links.")
-        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        lines += [f"• <code>{html.escape(s)}</code>" for s in syms]
+        lines.append("\nTip: /alts &lt;SYMBOL&gt; for notes & links.")
+        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except Exception as e:
         await target_msg(update).reply_text(f"Error: {e}")
 
@@ -495,14 +460,13 @@ async def cmd_listpresales(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await target_msg(update).reply_text("No presales listed yet.")
             return
         lines = ["🟠 <b>Curated Presales</b>"]
-        lines += [f"• <code>{s}</code>" for s in syms]
-        lines.append("\nTip: /alts <SYMBOL> for notes & links. DYOR • High risk.")
-        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        lines += [f"• <code>{html.escape(s)}</code>" for s in syms]
+        lines.append("\nTip: /alts &lt;SYMBOL&gt; for notes & links. DYOR • High risk.")
+        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except Exception as e:
         await target_msg(update).reply_text(f"Error: {e}")
 
-# ────────────────────── Callback buttons ───────────────────────────
-
+# ─────────────── Callbacks, worker, run (unchanged) ───────────────
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Loading...", show_alert=False)
@@ -577,8 +541,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("Deleted.")
             return
 
-# ─────────────────────────── Worker loop ───────────────────────────
-
 def alerts_loop():
     global _ALERTS_LAST_OK_AT, _ALERTS_LAST_RESULT
     if not RUN_ALERTS:
@@ -613,8 +575,6 @@ def delete_webhook_if_any():
     except Exception as e:
         print({"msg": "delete_webhook_exception", "error": str(e)})
 
-# ─────────────────────────── Run bot (polling) ─────────────────────
-
 def run_bot():
     if not RUN_BOT:
         print({"msg": "bot_disabled_env"}); return
@@ -637,10 +597,8 @@ def run_bot():
             .build()
         )
 
-        # Global guard — must be group=-1 so it runs BEFORE all other handlers
         app.add_handler(MessageHandler(filters.COMMAND, pre_command_usage_guard), group=-1)
 
-        # Core commands (group=0 by default; the guard already runs earlier)
         app.add_handler(CommandHandler("start", cmd_start))
         app.add_handler(CommandHandler("help", cmd_help))
         app.add_handler(CommandHandler("whoami", cmd_whoami))
@@ -653,52 +611,33 @@ def run_bot():
         app.add_handler(CommandHandler("delalert", cmd_delalert))
         app.add_handler(CommandHandler("clearalerts", cmd_clearalerts))
 
-        # Extras (funding/topgainers/chart/news/dca/pumplive etc.)
         register_extra_handlers(app)
-
-        # Plus pack
         register_plus_handlers(app)
-
-        # Advisor commands
         register_advisor_handlers(app)
-
-        # Admin module
         register_admin_handlers(app, _ADMIN_IDS)
 
-        # Callback queries (inline buttons)
         app.add_handler(CallbackQueryHandler(on_callback))
 
         print({"msg": "bot_start"})
         app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
     finally:
         try:
             lock_conn.close()
         except Exception:
             pass
 
-# ─────────────────────────── Entry point ───────────────────────────
-
 def main():
     init_db()
     init_extras()
-
-    # Health server & heartbeat
     port = int(os.getenv("PORT", "10000"))
     threading.Thread(
         target=lambda: uvicorn.run(health_app, host="0.0.0.0", port=port, log_level="info"),
         daemon=True
     ).start()
     threading.Thread(target=bot_heartbeat_loop, daemon=True).start()
-
-    # Background schedulers
-    start_advisor_scheduler()   # Daily advisor notifications
-    start_feedback_scheduler()  # +2h/+6h alert feedback loop
-
-    # Alerts worker
+    start_advisor_scheduler()
+    start_feedback_scheduler()
     threading.Thread(target=alerts_loop, daemon=True).start()
-
-    # Bot (polling)
     run_bot()
 
 if __name__ == "__main__":

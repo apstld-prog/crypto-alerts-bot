@@ -5,164 +5,129 @@ import os
 import time
 from datetime import datetime, timedelta
 
-import requests
 from sqlalchemy import text
 
 from db import session_scope
 
-BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-# Windows (hours) after trigger to send follow-up PnL
-FEEDBACK_WINDOWS = os.getenv("FEEDBACK_WINDOWS", "2,6")
+# Send follow-up messages (e.g., +2h / +6h) after an alert triggered
+# This version normalizes ALL timestamps to UTC-naive for arithmetic,
+# avoiding "can't subtract offset-naive and offset-aware datetimes".
+
+FOLLOWUP_DELAYS = [2 * 3600, 6 * 3600]  # seconds after trigger
+
+
+def _utcnow_naive() -> datetime:
+    # Always produce naive-UTC
+    return datetime.utcnow().replace(tzinfo=None)
 
 
 def _ensure_tables():
     with session_scope() as s:
-        s.execute(text(
-            """
-            CREATE TABLE IF NOT EXISTS alert_triggers (
-                id BIGSERIAL PRIMARY KEY,
+        # Table to track followups we have already sent
+        s.execute(text("""
+            CREATE TABLE IF NOT EXISTS alert_followups (
                 alert_id BIGINT NOT NULL,
-                user_id BIGINT NOT NULL,
-                symbol TEXT NOT NULL,
-                rule TEXT NOT NULL,
-                threshold NUMERIC NOT NULL,
-                trigger_price NUMERIC NOT NULL,
-                triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                sent_2h BOOLEAN NOT NULL DEFAULT FALSE,
-                sent_6h BOOLEAN NOT NULL DEFAULT FALSE
+                stage INT NOT NULL,
+                sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (alert_id, stage)
             );
-            """
-        ))
-        s.execute(text(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id BIGSERIAL PRIMARY KEY,
-                telegram_id TEXT UNIQUE
-            );
-            """
-        ))
+        """))
         s.commit()
 
 
-def record_alert_trigger(alert_id: int, user_id: int, symbol: str, rule: str, threshold: float, trigger_price: float):
-    """Called when an alert fires, to store a snapshot for follow-up."""
-    _ensure_tables()
+def _send_followup_message(telegram_id: int, text_msg: str):
+    # Keep it simple; server_combined uses main bot loop to send alerts
+    # We only store the work item; the actual sending can be a simple HTTP call.
+    # To keep dependency-free here, we emit a row in an outbox table used by the main code.
+    with session_scope() as s:
+        s.execute(text("""
+            CREATE TABLE IF NOT EXISTS outbox_msgs (
+                id BIGSERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                status TEXT NOT NULL DEFAULT 'new'
+            );
+        """))
+        s.execute(text(
+            "INSERT INTO outbox_msgs (chat_id, body) VALUES (:cid, :body)"
+        ), {"cid": telegram_id, "body": text_msg})
+        s.commit()
+
+
+def _load_recent_triggers(limit_minutes: int = 24 * 60):
+    """Return recent alerts that triggered in the last N minutes with (id, user_id, telegram_id, symbol, rule, value, last_triggered_at)."""
+    with session_scope() as s:
+        rows = s.execute(text(f"""
+            SELECT a.id, a.user_id, u.telegram_id, a.symbol, a.rule, a.value, a.last_triggered_at
+            FROM alerts a
+            JOIN users u ON u.id = a.user_id
+            WHERE a.last_triggered_at IS NOT NULL
+              AND a.last_triggered_at >= NOW() - INTERVAL '{limit_minutes} minutes'
+            ORDER BY a.last_triggered_at DESC
+            LIMIT 500
+        """)).all()
+    return rows
+
+
+def _already_sent(alert_id: int, stage: int) -> bool:
+    with session_scope() as s:
+        row = s.execute(text(
+            "SELECT 1 FROM alert_followups WHERE alert_id=:aid AND stage=:st"
+        ), {"aid": alert_id, "st": stage}).first()
+    return bool(row)
+
+
+def _mark_sent(alert_id: int, stage: int):
     with session_scope() as s:
         s.execute(text(
-            """
-            INSERT INTO alert_triggers (alert_id, user_id, symbol, rule, threshold, trigger_price, triggered_at)
-            VALUES (:aid, :uid, :sym, :rule, :thr, :p, NOW())
-            """
-        ), {"aid": alert_id, "uid": user_id, "sym": symbol, "rule": rule, "thr": threshold, "p": trigger_price})
+            "INSERT INTO alert_followups (alert_id, stage) VALUES (:aid, :st)"
+        ), {"aid": alert_id, "st": stage})
         s.commit()
 
 
-def _send_dm(telegram_id: str, html: str):
-    if not BOT_TOKEN:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, json={
-            "chat_id": telegram_id,
-            "text": html,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }, timeout=15)
-    except Exception:
-        pass
-
-
-def _fetch_price(symbol_pair: str) -> float | None:
-    try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol_pair}, timeout=10)
-        if r.status_code == 200:
-            j = r.json()
-            return float(j.get("price"))
-    except Exception:
-        return None
-    return None
-
-
-def _fmt(p: float) -> str:
-    if p >= 1:
-        return f"{p:.2f}"
-    return f"{p:.6f}"
-
-
-def feedback_scheduler_loop():
-    _ensure_tables()
-    windows = []
-    for w in FEEDBACK_WINDOWS.split(","):
-        w = w.strip()
-        if not w:
-            continue
-        try:
-            windows.append(int(w))
-        except Exception:
-            pass
-    windows = sorted(set([w for w in windows if 1 <= w <= 48]))  # clamp 1..48h
-    print({"msg": "feedback_scheduler_started", "windows": windows})
-
-    while True:
-        try:
-            now = datetime.utcnow()
-            with session_scope() as s:
-                # bring recent triggers from last 48h
-                rows = s.execute(text(
-                    """
-                    SELECT t.id, t.alert_id, t.user_id, t.symbol, t.rule, t.threshold, t.trigger_price, t.triggered_at,
-                           u.telegram_id, t.sent_2h, t.sent_6h
-                    FROM alert_triggers t
-                    JOIN users u ON t.user_id = u.id
-                    WHERE t.triggered_at > NOW() - INTERVAL '48 hours'
-                    ORDER BY t.triggered_at ASC
-                    """
-                )).all()
-            for r in rows:
-                pair = r.symbol  # already like BTCUSDT
-                now_price = _fetch_price(pair)
-                if now_price is None:
-                    continue
-                delta_pct = (now_price - float(r.trigger_price)) / float(r.trigger_price) * 100.0
-                # We don't know user's side (long/short). Show both interpretations.
-                gr = (
-                    f"🔁 Alert feedback • {pair}\n"
-                    f"Trigger @ {_fmt(float(r.trigger_price))}  →  Now {_fmt(now_price)}  ({delta_pct:+.2f}%)\n"
-                    f"• Αν είχες long: {delta_pct:+.2f}%   • Αν είχες short: {-delta_pct:+.2f}%"
-                )
-                en = (
-                    f"🔁 Alert feedback • {pair}\n"
-                    f"Trigger @ {_fmt(float(r.trigger_price))}  →  Now {_fmt(now_price)}  ({delta_pct:+.2f}%)\n"
-                    f"• If long: {delta_pct:+.2f}%   • If short: {-delta_pct:+.2f}%"
-                )
-
-                # Check each window and send once
-                age = now - r.triggered_at
-                updates = {}
-                should_send = None
-                if (2 in windows) and (age >= timedelta(hours=2)) and (not r.sent_2h):
-                    updates["sent_2h"] = True; should_send = "2h"
-                if (6 in windows) and (age >= timedelta(hours=6)) and (not r.sent_6h):
-                    updates["sent_6h"] = True; should_send = "6h"  # prefer latest if both true
-
-                if updates and should_send:
-                    tag = "⏱️ +2h" if should_send == "2h" else "⏱️ +6h"
-                    _send_dm(r.telegram_id, f"{tag}\n{gr}\n— — —\n{en}")
-                    # persist sent flag(s)
-                    with session_scope() as s2:
-                        sets = []
-                        params = {"id": r.id}
-                        for k, v in updates.items():
-                            sets.append(f"{k} = :{k}")
-                            params[k] = v
-                        s2.execute(text(f"UPDATE alert_triggers SET {', '.join(sets)} WHERE id=:id"), params)
-                        s2.commit()
-        except Exception as e:
-            print({"msg": "feedback_scheduler_error", "error": str(e)})
-        time.sleep(30)
+def _format_followup(symbol: str, rule: str, value: float, hours_after: int) -> str:
+    op = ">" if rule == "price_above" else "<"
+    return (
+        f"📈 Follow-up ({hours_after}h)\n"
+        f"Symbol: {symbol}\n"
+        f"Rule: {op} {value}\n"
+        f"(This is an informational performance follow-up.)"
+    )
 
 
 def start_feedback_scheduler():
+    """
+    Background loop: check for recently-triggered alerts, and send follow-ups
+    at +2h and +6h if not already sent.
+    """
+    def _loop():
+        print({"msg": "worker_extra_threads_started"})
+        _ensure_tables()
+        time.sleep(3)
+        while True:
+            try:
+                now = _utcnow_naive()
+                recent = _load_recent_triggers()
+                for r in recent:
+                    # Normalize DB timestamp to naive UTC for subtraction
+                    last_trig = r.last_triggered_at
+                    if last_trig is None:
+                        continue
+                    # Convert any tz-aware to naive
+                    if getattr(last_trig, "tzinfo", None) is not None:
+                        last_trig = last_trig.replace(tzinfo=None)
+                    elapsed = (now - last_trig).total_seconds()
+                    for idx, delay in enumerate(FOLLOWUP_DELAYS, start=1):
+                        if elapsed >= delay and not _already_sent(r.id, idx):
+                            hrs = int(delay // 3600)
+                            _send_followup_message(r.telegram_id, _format_followup(r.symbol, r.rule, r.value, hrs))
+                            _mark_sent(r.id, idx)
+                time.sleep(30)
+            except Exception as e:
+                print({"msg": "feedback_scheduler_error", "error": str(e)})
+                time.sleep(10)
+
     import threading
-    t = threading.Thread(target=feedback_scheduler_loop, daemon=True)
+    t = threading.Thread(target=_loop, daemon=True)
     t.start()
