@@ -29,6 +29,7 @@ from models_extras import init_extras
 from plans import build_plan_info, can_create_alert, plan_status_line
 from altcoins_info import get_off_binance_info, list_off_binance, list_presales
 from commands_admin import register_admin_handlers  # Admin module
+from commands_plus import register_plus_handlers   # <<< NEW extra module
 
 # ─────────────────────────── ENV / CONFIG ───────────────────────────
 
@@ -62,7 +63,6 @@ _BINANCE_LAST_FETCH = 0.0
 _BINANCE_TTL = int(os.getenv("BINANCE_EXCHANGEINFO_TTL", "3600"))  # seconds
 
 def _refresh_binance_symbols(force: bool = False):
-    """Refresh Binance USDT trading pairs and keep a base->symbol map."""
     global _BINANCE_LAST_FETCH, _BINANCE_SYMBOLS
     now = time.time()
     if (not force) and (now - _BINANCE_LAST_FETCH < _BINANCE_TTL) and _BINANCE_SYMBOLS:
@@ -87,27 +87,22 @@ def _refresh_binance_symbols(force: bool = False):
         print({"msg": "binance_symbols_error", "error": str(e)})
 
 def resolve_symbol_auto(symbol: str | None) -> str | None:
-    """Try current mapping, otherwise ask Binance (cached) for new listings."""
     if not symbol:
         return None
     symbol = symbol.upper().strip()
-    # 1) your static mapping (worker_logic.resolve_symbol)
     pair = resolve_symbol(symbol)
     if pair:
         return pair
-    # 2) cached Binance listing
     _refresh_binance_symbols()
     pair = _BINANCE_SYMBOLS.get(symbol)
     if pair:
         return pair
-    # 3) force refresh once
     _refresh_binance_symbols(force=True)
     return _BINANCE_SYMBOLS.get(symbol)
 
 # ───────────────────────── Small helpers ─────────────────────────────
 
 def target_msg(update: Update):
-    """Return a message target compatible with commands & callbacks."""
     return update.message or (update.callback_query.message if update.callback_query else None)
 
 def paypal_upgrade_url_for(tg_id: str | None) -> str | None:
@@ -258,7 +253,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Alts / Presales</b>\n"
         "• <code>/alts &lt;SYMBOL&gt;</code> → notes &amp; links only\n"
         "• <code>/listalts</code> → curated off-Binance/community\n"
-        "• <code>/listpresales</code> → curated presales (very high risk)\n"
+        "• <code>/listpresales</code> → curated presales (very high risk)\n\n"
+        "<b>Plus Pack</b>\n"
+        "• <code>/dailyai [SYMBOLS]</code> • <code>/advisor &lt;budget&gt; &lt;low|medium|high&gt;</code>\n"
+        "• <code>/whatif &lt;SYMBOL&gt; &lt;long|short&gt; &lt;entry&gt; [hours]</code>\n"
+        "• <code>/portfolio_sim &lt;positions&gt; &lt;shock&gt;</code>\n"
+        "• <code>/impactnews &lt;headline&gt;</code> • <code>/topalertsboard</code>\n"
     )
     for chunk in safe_chunks(help_html):
         await target_msg(update).reply_text(
@@ -445,7 +445,7 @@ async def cmd_listpresales(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await target_msg(update).reply_text(f"Error: {e}")
 
-# ────────────────────── Callback buttons (inline) ───────────────────
+# ────────────────────── Callback buttons ───────────────────────────
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -596,6 +596,9 @@ def run_bot():
         # Extras (funding/topgainers/chart/news/dca/pumplive etc.)
         register_extra_handlers(app)
 
+        # Plus pack (this module)
+        register_plus_handlers(app)
+
         # Admin module
         register_admin_handlers(app, _ADMIN_IDS)
 
@@ -603,22 +606,9 @@ def run_bot():
         app.add_handler(CallbackQueryHandler(on_callback))
 
         print({"msg": "bot_start"})
+        # Simpler: let Render restart on failure
+        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
-        backoff = 5
-        while True:
-            try:
-                app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-                break
-            except Conflict as e:
-                print({"msg": "bot_conflict_retry", "error": str(e)})
-                time.sleep(5)
-            except TgTimedOut as e:
-                print({"msg": "bot_timeout_retry", "error": str(e), "sleep": backoff})
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-            except Exception as e:
-                print({"msg": "bot_generic_retry", "error": str(e), "sleep": 10})
-                time.sleep(10)
     finally:
         try:
             lock_conn.close()
