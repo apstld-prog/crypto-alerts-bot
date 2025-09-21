@@ -2,22 +2,19 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Optional
 
 from sqlalchemy import text
-
 from db import session_scope
 
-# Follow-up σήματα που στέλνουμε μετά από alert trigger
-# π.χ. +2 ώρες και +6 ώρες
-FOLLOWUP_DELAYS = [2 * 3600, 6 * 3600]  # seconds
+# Follow-up stages (seconds after trigger)
+FOLLOWUP_DELAYS = [2 * 3600, 6 * 3600]  # +2h, +6h
 
 
-# ───────────────────────── Time helpers (UTC-naive) ─────────────────────────
+# ───────────────── Time helpers (UTC-naive) ─────────────────
 
 def _utcnow_naive() -> datetime:
-    """Return naive UTC datetime (no tzinfo) to avoid aware/naive mix errors."""
     return datetime.utcnow().replace(tzinfo=None)
 
 
@@ -29,12 +26,12 @@ def _to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt
 
 
-# ─────────────────────── Schema helpers (create if missing) ─────────────────
+# ──────────────── Auto-migrate schema (safe) ────────────────
 
 def _ensure_tables() -> None:
-    """Create tables used by the feedback system if they don't exist."""
+    """Create/upgrade tables used by feedback logic."""
     with session_scope() as s:
-        # Πίνακας με στιγμές που πυροδοτήθηκαν alerts
+        # Base tables
         s.execute(text("""
             CREATE TABLE IF NOT EXISTS alert_triggers (
                 id BIGSERIAL PRIMARY KEY,
@@ -47,8 +44,6 @@ def _ensure_tables() -> None:
                 triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
         """))
-
-        # Πίνακας με follow-ups που έχουν σταλεί (για να μη στέλνονται διπλά)
         s.execute(text("""
             CREATE TABLE IF NOT EXISTS alert_followups (
                 alert_id BIGINT NOT NULL,
@@ -57,8 +52,6 @@ def _ensure_tables() -> None:
                 PRIMARY KEY (alert_id, stage)
             );
         """))
-
-        # Outbox για εύκολη αποστολή μέσω του κύριου bot loop
         s.execute(text("""
             CREATE TABLE IF NOT EXISTS outbox_msgs (
                 id BIGSERIAL PRIMARY KEY,
@@ -68,42 +61,49 @@ def _ensure_tables() -> None:
                 status TEXT NOT NULL DEFAULT 'new'
             );
         """))
+
+        # Legacy upgrades (if table existed without some columns)
+        for col, ddl in [
+            ("user_id", "ALTER TABLE alert_triggers ADD COLUMN IF NOT EXISTS user_id BIGINT"),
+            ("symbol",  "ALTER TABLE alert_triggers ADD COLUMN IF NOT EXISTS symbol TEXT"),
+            ("rule",    "ALTER TABLE alert_triggers ADD COLUMN IF NOT EXISTS rule TEXT"),
+            ("value",   "ALTER TABLE alert_triggers ADD COLUMN IF NOT EXISTS value NUMERIC"),
+            ("price",   "ALTER TABLE alert_triggers ADD COLUMN IF NOT EXISTS price NUMERIC"),
+            ("triggered_at", "ALTER TABLE alert_triggers ADD COLUMN IF NOT EXISTS triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
+        ]:
+            s.execute(text(ddl))
+
         s.commit()
 
 
-# ─────────────────────── Public API (used by worker_logic) ───────────────────
+# ─────────────── Public API (called by worker_logic) ───────────────
 
 def record_alert_trigger(*args: Any, **kwargs: Any) -> None:
     """
     Safe logger used by worker_logic when an alert fires.
-    Accepts flexible signature to remain compatible:
+    Accepts flexible signature:
 
         record_alert_trigger(alert_id, user_id, symbol, rule, value, price, ts_utc=None)
-    or
-        record_alert_trigger(alert_id=<id>, user_id=<uid>, symbol=..., rule=..., value=..., price=..., ts_utc=<dt>)
+    or  record_alert_trigger(alert_id=<...>, user_id=<...>, ...)
 
     Stores a row in alert_triggers and updates alerts.last_triggered_at.
     """
     _ensure_tables()
 
-    # Extract fields defensively
     alert_id = kwargs.get("alert_id", args[0] if len(args) > 0 else None)
-    user_id = kwargs.get("user_id", args[1] if len(args) > 1 else None)
-    symbol = kwargs.get("symbol", args[2] if len(args) > 2 else None)
-    rule   = kwargs.get("rule",   args[3] if len(args) > 3 else None)
-    value  = kwargs.get("value",  args[4] if len(args) > 4 else None)
-    price  = kwargs.get("price",  args[5] if len(args) > 5 else None)
-    ts     = kwargs.get("ts_utc", None)
+    user_id  = kwargs.get("user_id",  args[1] if len(args) > 1 else None)
+    symbol   = kwargs.get("symbol",   args[2] if len(args) > 2 else None)
+    rule     = kwargs.get("rule",     args[3] if len(args) > 3 else None)
+    value    = kwargs.get("value",    args[4] if len(args) > 4 else None)
+    price    = kwargs.get("price",    args[5] if len(args) > 5 else None)
+    ts       = kwargs.get("ts_utc", None)
 
     ts_naive = _to_naive_utc(ts) or _utcnow_naive()
-
     if alert_id is None:
-        # Χωρίς id δεν μπορούμε να ενημερώσουμε την ειδοποίηση
         return
 
     try:
         with session_scope() as s:
-            # Insert trigger row
             s.execute(text("""
                 INSERT INTO alert_triggers (alert_id, user_id, symbol, rule, value, price, triggered_at)
                 VALUES (:aid, :uid, :sym, :rule, :val, :price, :ts)
@@ -114,10 +114,9 @@ def record_alert_trigger(*args: Any, **kwargs: Any) -> None:
                 "rule": rule,
                 "val": value,
                 "price": price,
-                "ts": ts_naive,  # SQLAlchemy θα το περάσει ως timestamptz
+                "ts": ts_naive,
             })
 
-            # Update last_triggered_at στο alerts
             s.execute(text("""
                 UPDATE alerts
                 SET last_triggered_at = :ts
@@ -126,11 +125,10 @@ def record_alert_trigger(*args: Any, **kwargs: Any) -> None:
 
             s.commit()
     except Exception as e:
-        # Δεν ρίχνουμε exception προς τα πάνω για να μην «σπάσουν» τα alerts
         print({"msg": "record_alert_trigger_error", "error": str(e), "aid": alert_id})
 
 
-# ─────────────────────── Follow-up sender helpers ────────────────────────────
+# ─────────────── Follow-up helpers ───────────────
 
 def _already_sent(alert_id: int, stage: int) -> bool:
     with session_scope() as s:
@@ -149,7 +147,6 @@ def _mark_sent(alert_id: int, stage: int) -> None:
 
 
 def _queue_followup_message(telegram_id: int, text_msg: str) -> None:
-    # Βάζουμε μήνυμα στην outbox, το οποίο στέλνεται από το main service
     with session_scope() as s:
         s.execute(text(
             "INSERT INTO outbox_msgs (chat_id, body) VALUES (:cid, :body)"
@@ -169,8 +166,8 @@ def _format_followup(symbol: str, rule: str, value: float, hours_after: int) -> 
 
 def _load_recent_triggers(window_minutes: int = 24 * 60):
     """
-    Βρίσκει πρόσφατα triggers (τελευταίο 24ωρο default) μαζί με user chat.
-    Προτιμούμε τον πίνακα alert_triggers για ακρίβεια, αλλά κρατάμε και fallback.
+    Fetch recent triggers with user chat id.
+    Prefer alert_triggers (more accurate). If empty, fallback to alerts.last_triggered_at.
     """
     with session_scope() as s:
         rows = s.execute(text(f"""
@@ -185,7 +182,6 @@ def _load_recent_triggers(window_minutes: int = 24 * 60):
         if rows:
             return rows
 
-        # Fallback: αν δεν υπάρχουν rows στον trigger πίνακα, κοιτάμε το alerts.last_triggered_at
         rows = s.execute(text(f"""
             SELECT a.id as alert_id, a.user_id, a.symbol, a.rule, a.value, NULL::NUMERIC as price,
                    a.last_triggered_at as triggered_at, u.telegram_id
@@ -199,14 +195,13 @@ def _load_recent_triggers(window_minutes: int = 24 * 60):
         return rows
 
 
-# ───────────────────────── Scheduler main loop ───────────────────────────────
+# ─────────────── Scheduler main loop ───────────────
 
 def start_feedback_scheduler() -> None:
     """
-    Background loop: κοιτάει πρόσφατα triggers και στέλνει follow-ups
-    στα +2h και +6h (αν δεν έχουν ήδη σταλεί).
+    Background loop: scan recent triggers and send follow-up messages
+    at +2h and +6h (if not already sent).
     """
-
     def _loop():
         print({"msg": "worker_extra_threads_started"})
         _ensure_tables()
