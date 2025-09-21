@@ -29,7 +29,7 @@ from models_extras import init_extras
 from plans import build_plan_info, can_create_alert, plan_status_line
 from altcoins_info import get_off_binance_info, list_off_binance, list_presales
 from commands_admin import register_admin_handlers  # Admin module
-from commands_plus import register_plus_handlers   # <<< NEW extra module
+from commands_plus import register_plus_handlers   # Plus pack (AI-like utilities)
 
 # ─────────────────────────── ENV / CONFIG ───────────────────────────
 
@@ -128,9 +128,16 @@ def upgrade_keyboard(tg_id: str | None):
     return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade with PayPal", url=u)]]) if u else None
 
 def start_text() -> str:
+    # Short capability snapshot + getting started
     return (
         "<b>Crypto Alerts Bot</b>\n"
         "⚡ Fast prices • 🧪 Diagnostics • 🔔 Alerts\n\n"
+        "<b>What you can do — quick</b>\n"
+        "• Prices: <code>/price BTC</code>, mini <code>/chart BTC</code>\n"
+        "• Alerts: <code>/setalert BTC &gt; 110000</code>, <code>/myalerts</code> (delete buttons)\n"
+        "• Market tools: <code>/feargreed</code>, <code>/funding</code>, <code>/topgainers</code>, <code>/toplosers</code>, <code>/news</code>, <code>/dca</code>\n"
+        "• Plus pack: <code>/dailyai</code>, <code>/advisor</code>, <code>/whatif</code>, <code>/portfolio_sim</code>, <code>/impactnews</code>, <code>/topalertsboard</code>\n"
+        "• Alts & Presales: <code>/listalts</code>, <code>/listpresales</code>, <code>/alts &lt;SYMBOL&gt;</code>\n\n"
         "<b>Getting Started</b>\n"
         "• <code>/price BTC</code> — current price\n"
         "• <code>/setalert BTC &gt; 110000</code> — alert when condition is met\n"
@@ -596,7 +603,7 @@ def run_bot():
         # Extras (funding/topgainers/chart/news/dca/pumplive etc.)
         register_extra_handlers(app)
 
-        # Plus pack (this module)
+        # Plus pack
         register_plus_handlers(app)
 
         # Admin module
@@ -606,7 +613,7 @@ def run_bot():
         app.add_handler(CallbackQueryHandler(on_callback))
 
         print({"msg": "bot_start"})
-        # Simpler: let Render restart on failure
+        # Simple run; let the platform restart on failure
         app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
     finally:
