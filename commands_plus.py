@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import math
-import re
-import time
 from typing import Dict, List, Tuple
 
 import requests
@@ -19,6 +17,7 @@ BINANCE_TICKER_24H = "https://api.binance.com/api/v3/ticker/24hr"
 
 
 def _ticker_24h(symbol_pair: str) -> dict | None:
+    """Fetch 24h ticker from Binance for lightweight insights."""
     try:
         r = requests.get(BINANCE_TICKER_24H, params={"symbol": symbol_pair}, timeout=12)
         if r.status_code == 200:
@@ -28,7 +27,7 @@ def _ticker_24h(symbol_pair: str) -> dict | None:
     return None
 
 
-def _num(x) -> float:
+def _fnum(x) -> float:
     try:
         return float(x)
     except Exception:
@@ -40,7 +39,6 @@ def _fmt(v: float, decimals: int = 2) -> str:
         return "n/a"
     if abs(v) >= 1:
         return f"{v:.{decimals}f}"
-    # more precision for very small prices
     return f"{v:.6f}"
 
 
@@ -69,9 +67,9 @@ async def cmd_dailyai(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines_gr.append(f"• {s}: δεν βρέθηκε 24h στατιστικό.")
             lines_en.append(f"• {s}: 24h stats not found.")
             continue
-        price = _num(t.get("lastPrice"))
-        change_pct = _num(t.get("priceChangePercent"))
-        vol = _num(t.get("volume"))
+        price = _fnum(t.get("lastPrice"))
+        change_pct = _fnum(t.get("priceChangePercent"))
+        vol = _fnum(t.get("volume"))
         hint_gr = "Σταθερό μοτίβο — ουδέτερη στάση."
         hint_en = "Sideways pattern — neutral stance."
         if not math.isnan(change_pct):
@@ -139,12 +137,19 @@ async def cmd_advisor(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ────────────────────────────────────────────────────────────────────
-# /whatif <SYMBOL> <long|short> <entry_price> [hours]
+# /whatif <SYMBOL> <long|short> <entry_price> [leverage]
+# Immediate PnL based on CURRENT spot price (no 24h window).
 
 async def cmd_whatif(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Instant PnL using live Binance spot price.
+    Usage: /whatif BTC long 68000 [2]
+      - direction: long | short
+      - leverage (optional): default 1x
+    """
     if len(context.args) < 3:
         await update.effective_message.reply_text(
-            "Usage: /whatif <SYMBOL> <long|short> <entry_price> [hours]\n"
+            "Usage: /whatif <SYMBOL> <long|short> <entry_price> [leverage]\n"
             "Example: /whatif BTC long 68000 2"
         )
         return
@@ -155,12 +160,12 @@ async def cmd_whatif(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.effective_message.reply_text("Bad entry_price")
         return
-    hours = 0
+    lev = 1.0
     if len(context.args) >= 4:
         try:
-            hours = int(context.args[3])
+            lev = max(0.1, float(context.args[3]))
         except Exception:
-            hours = 0
+            lev = 1.0
 
     pair = sym if sym.endswith("USDT") else f"{sym}USDT"
     price = fetch_price_binance(pair)
@@ -170,11 +175,16 @@ async def cmd_whatif(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     move_pct = (price - entry) / entry * 100.0
     pnl_pct = move_pct if side == "long" else -move_pct
-    gr = f"Τώρα {pair}={price:.6f}. Αν είχες {side} στο {entry:.6f}, PnL {pnl_pct:+.2f}%"
-    en = f"Now {pair}={price:.6f}. If you were {side} at {entry:.6f}, PnL {pnl_pct:+.2f}%"
-    if hours > 0:
-        gr = f"{gr} ~{hours}h"
-        en = f"{en} ~{hours}h"
+    pnl_pct *= lev
+
+    gr = (
+        f"Τώρα {pair}={price:.6f}. Αν είχες {side} στο {entry:.6f} με μόχλευση {lev:g}×, "
+        f"PnL {pnl_pct:+.2f}%"
+    )
+    en = (
+        f"Now {pair}={price:.6f}. If you were {side} at {entry:.6f} with {lev:g}× leverage, "
+        f"PnL {pnl_pct:+.2f}%"
+    )
     await update.effective_message.reply_text(gr + "\n" + en)
 
 
@@ -261,17 +271,13 @@ KEY_NEG = ("hack", "exploit", "ban", "suspend", "lawsuit", "criminal", "stableco
 def _impact_score(headline: str) -> Tuple[int, str, str]:
     h = (headline or "").lower()
     score = 50
-    reasons = []
     for kw in KEY_POS:
         if kw in h:
             score += 12
-            reasons.append(f"+{kw}")
     for kw in KEY_NEG:
         if kw in h:
             score -= 15
-            reasons.append(f"-{kw}")
     score = max(0, min(100, score))
-    # Greek/English quick hints
     if score >= 80:
         gr = "Ισχυρό θετικό σήμα • πιθανή ανοδική κίνηση."
         en = "Strong positive signal • potential bullish move."
