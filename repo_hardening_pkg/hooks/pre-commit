@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Abort commit if likely secrets are detected in staged changes.
+
+set -euo pipefail
+
+# Check staged diff only
+DIFF="$(git diff --cached)"
+
+# Telegram bot token pattern: 6+ digits colon 20+ URL-safe chars
+if echo "$DIFF" | grep -E '\b[0-9]{6,}:[A-Za-z0-9_-]{20,}\b' >/dev/null; then
+  echo "❌ Detected a string that looks like a Telegram Bot Token in staged changes."
+  echo "   Please remove it and use environment variables (.env) instead."
+  exit 1
+fi
+
+# Generic .env commit prevention
+if git diff --cached --name-only | grep -E '^(\.env|.+\.env(\.|$))' >/dev/null; then
+  echo "❌ Attempt to commit a .env file detected. This file must not be committed."
+  exit 1
+fi
+
+# Common secrets (heuristics)
+if echo "$DIFF" | grep -Ei '(api[_-]?key|secret|token|password)\s*=\s*[\'"][^\'"]+[\'"]' >/dev/null; then
+  echo "⚠️  Possible secret-looking assignment found. Double-check before committing."
+  read -p "Continue anyway? [y/N] " ans
+  if [[ ! "$ans" =~ ^[yY]$ ]]; then
+    exit 1
+  fi
+fi
+
+exit 0

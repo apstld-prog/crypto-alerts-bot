@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Abort commit if a Telegram-like token is detected in staged changes
+if git diff --cached | grep -E "(\b\d{6}:[A-Za-z0-9_-]{20,}\b)"; then
+  echo "❌ Possible Telegram token detected. Commit aborted."
+  exit 1
+fi
