@@ -1,164 +1,205 @@
 # worker_logic.py
-# Alert evaluation & sending logic
+from __future__ import annotations
 
 import os
+import time
 from datetime import datetime, timedelta
+from typing import Dict, Any
+
 import requests
 from sqlalchemy import text
-from db import session_scope, engine
 
-BINANCE_REST = "https://api.binance.com/api/v3/ticker/price"
-ALERT_COOLDOWN_DEFAULT = 900  # seconds
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+from db import session_scope
+from feedback_followup import record_alert_trigger
 
-# Explicit symbol map for convenience/popular pairs.
-SYMBOL_MAP = {
-    # Top caps
-    "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT",
-    "BNB": "BNBUSDT",
-    "SOL": "SOLUSDT",
-    "XRP": "XRPUSDT",
-    "ADA": "ADAUSDT",
-    "DOGE": "DOGEUSDT",
-    "LTC": "LTCUSDT",
-    "BCH": "BCHUSDT",
-    "TON": "TONUSDT",
-    "LINK": "LINKUSDT",
-    "MATIC": "MATICUSDT",  # aka POL elsewhere
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+# How often the server's alerts loop calls this (seconds) comes from the caller,
+# but we also guard with per-alert cooldowns in DB.
+DEFAULT_COOLDOWN = int(os.getenv("ALERT_DEFAULT_COOLDOWN_SECONDS", "900"))  # 15m fallback
 
-    # Cosmos / related
-    "ATOM": "ATOMUSDT",
-    "OSMO": "OSMOUSDT",
-    "INJ":  "INJUSDT",
-    "DYDX": "DYDXUSDT",
-    "SEI":  "SEIUSDT",
-    "TIA":  "TIAUSDT",     # Celestia
-    "RUNE": "RUNEUSDT",    # THORChain
-    "KAVA": "KAVAUSDT",
-    "AKT":  "AKTUSDT",     # Akash
 
-    # Other popular
-    "AVAX": "AVAXUSDT",
-    "DOT":  "DOTUSDT",
-    "APT":  "APTUSDT",
-    "ARB":  "ARBUSDT",
-    "OP":   "OPUSDT",
-    "SUI":  "SUIUSDT",
-    "PEPE": "PEPEUSDT",
-    "SHIB": "SHIBUSDT",
-    "ARKM": "ARKMUSDT",
-}
+# ────────────────────────────────────────────────────────────────────
+# Price helpers
 
-def fetch_price_binance(symbol: str) -> float | None:
-    try:
-        r = requests.get(BINANCE_REST, params={"symbol": symbol}, timeout=10)
-        if r.status_code == 200:
-            return float(r.json()["price"])
-    except Exception:
-        pass
-    return None
-
-def resolve_symbol(sym: str | None) -> str | None:
+def resolve_symbol(symbol: str | None) -> str | None:
     """
-    Resolve user input to a Binance pair (e.g., BTC -> BTCUSDT).
-    - If already ends with USDT, accept it as-is.
-    - If in SYMBOL_MAP, return mapped pair.
-    - Else try fallback "<SYM>USDT" and verify by fetching a price.
+    Return a Binance USDT pair symbol if we know it, else None.
+    Caller may additionally try auto-discovery (exchangeInfo) if needed.
     """
-    if not sym:
+    if not symbol:
         return None
-    s = sym.upper().replace("/", "").strip()
+    s = symbol.strip().upper()
     if s.endswith("USDT"):
         return s
-    if s in SYMBOL_MAP:
-        return SYMBOL_MAP[s]
-    candidate = f"{s}USDT"
-    if fetch_price_binance(candidate) is not None:
-        return candidate
+    # minimal heuristic: assume USDT if not specified
+    return f"{s}USDT"
+
+
+def fetch_price_binance(symbol_pair: str) -> float | None:
+    """
+    Lightweight spot price from Binance public API.
+    """
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": symbol_pair},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            j = r.json()
+            return float(j.get("price"))
+    except Exception:
+        return None
     return None
 
-def _should_fire(rule: str, value: float, price: float) -> bool:
-    return (price > value) if rule == "price_above" else (price < value)
 
-def _send_alert_message(tg_id: str, seq: int, symbol: str, rule: str, value: float, price: float, alert_id: int):
-    op = ">" if rule == "price_above" else "<"
-    text_msg = (
-        f"🔔 Alert <b>A{seq}</b>\n"
-        f"Symbol: <b>{symbol}</b>\n"
-        f"Rule: {op} {value}\n"
-        f"Price: <b>{price}</b>\n"
-        f"Time: {datetime.utcnow().isoformat(timespec='seconds')}Z"
-    )
-    kb = {
-        "inline_keyboard": [[
-            {"text": "✅ Keep", "callback_data": f"ack:keep:{alert_id}"},
-            {"text": "🗑️ Delete", "callback_data": f"ack:del:{alert_id}"},
-        ]]
-    }
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+# ────────────────────────────────────────────────────────────────────
+# Telegram send helper
+
+def _send_telegram_message(chat_id: str, html: str, reply_markup: Dict[str, Any] | None = None) -> bool:
+    if not BOT_TOKEN:
+        return False
     try:
-        r = requests.post(
-            url,
-            json={"chat_id": tg_id, "text": text_msg, "parse_mode": "HTML",
-                  "disable_web_page_preview": True, "reply_markup": kb},
-            timeout=15,
-        )
-        print({"msg":"send_alert_message", "chat_id": tg_id, "status": r.status_code, "body": r.text[:120]})
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": html,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        r = requests.post(url, json=payload, timeout=15)
+        ok = r.status_code == 200 and r.json().get("ok") is True
+        if not ok:
+            print({"msg": "send_alert_message_fail", "chat_id": chat_id, "status": r.status_code, "body": r.text[:200]})
+        return ok
     except Exception as e:
-        print({"msg":"send_alert_exception", "error": str(e)})
+        print({"msg": "send_alert_message_exception", "chat_id": chat_id, "error": str(e)})
+        return False
 
-def resolve_price_for_alert(sym: str) -> float | None:
-    return fetch_price_binance(sym)
 
-def run_alert_cycle(session) -> dict:
-    evaluated = triggered = errors = 0
+def _ack_inline_buttons(alert_id: int):
+    # (same callback scheme used by server_combined.on_callback)
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "👍 Keep", "callback_data": f"ack:keep:{alert_id}"},
+                {"text": "🗑️ Delete", "callback_data": f"ack:del:{alert_id}"},
+            ]
+        ]
+    }
 
-    rows = session.execute(text("""
-        SELECT a.id, a.user_id, a.user_seq, a.symbol, a.rule, a.value, a.cooldown_seconds,
-               a.last_fired_at, a.last_met, u.telegram_id
+
+# ────────────────────────────────────────────────────────────────────
+# Main alert runner
+
+def run_alert_cycle(session) -> Dict[str, int]:
+    """
+    Evaluate user alerts and send notifications.
+    Must be called with an active SQLAlchemy session bound to the same engine as db.session_scope.
+    Returns counters for logging.
+    """
+    evaluated = 0
+    triggered = 0
+    errors = 0
+
+    # Schema assumptions:
+    #  - users(id BIGSERIAL PK, telegram_id TEXT UNIQUE)
+    #  - alerts(
+    #       id BIGSERIAL PK,
+    #       user_id BIGINT,
+    #       symbol TEXT,              -- e.g. BTCUSDT
+    #       rule TEXT,                -- 'price_above' | 'price_below'
+    #       value NUMERIC,            -- threshold
+    #       cooldown_seconds INT,     -- NULL/0 -> DEFAULT_COOLDOWN
+    #       enabled BOOLEAN,
+    #       last_fired_at TIMESTAMPTZ NULL,
+    #       user_seq INT              -- optional per-user numbering
+    #    )
+    #
+    # Any differences with your existing schema are easy to patch; the queries below are conservative.
+
+    rows = session.execute(text(
+        """
+        SELECT a.id, a.user_id, a.symbol, a.rule, a.value, a.cooldown_seconds,
+               a.enabled, a.last_fired_at,
+               COALESCE(u.telegram_id, '') AS telegram_id
         FROM alerts a
-        LEFT JOIN users u ON u.id = a.user_id
+        JOIN users u ON u.id = a.user_id
         WHERE a.enabled = TRUE
         ORDER BY a.id ASC
         LIMIT 500
-    """)).all()
-
-    if not rows:
-        return {"evaluated": 0, "triggered": 0, "errors": 0}
-
-    symbols = sorted({r.symbol for r in rows})
-    prices = {sym: resolve_price_for_alert(sym) for sym in symbols}
-    now = datetime.utcnow()
+        """
+    )).all()
 
     for r in rows:
         evaluated += 1
-        price = prices.get(r.symbol)
-        if price is None:
-            continue
         try:
-            meet = _should_fire(r.rule, float(r.value), float(price))
-            cooldown = int(r.cooldown_seconds or ALERT_COOLDOWN_DEFAULT)
-            can_fire = True
-            if r.last_fired_at:
-                if (now - r.last_fired_at) < timedelta(seconds=cooldown):
-                    can_fire = False
+            symbol = r.symbol
+            pair = symbol if symbol and symbol.endswith("USDT") else resolve_symbol(symbol)
+            if not pair:
+                continue
 
-            session.execute(text("UPDATE alerts SET last_met = :met WHERE id = :id"),
-                            {"met": bool(meet), "id": r.id})
+            price = fetch_price_binance(pair)
+            if price is None:
+                continue
 
-            if meet and can_fire and r.telegram_id:
-                _send_alert_message(
-                    tg_id=str(r.telegram_id),
-                    seq=int(r.user_seq) if r.user_seq is not None else int(r.id),
-                    symbol=r.symbol, rule=r.rule, value=float(r.value),
-                    price=float(price), alert_id=int(r.id),
+            rule = r.rule or ""
+            threshold = float(r.value)
+
+            # cooldown
+            cooldown = int(r.cooldown_seconds or 0) or DEFAULT_COOLDOWN
+            last_ts = r.last_fired_at
+            if last_ts is not None:
+                diff = datetime.utcnow() - last_ts
+                if diff.total_seconds() < cooldown:
+                    # still cooling
+                    continue
+
+            # evaluate
+            ok = False
+            if rule == "price_above":
+                ok = price > threshold
+            elif rule == "price_below":
+                ok = price < threshold
+
+            if not ok:
+                continue
+
+            # Triggered → send notification + update last_fired_at + store snapshot for feedback
+            html = (
+                f"🔔 <b>{pair}</b> {('>' if rule=='price_above' else '<')} {threshold}\n"
+                f"Now: <b>{price:.6f}</b>"
+            )
+            sent = False
+            if r.telegram_id:
+                sent = _send_telegram_message(str(r.telegram_id), html, reply_markup=_ack_inline_buttons(r.id))
+
+            # Update cooldown regardless of send success to avoid spamming when chat_id is invalid
+            session.execute(text(
+                "UPDATE alerts SET last_fired_at = NOW() WHERE id = :id"
+            ), {"id": r.id})
+            session.commit()
+
+            # Record for feedback loop
+            try:
+                record_alert_trigger(
+                    alert_id=int(r.id),
+                    user_id=int(r.user_id),
+                    symbol=pair,
+                    rule=rule,
+                    threshold=threshold,
+                    trigger_price=float(price),
                 )
-                session.execute(text("UPDATE alerts SET last_fired_at = NOW() WHERE id = :id"),
-                                {"id": r.id})
+            except Exception as e:
+                print({"msg": "record_alert_trigger_error", "id": r.id, "error": str(e)})
+
+            if sent:
                 triggered += 1
 
-        except Exception:
+        except Exception as e:
             errors += 1
+            print({"msg": "alert_eval_error", "id": getattr(r, "id", None), "error": str(e)})
 
     return {"evaluated": evaluated, "triggered": triggered, "errors": errors}

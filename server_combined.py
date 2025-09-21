@@ -15,7 +15,6 @@ from fastapi.responses import RedirectResponse, PlainTextResponse, JSONResponse
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import Conflict, TimedOut as TgTimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 from sqlalchemy import text
@@ -24,18 +23,21 @@ from sqlalchemy import text
 from db import init_db, session_scope, engine
 from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
 from commands_extra import register_extra_handlers
-from worker_extra import start_pump_watcher
 from models_extras import init_extras
 from plans import build_plan_info, can_create_alert, plan_status_line
 from altcoins_info import get_off_binance_info, list_off_binance, list_presales
-from commands_admin import register_admin_handlers  # Admin module
-from commands_plus import register_plus_handlers   # Plus pack (AI-like utilities)
+from commands_admin import register_admin_handlers
+from commands_plus import register_plus_handlers
+
+# NEW modules (advisor + feedback schedulers & commands)
+from commands_advisor import register_advisor_handlers
+from advisor_features import start_advisor_scheduler
+from feedback_followup import start_feedback_scheduler
 
 # ─────────────────────────── ENV / CONFIG ───────────────────────────
 
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 WEB_URL = (os.getenv("WEB_URL") or "").strip() or None
-ADMIN_KEY = (os.getenv("ADMIN_KEY") or "").strip() or None
 
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
 FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "10"))
@@ -128,7 +130,6 @@ def upgrade_keyboard(tg_id: str | None):
     return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade with PayPal", url=u)]]) if u else None
 
 def start_text() -> str:
-    # Short capability snapshot + getting started
     return (
         "<b>Crypto Alerts Bot</b>\n"
         "⚡ Fast prices • 🧪 Diagnostics • 🔔 Alerts\n\n"
@@ -137,6 +138,8 @@ def start_text() -> str:
         "• Alerts: <code>/setalert BTC &gt; 110000</code>, <code>/myalerts</code> (delete buttons)\n"
         "• Market tools: <code>/feargreed</code>, <code>/funding</code>, <code>/topgainers</code>, <code>/toplosers</code>, <code>/news</code>, <code>/dca</code>\n"
         "• Plus pack: <code>/dailyai</code>, <code>/advisor</code>, <code>/whatif</code>, <code>/portfolio_sim</code>, <code>/impactnews</code>, <code>/topalertsboard</code>\n"
+        "• Advisor (persistent): <code>/setadvisor</code>, <code>/myadvisor</code>, <code>/rebalance_now</code>\n"
+        "• Alerts feedback: automatic follow-up +2h/+6h\n"
         "• Alts & Presales: <code>/listalts</code>, <code>/listpresales</code>, <code>/alts &lt;SYMBOL&gt;</code>\n\n"
         "<b>Getting Started</b>\n"
         "• <code>/price BTC</code> — current price\n"
@@ -146,14 +149,7 @@ def start_text() -> str:
         "• <code>/support &lt;message&gt;</code> — contact admin support\n\n"
         "💎 <b>Premium</b>: unlimited alerts\n"
         f"🆓 <b>Free</b>: up to <b>{FREE_ALERT_LIMIT}</b> alerts.\n\n"
-        "<b>Extra Features</b>\n"
-        "• <code>/feargreed</code> • <code>/funding [SYMBOL]</code>\n"
-        "• <code>/topgainers</code> • <code>/toplosers</code>\n"
-        "• <code>/chart &lt;SYMBOL&gt;</code> • <code>/news [N]</code>\n"
-        "• <code>/dca &lt;amount_per_buy&gt; &lt;buys&gt; &lt;symbol&gt;</code>\n"
-        "• <code>/pumplive on|off [threshold%]</code>\n"
-        "• <code>/listalts</code>, <code>/listpresales</code>, <code>/alts &lt;SYMBOL&gt;</code>\n\n"
-        "🌱 <b>New &amp; Off-Binance</b> — Try <code>/alts HYPER</code> or <code>/alts OZ</code> for info.\n"
+        "🌱 <b>New & Off-Binance</b> — Try <code>/alts HYPER</code> or <code>/alts OZ</code> for info.\n"
         "If a token gets listed on Binance later, <code>/price</code> will auto-detect it.\n"
     )
 
@@ -247,7 +243,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     help_html = (
         "<b>Help</b>\n\n"
-        "• <code>/price &lt;SYMBOL&gt;</code> → Spot price (auto-detects new Binance USDT listings)\n"
+        "• <code>/price &lt;SYMBOL&gt;</code> → Spot price (auto-detect new Binance USDT listings)\n"
         "• <code>/setalert &lt;SYMBOL&gt; &lt;op&gt; &lt;value&gt;</code>  e.g. <code>/setalert BTC &gt; 110000</code>\n"
         "• <code>/myalerts</code> → list your alerts\n"
         "• <code>/delalert &lt;id&gt;</code>, <code>/clearalerts</code> → Premium\n"
@@ -263,9 +259,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/listpresales</code> → curated presales (very high risk)\n\n"
         "<b>Plus Pack</b>\n"
         "• <code>/dailyai [SYMBOLS]</code> • <code>/advisor &lt;budget&gt; &lt;low|medium|high&gt;</code>\n"
-        "• <code>/whatif &lt;SYMBOL&gt; &lt;long|short&gt; &lt;entry&gt; [hours]</code>\n"
+        "• <code>/whatif &lt;SYMBOL&gt; &lt;long|short&gt; &lt;entry&gt; [leverage]</code>\n"
         "• <code>/portfolio_sim &lt;positions&gt; &lt;shock&gt;</code>\n"
         "• <code>/impactnews &lt;headline&gt;</code> • <code>/topalertsboard</code>\n"
+        "• <code>/setadvisor</code> • <code>/myadvisor</code> • <code>/rebalance_now</code> (daily advisor)\n"
     )
     for chunk in safe_chunks(help_html):
         await target_msg(update).reply_text(
@@ -606,6 +603,9 @@ def run_bot():
         # Plus pack
         register_plus_handlers(app)
 
+        # Advisor commands
+        register_advisor_handlers(app)
+
         # Admin module
         register_admin_handlers(app, _ADMIN_IDS)
 
@@ -613,7 +613,6 @@ def run_bot():
         app.add_handler(CallbackQueryHandler(on_callback))
 
         print({"msg": "bot_start"})
-        # Simple run; let the platform restart on failure
         app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
     finally:
@@ -636,11 +635,12 @@ def main():
     ).start()
     threading.Thread(target=bot_heartbeat_loop, daemon=True).start()
 
+    # Background schedulers
+    start_advisor_scheduler()   # Daily advisor notifications
+    start_feedback_scheduler()  # +2h/+6h alert feedback loop
+
     # Alerts worker
     threading.Thread(target=alerts_loop, daemon=True).start()
-
-    # Pump watcher (extra)
-    start_pump_watcher()
 
     # Bot (polling)
     run_bot()
