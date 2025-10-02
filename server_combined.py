@@ -1,18 +1,14 @@
 # server_combined.py
 import os
-import threading
-import time
 import logging
 from datetime import datetime, timedelta
 
-import uvicorn
-import requests
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-
+import httpx
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes
+    Application, ApplicationBuilder, CommandHandler, ContextTypes
 )
 
 # ────────────────────────── Config / Logging ──────────────────────────
@@ -23,7 +19,6 @@ log = logging.getLogger("server_combined")
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # βάλε το δικό σου Telegram user id
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "10"))
-PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing token: set BOT_TOKEN or TELEGRAM_TOKEN in environment")
@@ -51,32 +46,34 @@ def has_access(uid: int) -> bool:
         return True
     return datetime.utcnow() <= u["trial_end"]
 
-# ──────────────────────── Telegram Bot ───────────────────────
-_bot_app = None
+# ──────────────────────── Telegram Bot (async) ───────────────────────
+application: Application | None = None
 _bot_started = False
-_last_alerts_ok = None
-_last_bot_ok = None
-_bot_username = None  # from getMe
+_last_alerts_ok: datetime | None = None
+_bot_username: str | None = None
 
-def _delete_webhook():
+async def _delete_webhook_async():
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
     try:
-        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=10)
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
         log.info("deleteWebhook status=%s body=%s", r.status_code, r.text[:160])
     except Exception as e:
         log.warning("deleteWebhook error: %s", e)
 
-def _get_me():
+async def _get_me_async():
     global _bot_username
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
     try:
-        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=10)
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
         data = r.json()
         if data.get("ok"):
             _bot_username = data["result"].get("username")
             log.info("getMe ok: id=%s username=@%s", data["result"].get("id"), _bot_username)
             return True
-        else:
-            log.error("getMe failed: %s", r.text)
-            return False
+        log.error("getMe failed: %s", r.text)
+        return False
     except Exception as e:
         log.error("getMe exception: %s", e)
         return False
@@ -208,92 +205,87 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     premiums = sum(1 for v in users_db.values() if v["premium"])
     await update.message.reply_text(f"📊 Users: {total}\n⭐ Premium: {premiums}\n🤖 Bot: @{_bot_username or 'unknown'}")
 
-def _bot_thread():
-    """Runs the Telegram bot in polling mode (single instance)"""
-    global _bot_app, _last_bot_ok
-
-    # Make sure webhook is removed for polling
-    _delete_webhook()
-
-    # Log /getMe to verify token and bot identity
-    _get_me()
-
-    log.info("Starting Telegram bot polling…")
-    try:
-        _bot_app = (
-            ApplicationBuilder()
-            .token(BOT_TOKEN)
-            .read_timeout(40)
-            .connect_timeout(15)
-            .build()
-        )
-
-        # User commands
-        _bot_app.add_handler(CommandHandler("ping", cmd_ping))
-        _bot_app.add_handler(CommandHandler("whoami", cmd_whoami))
-        _bot_app.add_handler(CommandHandler("start", cmd_start))
-        _bot_app.add_handler(CommandHandler("help", cmd_help))
-        _bot_app.add_handler(CommandHandler("support", cmd_support))
-        _bot_app.add_handler(CommandHandler("price", cmd_price))
-
-        # Admin-only commands (ελέγχονται μέσα στους handlers)
-        _bot_app.add_handler(CommandHandler("listusers", cmd_listusers))
-        _bot_app.add_handler(CommandHandler("extend", cmd_extend))
-        _bot_app.add_handler(CommandHandler("setpremium", cmd_setpremium))
-        _bot_app.add_handler(CommandHandler("stats", cmd_stats))
-
-        _bot_app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-    except Exception as e:
-        log.exception("Bot polling crashed: %s", e)
-    finally:
-        _last_bot_ok = datetime.utcnow()
-
-def _alerts_thread():
-    """Dummy alerts loop για health /alertsok (βάλε τη δική σου λογική εδώ)."""
-    global _last_alerts_ok
-    log.info("Starting alerts loop…")
-    while True:
-        try:
-            _last_alerts_ok = datetime.utcnow()
-            time.sleep(60)
-        except Exception as e:
-            log.error("alerts_loop error: %s", e)
-            time.sleep(60)
-
 # ─────────────────────── FastAPI (health_app) ───────────────────────
 health_app = FastAPI(title="Crypto Alerts Health")
 
 @health_app.on_event("startup")
-def on_startup():
-    # Ξεκίνησε bot + alerts σε background threads όταν σηκώνεται το ASGI app
-    global _bot_started
-    if not _bot_started:
-        threading.Thread(target=_bot_thread, daemon=True).start()
-        threading.Thread(target=_alerts_thread, daemon=True).start()
-        _bot_started = True
-        log.info("Background workers started (bot + alerts)")
+async def on_startup():
+    """Ξεκινάει τον Telegram bot σε async mode στο ίδιο event loop του Uvicorn."""
+    global application, _bot_started
 
+    if _bot_started:
+        return
+
+    # 1) Καθαρίζουμε webhook για polling
+    await _delete_webhook_async()
+
+    # 2) Χτίζουμε Application & Handlers
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .read_timeout(40)
+        .connect_timeout(15)
+        .build()
+    )
+
+    # User commands
+    application.add_handler(CommandHandler("ping", cmd_ping))
+    application.add_handler(CommandHandler("whoami", cmd_whoami))
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("support", cmd_support))
+    application.add_handler(CommandHandler("price", cmd_price))
+
+    # Admin commands
+    application.add_handler(CommandHandler("listusers", cmd_listusers))
+    application.add_handler(CommandHandler("extend", cmd_extend))
+    application.add_handler(CommandHandler("setpremium", cmd_setpremium))
+    application.add_handler(CommandHandler("stats", cmd_stats))
+
+    # 3) initialize → start → start_polling (όλα async στο ίδιο loop)
+    await application.initialize()
+    await application.start()
+    await _get_me_async()
+    await application.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+    _bot_started = True
+    log.info("Telegram bot started (async polling).")
+
+@health_app.on_event("shutdown")
+async def on_shutdown():
+    """Σταματάει ομαλά το polling & το application όταν σβήνει το ASGI app."""
+    global application, _bot_started
+    if application:
+        try:
+            await application.updater.stop()
+        except Exception:
+            pass
+        try:
+            await application.stop()
+        except Exception:
+            pass
+        try:
+            await application.shutdown()
+        except Exception:
+            pass
+    _bot_started = False
+    log.info("Telegram bot stopped.")
+
+# Health endpoints
 @health_app.api_route("/", methods=["GET", "HEAD"])
-def root():
+async def root():
     return JSONResponse({"ok": True, "service": "crypto-alerts-bot"})
 
 @health_app.api_route("/health", methods=["GET", "HEAD"])
-def health():
+async def health():
     return JSONResponse({"status": "ok", "time": datetime.utcnow().isoformat() + "Z"})
 
 @health_app.api_route("/botok", methods=["GET", "HEAD"])
-def botok():
+async def botok():
     status = "running" if _bot_started else "not_started"
     return JSONResponse({"bot": status, "username": _bot_username})
 
 @health_app.api_route("/alertsok", methods=["GET", "HEAD"])
-def alertsok():
-    ts = _last_alerts_ok.isoformat() + "Z" if _last_alerts_ok else None
-    return JSONResponse({"last_ok": ts})
-
-# ───────────────────────── Local run helper ─────────────────────────
-def main():
-    uvicorn.run(health_app, host="0.0.0.0", port=PORT, log_level="info")
-
-if __name__ == "__main__":
-    main()
+async def alertsok():
+    # εδώ μπορείς να βάλεις πραγματικό heartbeat από loop alerts
+    return JSONResponse({"last_ok": None})
