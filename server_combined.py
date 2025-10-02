@@ -31,7 +31,7 @@ from altcoins_info import get_off_binance_info, list_off_binance, list_presales
 from commands_plus import register_plus_handlers
 from commands_advisor import register_advisor_handlers
 from advisor_features import start_advisor_scheduler
-from feedback_followup import start_feedback_scheduler
+from feedback_followup import start_feedback_scheduler  # uses fallback if column missing
 
 # ───────────────────── Configuration ─────────────────────
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
@@ -242,28 +242,28 @@ def safe_chunks(s: str, limit: int = 3800):
 def op_from_rule(rule: str) -> str:
     return ">" if rule == "price_above" else "<"
 
-# ───────────────────── FastAPI health ─────────────────────
+# ───────────────────── FastAPI health (GET/HEAD) ─────────────────────
 health_app = FastAPI()
 _BOT_HEART_BEAT_AT = None
 _BOT_HEART_STATUS = "unknown"
 _ALERTS_LAST_OK_AT = None
 _ALERTS_LAST_RESULT = None
 
-@health_app.get("/")
+@health_app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"ok": True, "service": "crypto-alerts-server"}
 
-@health_app.get("/health")
+@health_app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok"}
 
-@health_app.get("/botok")
+@health_app.api_route("/botok", methods=["GET", "HEAD"])
 def botok():
     now = datetime.utcnow()
     stale = (_BOT_HEART_BEAT_AT is None) or ((now - _BOT_HEART_BEAT_AT) > timedelta(seconds=_BOT_HEART_TTL))
     return {"bot": ("stale" if stale else _BOT_HEART_STATUS)}
 
-@health_app.get("/alertsok")
+@health_app.api_route("/alertsok", methods=["GET", "HEAD"])
 def alertsok():
     return {"last_ok": _ALERTS_LAST_OK_AT.isoformat() + "Z" if _ALERTS_LAST_OK_AT else None,
             "last_result": _ALERTS_LAST_RESULT or {}}

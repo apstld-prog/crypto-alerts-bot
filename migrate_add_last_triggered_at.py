@@ -1,24 +1,23 @@
 # migrate_add_last_triggered_at.py
 import os
 import sys
-from datetime import datetime
 from sqlalchemy import create_engine, text
 
 def main():
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
-        print("ERROR: DATABASE_URL not set in environment.")
+        print("ERROR: DATABASE_URL not set.")
         sys.exit(1)
 
     engine = create_engine(db_url, pool_pre_ping=True, future=True)
     with engine.begin() as conn:
-        # 1) Add column if missing
+        # 1) Add missing column
         conn.execute(text("""
             ALTER TABLE IF NOT EXISTS alerts
             ADD COLUMN IF NOT EXISTS last_triggered_at TIMESTAMPTZ NULL;
         """))
 
-        # 2) Optional: backfill from alert_triggers (if table exists)
+        # 2) Backfill from alert_triggers if exists
         conn.execute(text("""
             DO $$
             BEGIN
@@ -46,7 +45,7 @@ def main():
             ON alerts (last_triggered_at DESC);
         """))
 
-    print("OK: alerts.last_triggered_at ensured + backfilled (if possible).")
+    print("OK: alerts.last_triggered_at ensured/backfilled.")
 
 if __name__ == "__main__":
     main()

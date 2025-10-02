@@ -3,21 +3,29 @@ REM ============================================
 REM Full automation: migration + commit + push
 REM ============================================
 
-echo [1/4] Activating venv...
-call .venv\Scripts\activate
+cd /d "%~dp0"
 
-echo [2/4] Running migration script (if exists)...
-if exist migrate_add_last_triggered_at.py (
-    python migrate_add_last_triggered_at.py
+echo [1/5] Activating venv...
+if exist ".venv\Scripts\activate" (
+  call .venv\Scripts\activate
 ) else (
-    echo No migration script found, skipping...
+  echo WARNING: .venv not found. Continuing without venv...
 )
 
-echo [3/4] Git commit & push...
+echo [2/5] Running migrations (if present)...
+if exist migrate_add_last_triggered_at.py (
+  python migrate_add_last_triggered_at.py
+) else (
+  echo No migration scripts found, skipping...
+)
+
+echo [3/5] Git stage & commit...
 git add -A
 git commit -m "Auto: migration + latest changes" || echo Nothing to commit.
-git push
 
-echo [4/4] Done! Render will auto-redeploy if connected to this repo.
+echo [4/5] Pushing to origin/main...
+git push -u origin main
+
+echo [5/5] Done. If Render is linked, it will redeploy automatically.
 echo.
 pause
