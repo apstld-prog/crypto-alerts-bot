@@ -1,17 +1,2 @@
-﻿# .gitignore
-__pycache__/
-*.pyc
-.venv/
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
-*.zip
-*.pdf
-*.doc
-*.docx
-*.png
-*.jpg
-*.jpeg
-*.gif
-*.ico
+Renaming gitignore -
+cryptoalerts77_full_project_pack_signed/
