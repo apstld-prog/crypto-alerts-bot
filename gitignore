@@ -1,0 +1,63 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# --- Node / JS ---
+node_modules/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- IDE ---
+.vscode/
+.idea/
+
+# --- Env & secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Logs ---
+logs/
+*.log
+
+# --- Caches & test artifacts ---
+.cache/
+.mypy_cache/
+.pytest_cache/
+.coverage*
+.tox/
+htmlcov/
+
+# --- Local DBs ---
+*.db
+*.sqlite*
+
+# --- Render/local misc ---
+.startup.log
+
+# --- Project-specific (mobile package & artifacts) ---
+cryptoalerts77_full_project_pack_signed/
+# If you plan to keep a Flutter/React Native app outside this repo, ignore these too:
+android/
+ios/
+macos/
+windows/
+linux/
+flutter_export_environment.sh
+*.aab
+*.apk
+*.ipa
+
+# --- Misc ---
+*.bak
+*.tmp
