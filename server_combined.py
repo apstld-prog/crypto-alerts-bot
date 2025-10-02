@@ -46,7 +46,7 @@ TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "10"))
 ADMIN_IDS_ENV = os.getenv("ADMIN_TELEGRAM_IDS") or ""
 _ADMIN_IDS = {s.strip() for s in ADMIN_IDS_ENV.split(",") if s.strip()}
 
-BOT_LOCK_ID = int(os.getenv("BOT_LOCK_ID", "911001"))
+BOT_LOCK_ID = int(os.getenv("BOT_LOCK_ID", "921001"))
 ALERTS_LOCK_ID = int(os.getenv("ALERTS_LOCK_ID", "911002"))
 
 BOT_HEARTBEAT_INTERVAL = int(os.getenv("BOT_HEART_INTERVAL_SECONDS", "60"))
@@ -548,9 +548,9 @@ def delete_webhook_if_any():
     except Exception as e:
         print({"msg": "delete_webhook_exception", "error": str(e)})
 
-# ====== Bot runner (thread με ασφαλές asyncio.run) ======
+# ====== Bot runner (thread με ΔΙΚΟ ΤΟΥ event loop) ======
 def run_bot():
-    """Start PTB in a dedicated thread using asyncio.run (χωρίς manual loop close)."""
+    """Start PTB in a dedicated thread with its own event loop (όχι asyncio.run)."""
     global _BOT_THREAD_ALIVE, _BOT_LOCK_HELD
     _BOT_THREAD_ALIVE = True
 
@@ -604,7 +604,7 @@ def run_bot():
         app.add_handler(CommandHandler("listalts", cmd_listalts))
         app.add_handler(CommandHandler("listpresales", cmd_listpresales))
 
-        # Extras & admin (όπως τα έχεις σε αρχεία)
+        # Extras & admin
         register_extra_handlers(app)
         register_admin_handlers(app, _ADMIN_IDS)
 
@@ -616,7 +616,7 @@ def run_bot():
             "trial_days": TRIAL_DAYS
         })
 
-        # Δεν εγγράφουμε signal handlers (τρέχουμε σε thread)
+        # Πολύ σημαντικό: δεν γράφουμε signal handlers (τρέχουμε σε thread)
         await app.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
@@ -625,9 +625,11 @@ def run_bot():
             stop_signals=None,
         )
 
+    # === ΔΙΚΟ ΤΟΥ event loop στο thread ===
+    loop = asyncio.new_event_loop()
     try:
-        # Ασφαλής εκτέλεση χωρίς manual loop close
-        asyncio.run(_runner())
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_runner())
         print({"msg": "bot_polling_stopped_normally"})
     except Conflict as e:
         print({"msg": "bot_conflict_exit", "error": str(e)})
@@ -637,6 +639,16 @@ def run_bot():
         print({"msg": "bot_generic_exit", "error": str(e)})
     finally:
         try:
+            # Σταματάμε ευγενικά και ΚΛΕΙΝΟΥΜΕ το loop μόνο αν δεν τρέχει
+            if loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+                # δώσε λίγο χρόνο να σταματήσει
+                time.sleep(0.05)
+            if not loop.is_closed():
+                loop.close()
+        except Exception:
+            pass
+        try:
             lock_conn.close()
         except Exception:
             pass
@@ -645,8 +657,6 @@ def run_bot():
         print({"msg": "bot_thread_exit"})
 
 # ====== Startup hooks (ώστε να δουλεύει με uvicorn server_combined:health_app) ======
-_STARTED = False
-
 def _start_all_once():
     global _STARTED
     if _STARTED:
@@ -667,7 +677,7 @@ def _start_all_once():
     # Pump watcher (αν το έχεις ενεργό)
     start_pump_watcher()
 
-    # BOT σε ξεχωριστό thread (τρέχει asyncio.run εσωτερικά)
+    # BOT σε ξεχωριστό thread με δικό του loop
     threading.Thread(target=run_bot, daemon=True).start()
 
     print({"msg": "startup_threads_spawned"})
