@@ -5,6 +5,7 @@ import os
 import re
 import time
 import threading
+import asyncio
 from datetime import datetime, timedelta
 
 import requests
@@ -547,25 +548,29 @@ def delete_webhook_if_any():
     except Exception as e:
         print({"msg": "delete_webhook_exception", "error": str(e)})
 
-# ====== Bot runner (thread) ======
+# ====== Bot runner (thread with its own asyncio loop) ======
 def run_bot():
-    """Start polling with retries; log everything clearly."""
+    """Start PTB in a dedicated asyncio event loop inside this thread."""
     global _BOT_THREAD_ALIVE, _BOT_LOCK_HELD
     _BOT_THREAD_ALIVE = True
 
     if not RUN_BOT:
         print({"msg": "bot_disabled_env"}); return
 
+    # Acquire advisory lock so μόνο μια instance κάνει polling
     lock_conn = engine.connect()
     got = lock_conn.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": BOT_LOCK_ID}).scalar()
     if not got:
         print({"msg": "advisory_lock_busy", "lock": "bot", "id": BOT_LOCK_ID})
         lock_conn.close(); return
-
     _BOT_LOCK_HELD = True
     print({"msg": "advisory_lock_acquired", "lock": "bot", "id": BOT_LOCK_ID})
 
-    try:
+    # Δημιουργία event loop για το thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    async def _runner():
         delete_webhook_if_any()
 
         app = (
@@ -591,7 +596,7 @@ def run_bot():
         app.add_handler(CommandHandler("setpremium", cmd_setpremium))
         app.add_handler(CommandHandler("stats", cmd_stats))
 
-        # Legacy σου
+        # Legacy
         app.add_handler(CommandHandler("price", cmd_price))
         app.add_handler(CommandHandler("setalert", cmd_setalert))
         app.add_handler(CommandHandler("myalerts", cmd_myalerts))
@@ -618,22 +623,32 @@ def run_bot():
             "trial_days": TRIAL_DAYS
         })
 
-        backoff = 5
-        while True:
-            try:
-                app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-                print({"msg": "bot_polling_stopped_normally"})
-                break
-            except Conflict as e:
-                print({"msg": "bot_conflict_retry", "error": str(e)})
-                time.sleep(5)
-            except TgTimedOut as e:
-                print({"msg": "bot_timeout_retry", "error": str(e), "sleep": backoff})
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-            except Exception as e:
-                print({"msg": "bot_generic_retry", "error": str(e), "sleep": 10})
-                time.sleep(10)
+        # Manual lifecycle ώστε να τρέχει μέσα στο loop αυτού του thread
+        await app.initialize()
+        await app.start()
+        try:
+            # Updater-based polling (v20) ως coroutine
+            await app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                poll_interval=1.0,
+                timeout=40,
+            )
+            await app.updater.wait_until_closed()
+        finally:
+            await app.stop()
+            await app.shutdown()
+
+    try:
+        # Τρέχουμε το _runner μέσα στο δικό μας loop
+        loop.run_until_complete(_runner())
+        print({"msg": "bot_polling_stopped_normally"})
+    except Conflict as e:
+        print({"msg": "bot_conflict_exit", "error": str(e)})
+    except TgTimedOut as e:
+        print({"msg": "bot_timeout_exit", "error": str(e)})
+    except Exception as e:
+        print({"msg": "bot_generic_exit", "error": str(e)})
     finally:
         try:
             lock_conn.close()
@@ -641,9 +656,13 @@ def run_bot():
             pass
         _BOT_LOCK_HELD = False
         _BOT_THREAD_ALIVE = False
+        loop.run_until_complete(asyncio.sleep(0))
+        loop.close()
         print({"msg": "bot_thread_exit"})
 
 # ====== Startup hooks (ώστε να δουλεύει με uvicorn server_combined:health_app) ======
+_STARTED = False
+
 def _start_all_once():
     global _STARTED
     if _STARTED:
@@ -664,19 +683,17 @@ def _start_all_once():
     # Pump watcher (αν το έχεις ενεργό)
     start_pump_watcher()
 
-    # BOT σε ξεχωριστό thread
+    # BOT σε ξεχωριστό thread με δικό του loop
     threading.Thread(target=run_bot, daemon=True).start()
 
     print({"msg": "startup_threads_spawned"})
 
 @health_app.on_event("startup")
 async def on_fastapi_startup():
-    # Όταν ο uvicorn φορτώνει το health_app, ξεκινάμε όλα τα threads.
     _start_all_once()
 
 # ====== Entry point (άμα το τρέξεις ως script) ======
 def main():
-    # Αν το τρέξεις ως python server_combined.py, πάλι ξεκινάει το ίδιο
     _start_all_once()
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run(health_app, host="0.0.0.0", port=port, log_level="info")
