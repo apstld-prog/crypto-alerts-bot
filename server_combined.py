@@ -31,7 +31,7 @@ from altcoins_info import get_off_binance_info, list_off_binance, list_presales
 from commands_plus import register_plus_handlers
 from commands_advisor import register_advisor_handlers
 from advisor_features import start_advisor_scheduler
-from feedback_followup import start_feedback_scheduler  # uses fallback if column missing
+from feedback_followup import start_feedback_scheduler  # has fallback if column missing
 
 # ───────────────────── Configuration ─────────────────────
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
@@ -509,6 +509,16 @@ async def cmd_userstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c = count_users_started()
     await update.effective_message.reply_text(f"👥 Users who pressed /start (trial started): {c}")
 
+async def cmd_adminhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    await update.effective_message.reply_text(
+        "🛡 Admin commands:\n"
+        "• /grant <telegram_id> <days> — Give premium days\n"
+        "• /userstats — Count users who pressed /start\n"
+        "• /whoami — Show current access (you’re admin)"
+    )
+
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     active, days = has_active_access(tg_id)
@@ -627,17 +637,24 @@ def run_bot():
             .build()
         )
 
+        # ── Admin-only filter at dispatcher level
+        ADMIN_ID_LIST = [int(x) for x in ADMIN_IDS if x]
+        admin_filter = filters.User(user_id=ADMIN_ID_LIST)
+
         # Access guard BEFORE all commands (except /start)
         app.add_handler(MessageHandler(filters.COMMAND & (~filters.Regex(r"^/start")), access_guard), group=-1)
 
-        # Core & admin
+        # Core & general
         app.add_handler(CommandHandler("start", cmd_start))
         app.add_handler(CommandHandler("help", cmd_help))
         app.add_handler(CommandHandler("whoami", cmd_whoami))
-        app.add_handler(CommandHandler("userstats", cmd_userstats))  # admin
-        app.add_handler(CommandHandler("grant", cmd_grant))          # admin
 
-        # Price & alerts
+        # Admin-only (registered with filter)
+        app.add_handler(CommandHandler("grant", cmd_grant), admin_filter)
+        app.add_handler(CommandHandler("userstats", cmd_userstats), admin_filter)
+        app.add_handler(CommandHandler("adminhelp", cmd_adminhelp), admin_filter)
+
+        # Price & alerts (general)
         app.add_handler(CommandHandler("price", cmd_price))
         app.add_handler(CommandHandler("setalert", cmd_setalert))
         app.add_handler(CommandHandler("myalerts", cmd_myalerts))
