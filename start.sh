@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -euo pipefail
 
-# Move to repo root (where this script lives)
-cd "$(dirname "$0")"
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 
-# Diagnostics
-python -V
-pip -V
-
-# Run the single-process server (bot + alerts + health + alerts loop)
-exec python server_combined.py
+export PYTHONUNBUFFERED=1
+uvicorn server_combined:health_app --host 0.0.0.0 --port "${PORT:-8080}"
