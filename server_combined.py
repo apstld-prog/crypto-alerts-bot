@@ -548,7 +548,7 @@ def delete_webhook_if_any():
     except Exception as e:
         print({"msg": "delete_webhook_exception", "error": str(e)})
 
-# ====== Bot runner (thread with its own asyncio loop) ======
+# ====== Bot runner (thread με το δικό του asyncio loop) ======
 def run_bot():
     """Start PTB in a dedicated asyncio event loop inside this thread."""
     global _BOT_THREAD_ALIVE, _BOT_LOCK_HELD
@@ -557,7 +557,7 @@ def run_bot():
     if not RUN_BOT:
         print({"msg": "bot_disabled_env"}); return
 
-    # Acquire advisory lock so μόνο μια instance κάνει polling
+    # Advisory lock: μόνο μία polling instance
     lock_conn = engine.connect()
     got = lock_conn.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": BOT_LOCK_ID}).scalar()
     if not got:
@@ -566,7 +566,7 @@ def run_bot():
     _BOT_LOCK_HELD = True
     print({"msg": "advisory_lock_acquired", "lock": "bot", "id": BOT_LOCK_ID})
 
-    # Δημιουργία event loop για το thread
+    # Δικό μας asyncio loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -608,12 +608,9 @@ def run_bot():
         app.add_handler(CommandHandler("listalts", cmd_listalts))
         app.add_handler(CommandHandler("listpresales", cmd_listpresales))
 
-        # Extras (όπως τα είχες)
+        # Extras & admin (όπως τα έχεις σε αρχεία)
         register_extra_handlers(app)
         register_admin_handlers(app, _ADMIN_IDS)
-
-        # Callbacks
-        app.add_handler(CallbackQueryHandler(on_callback))
 
         print({
             "msg": "bot_starting",
@@ -623,24 +620,15 @@ def run_bot():
             "trial_days": TRIAL_DAYS
         })
 
-        # Manual lifecycle ώστε να τρέχει μέσα στο loop αυτού του thread
-        await app.initialize()
-        await app.start()
-        try:
-            # Updater-based polling (v20) ως coroutine
-            await app.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-                poll_interval=1.0,
-                timeout=40,
-            )
-            await app.updater.wait_until_closed()
-        finally:
-            await app.stop()
-            await app.shutdown()
+        # Ένα και μοναδικό lifecycle call
+        await app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+            poll_interval=1.0,
+            timeout=40,
+        )
 
     try:
-        # Τρέχουμε το _runner μέσα στο δικό μας loop
         loop.run_until_complete(_runner())
         print({"msg": "bot_polling_stopped_normally"})
     except Conflict as e:
