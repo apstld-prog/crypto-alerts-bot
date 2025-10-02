@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timedelta
 
 import uvicorn
+import requests
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -14,17 +15,18 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes
 )
 
-# ────────────────────────── Config ──────────────────────────
-logging.basicConfig(level=logging.INFO)
+# ────────────────────────── Config / Logging ──────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("server_combined")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# Read token from either BOT_TOKEN or TELEGRAM_TOKEN (fallback)
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # βάλε το δικό σου Telegram user id
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "10"))
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
+    raise RuntimeError("Missing token: set BOT_TOKEN or TELEGRAM_TOKEN in environment")
 
 # ───────────────── In-memory store (demo) ───────────────────
 # Σε παραγωγή αντικαθίσταται με DB (Postgres).
@@ -54,13 +56,54 @@ _bot_app = None
 _bot_started = False
 _last_alerts_ok = None
 _last_bot_ok = None
+_bot_username = None  # from getMe
+
+def _delete_webhook():
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=10)
+        log.info("deleteWebhook status=%s body=%s", r.status_code, r.text[:160])
+    except Exception as e:
+        log.warning("deleteWebhook error: %s", e)
+
+def _get_me():
+    global _bot_username
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=10)
+        data = r.json()
+        if data.get("ok"):
+            _bot_username = data["result"].get("username")
+            log.info("getMe ok: id=%s username=@%s", data["result"].get("id"), _bot_username)
+            return True
+        else:
+            log.error("getMe failed: %s", r.text)
+            return False
+    except Exception as e:
+        log.error("getMe exception: %s", e)
+        return False
+
+# ─────────────── User Commands ───────────────
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong ✅")
+
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    u = get_user(uid)
+    role = "admin" if is_admin(uid) else "user"
+    active = has_access(uid)
+    await update.message.reply_text(
+        f"Role: {role}\nActive access: {active}\n"
+        f"Trial end: {u['trial_end'].strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"Premium: {u['premium']}"
+    )
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     u = get_user(uid)
 
     if is_admin(uid):
-        await update.message.reply_text("👑 Welcome Admin — unlimited access enabled.")
+        await update.message.reply_text(
+            f"👑 Welcome Admin — unlimited access.\nBot: @{_bot_username or 'unknown'}"
+        )
         return
 
     left = u["trial_end"] - datetime.utcnow()
@@ -77,6 +120,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /myalerts — list alerts (demo)\n"
         "• /help — instructions\n"
         "• /support <msg> — contact admin\n"
+        "• /whoami — show your access status\n"
+        "• /ping — quick connectivity test\n"
     )
     await update.message.reply_text(msg)
 
@@ -86,7 +131,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/price <SYMBOL> → Get live price (demo)\n"
         "/setalert <SYMBOL> <op> <value> → Set alert (demo)\n"
         "/myalerts → Your alerts (demo)\n"
-        "/support <msg> → Send message to admin\n\n"
+        "/support <msg> → Send message to admin\n"
+        "/whoami → See your access status\n"
+        "/ping → Connectivity test\n\n"
         "Trial: 10 days full access to everything.\n"
         "After trial → contact admin to extend access."
     )
@@ -109,7 +156,7 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Demo τιμή. Ενσωμάτωσε Binance/CMC εδώ αν θες.
     await update.message.reply_text("BTC price ≈ 68000 USDT (demo)")
 
-# ─────────────── Admin Commands (μόνο για σένα) ─────────────
+# ─────────────── Admin Commands ───────────────
 async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -159,11 +206,18 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     total = len(users_db)
     premiums = sum(1 for v in users_db.values() if v["premium"])
-    await update.message.reply_text(f"📊 Users: {total}\n⭐ Premium: {premiums}")
+    await update.message.reply_text(f"📊 Users: {total}\n⭐ Premium: {premiums}\n🤖 Bot: @{_bot_username or 'unknown'}")
 
 def _bot_thread():
     """Runs the Telegram bot in polling mode (single instance)"""
     global _bot_app, _last_bot_ok
+
+    # Make sure webhook is removed for polling
+    _delete_webhook()
+
+    # Log /getMe to verify token and bot identity
+    _get_me()
+
     log.info("Starting Telegram bot polling…")
     try:
         _bot_app = (
@@ -175,6 +229,8 @@ def _bot_thread():
         )
 
         # User commands
+        _bot_app.add_handler(CommandHandler("ping", cmd_ping))
+        _bot_app.add_handler(CommandHandler("whoami", cmd_whoami))
         _bot_app.add_handler(CommandHandler("start", cmd_start))
         _bot_app.add_handler(CommandHandler("help", cmd_help))
         _bot_app.add_handler(CommandHandler("support", cmd_support))
@@ -198,7 +254,6 @@ def _alerts_thread():
     log.info("Starting alerts loop…")
     while True:
         try:
-            # εδώ θα καλούσες run_alert_cycle(...)
             _last_alerts_ok = datetime.utcnow()
             time.sleep(60)
         except Exception as e:
@@ -229,7 +284,7 @@ def health():
 @health_app.api_route("/botok", methods=["GET", "HEAD"])
 def botok():
     status = "running" if _bot_started else "not_started"
-    return JSONResponse({"bot": status})
+    return JSONResponse({"bot": status, "username": _bot_username})
 
 @health_app.api_route("/alertsok", methods=["GET", "HEAD"])
 def alertsok():
