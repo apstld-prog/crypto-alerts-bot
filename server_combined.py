@@ -23,7 +23,7 @@ from telegram.ext import (
 
 from sqlalchemy import text
 
-# ====== Local modules (όπως τα είχες) ======
+# ====== Local modules ======
 from db import init_db, session_scope, engine
 from worker_logic import run_alert_cycle, resolve_symbol, fetch_price_binance
 from commands_extra import register_extra_handlers
@@ -179,7 +179,7 @@ _ALERTS_LAST_OK_AT = None
 _ALERTS_LAST_RESULT = None
 _BOT_THREAD_ALIVE = False
 _BOT_LOCK_HELD = False
-_STARTED = False  # guarding to avoid double-start on reloads
+_STARTED = False  # guard
 
 @health_app.api_route("/", methods=["GET", "HEAD"])
 def root():
@@ -263,11 +263,11 @@ async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("⛔ Το δοκιμαστικό σου έληξε. Στείλε /support για επέκταση από admin.")
     raise ApplicationHandlerStop
 
-# ====== Commands (βασικά + admin) ======
+# ====== Commands ======
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     _get_access(tg_id)  # ensure trial created
-    _ = build_plan_info(str(tg_id), _ADMIN_IDS)  # αγγίζουμε τη δική σου DB/λογική
+    _ = build_plan_info(str(tg_id), _ADMIN_IDS)
     await target_msg(update).reply_text(
         start_text(tg_id, update.effective_user.first_name),
         reply_markup=main_menu_keyboard(str(tg_id)),
@@ -548,21 +548,24 @@ def delete_webhook_if_any():
     except Exception as e:
         print({"msg": "delete_webhook_exception", "error": str(e)})
 
-# ====== Bot runner (thread με ΔΙΚΟ ΤΟΥ event loop) ======
+# ====== Bot runner (με retry στο advisory lock) ======
 def run_bot():
-    """Start PTB in a dedicated thread with its own event loop (όχι asyncio.run)."""
+    """Start PTB in a dedicated thread with its own event loop."""
     global _BOT_THREAD_ALIVE, _BOT_LOCK_HELD
     _BOT_THREAD_ALIVE = True
 
     if not RUN_BOT:
         print({"msg": "bot_disabled_env"}); return
 
-    # Advisory lock: μόνο μία polling instance
+    # Προσπάθησε να πάρεις lock με retry
     lock_conn = engine.connect()
-    got = lock_conn.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": BOT_LOCK_ID}).scalar()
-    if not got:
+    while True:
+        got = lock_conn.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": BOT_LOCK_ID}).scalar()
+        if got:
+            break
         print({"msg": "advisory_lock_busy", "lock": "bot", "id": BOT_LOCK_ID})
-        lock_conn.close(); return
+        time.sleep(20)  # retry μετά από 20s
+
     _BOT_LOCK_HELD = True
     print({"msg": "advisory_lock_acquired", "lock": "bot", "id": BOT_LOCK_ID})
 
@@ -616,7 +619,7 @@ def run_bot():
             "trial_days": TRIAL_DAYS
         })
 
-        # Πολύ σημαντικό: δεν γράφουμε signal handlers (τρέχουμε σε thread)
+        # χωρίς signal handlers (τρέχει σε thread)
         await app.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
@@ -625,7 +628,6 @@ def run_bot():
             stop_signals=None,
         )
 
-    # === ΔΙΚΟ ΤΟΥ event loop στο thread ===
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
@@ -639,10 +641,8 @@ def run_bot():
         print({"msg": "bot_generic_exit", "error": str(e)})
     finally:
         try:
-            # Σταματάμε ευγενικά και ΚΛΕΙΝΟΥΜΕ το loop μόνο αν δεν τρέχει
             if loop.is_running():
                 loop.call_soon_threadsafe(loop.stop)
-                # δώσε λίγο χρόνο να σταματήσει
                 time.sleep(0.05)
             if not loop.is_closed():
                 loop.close()
@@ -656,7 +656,7 @@ def run_bot():
         _BOT_THREAD_ALIVE = False
         print({"msg": "bot_thread_exit"})
 
-# ====== Startup hooks (ώστε να δουλεύει με uvicorn server_combined:health_app) ======
+# ====== Startup hooks ======
 def _start_all_once():
     global _STARTED
     if _STARTED:
@@ -674,7 +674,7 @@ def _start_all_once():
     # Alerts worker
     threading.Thread(target=alerts_loop, daemon=True).start()
 
-    # Pump watcher (αν το έχεις ενεργό)
+    # Pump watcher
     start_pump_watcher()
 
     # BOT σε ξεχωριστό thread με δικό του loop
@@ -686,7 +686,7 @@ def _start_all_once():
 async def on_fastapi_startup():
     _start_all_once()
 
-# ====== Entry point (άμα το τρέξεις ως script) ======
+# ====== Entry point ======
 def main():
     _start_all_once()
     port = int(os.getenv("PORT", "10000"))
