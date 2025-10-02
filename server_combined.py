@@ -548,9 +548,9 @@ def delete_webhook_if_any():
     except Exception as e:
         print({"msg": "delete_webhook_exception", "error": str(e)})
 
-# ====== Bot runner (thread με το δικό του asyncio loop) ======
+# ====== Bot runner (thread με ασφαλές asyncio.run) ======
 def run_bot():
-    """Start PTB in a dedicated asyncio event loop inside this thread."""
+    """Start PTB in a dedicated thread using asyncio.run (χωρίς manual loop close)."""
     global _BOT_THREAD_ALIVE, _BOT_LOCK_HELD
     _BOT_THREAD_ALIVE = True
 
@@ -565,10 +565,6 @@ def run_bot():
         lock_conn.close(); return
     _BOT_LOCK_HELD = True
     print({"msg": "advisory_lock_acquired", "lock": "bot", "id": BOT_LOCK_ID})
-
-    # Δικό μας asyncio loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
 
     async def _runner():
         delete_webhook_if_any()
@@ -620,17 +616,18 @@ def run_bot():
             "trial_days": TRIAL_DAYS
         })
 
-        # <<< ΣΗΜΑΝΤΙΚΟ >>> μην κάνεις signal handlers στο thread
+        # Δεν εγγράφουμε signal handlers (τρέχουμε σε thread)
         await app.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
             poll_interval=1.0,
             timeout=40,
-            stop_signals=None,  # <<< fix για thread
+            stop_signals=None,
         )
 
     try:
-        loop.run_until_complete(_runner())
+        # Ασφαλής εκτέλεση χωρίς manual loop close
+        asyncio.run(_runner())
         print({"msg": "bot_polling_stopped_normally"})
     except Conflict as e:
         print({"msg": "bot_conflict_exit", "error": str(e)})
@@ -645,8 +642,6 @@ def run_bot():
             pass
         _BOT_LOCK_HELD = False
         _BOT_THREAD_ALIVE = False
-        loop.run_until_complete(asyncio.sleep(0))
-        loop.close()
         print({"msg": "bot_thread_exit"})
 
 # ====== Startup hooks (ώστε να δουλεύει με uvicorn server_combined:health_app) ======
@@ -672,7 +667,7 @@ def _start_all_once():
     # Pump watcher (αν το έχεις ενεργό)
     start_pump_watcher()
 
-    # BOT σε ξεχωριστό thread με δικό του loop
+    # BOT σε ξεχωριστό thread (τρέχει asyncio.run εσωτερικά)
     threading.Thread(target=run_bot, daemon=True).start()
 
     print({"msg": "startup_threads_spawned"})
