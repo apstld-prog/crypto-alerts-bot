@@ -178,6 +178,7 @@ _ALERTS_LAST_OK_AT = None
 _ALERTS_LAST_RESULT = None
 _BOT_THREAD_ALIVE = False
 _BOT_LOCK_HELD = False
+_STARTED = False  # guarding to avoid double-start on reloads
 
 @health_app.api_route("/", methods=["GET", "HEAD"])
 def root():
@@ -224,6 +225,7 @@ def diag():
         "ADMIN_IDS": list(_ADMIN_IDS),
         "FREE_ALERT_LIMIT": FREE_ALERT_LIMIT,
         "TRIAL_DAYS": TRIAL_DAYS,
+        "started": _STARTED,
     }
 
 # ====== Bot heartbeat ======
@@ -641,18 +643,17 @@ def run_bot():
         _BOT_THREAD_ALIVE = False
         print({"msg": "bot_thread_exit"})
 
-# ====== Entry point ======
-def main():
+# ====== Startup hooks (ώστε να δουλεύει με uvicorn server_combined:health_app) ======
+def _start_all_once():
+    global _STARTED
+    if _STARTED:
+        print({"msg": "startup_already_started"})
+        return
+    _STARTED = True
+
     # DB init
     init_db()
     init_extras()
-
-    # Uvicorn (web/health) σε thread
-    port = int(os.getenv("PORT", "10000"))
-    threading.Thread(
-        target=lambda: uvicorn.run(health_app, host="0.0.0.0", port=port, log_level="info"),
-        daemon=True
-    ).start()
 
     # Heartbeat
     threading.Thread(target=bot_heartbeat_loop, daemon=True).start()
@@ -663,12 +664,22 @@ def main():
     # Pump watcher (αν το έχεις ενεργό)
     start_pump_watcher()
 
-    # ===== BOT σε ξεχωριστό thread (σημαντικό) =====
+    # BOT σε ξεχωριστό thread
     threading.Thread(target=run_bot, daemon=True).start()
 
-    # Κράτα το main ζωντανό
-    while True:
-        time.sleep(3600)
+    print({"msg": "startup_threads_spawned"})
+
+@health_app.on_event("startup")
+async def on_fastapi_startup():
+    # Όταν ο uvicorn φορτώνει το health_app, ξεκινάμε όλα τα threads.
+    _start_all_once()
+
+# ====== Entry point (άμα το τρέξεις ως script) ======
+def main():
+    # Αν το τρέξεις ως python server_combined.py, πάλι ξεκινάει το ίδιο
+    _start_all_once()
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run(health_app, host="0.0.0.0", port=port, log_level="info")
 
 if __name__ == "__main__":
     main()
