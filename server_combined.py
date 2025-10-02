@@ -620,12 +620,13 @@ def run_bot():
             "trial_days": TRIAL_DAYS
         })
 
-        # Ένα και μοναδικό lifecycle call
+        # <<< ΣΗΜΑΝΤΙΚΟ >>> μην κάνεις signal handlers στο thread
         await app.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
             poll_interval=1.0,
             timeout=40,
+            stop_signals=None,  # <<< fix για thread
         )
 
     try:
