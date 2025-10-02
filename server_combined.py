@@ -177,7 +177,7 @@ _BOT_LAST_HEARTBEAT = None
 _BOT_STATUS = "not_started"
 _ALERTS_LAST_OK_AT = None
 _ALERTS_LAST_RESULT = None
-_BOT_THREAD_ALIVE = False
+_BOT_TASK: asyncio.Task | None = None
 _BOT_LOCK_HELD = False
 _STARTED = False  # guard
 
@@ -194,7 +194,7 @@ def botok():
     stale = (_BOT_LAST_HEARTBEAT is None) or ((datetime.utcnow() - _BOT_LAST_HEARTBEAT).total_seconds() > BOT_HEART_TTL)
     return {
         "bot_status": _BOT_STATUS,
-        "bot_thread_alive": _BOT_THREAD_ALIVE,
+        "bot_task_alive": (_BOT_TASK is not None and not _BOT_TASK.done()),
         "lock_held": _BOT_LOCK_HELD,
         "stale": stale,
         "last": (_BOT_LAST_HEARTBEAT.isoformat() + "Z") if _BOT_LAST_HEARTBEAT else None,
@@ -227,6 +227,7 @@ def diag():
         "FREE_ALERT_LIMIT": FREE_ALERT_LIMIT,
         "TRIAL_DAYS": TRIAL_DAYS,
         "started": _STARTED,
+        "bot_task": (None if _BOT_TASK is None else str(_BOT_TASK)),
     }
 
 # ====== Bot heartbeat ======
@@ -548,28 +549,28 @@ def delete_webhook_if_any():
     except Exception as e:
         print({"msg": "delete_webhook_exception", "error": str(e)})
 
-# ====== Bot runner (με retry στο advisory lock) ======
-def run_bot():
-    """Start PTB in a dedicated thread with its own event loop."""
-    global _BOT_THREAD_ALIVE, _BOT_LOCK_HELD
-    _BOT_THREAD_ALIVE = True
-
+# ====== Async bot runner (στο ίδιο loop του FastAPI) ======
+async def bot_polling_task():
+    """Run PTB polling as an asyncio Task (no extra threads/loops)."""
+    global _BOT_LOCK_HELD
     if not RUN_BOT:
         print({"msg": "bot_disabled_env"}); return
 
-    # Προσπάθησε να πάρεις lock με retry
-    lock_conn = engine.connect()
+    # Advisory lock με retry
     while True:
-        got = lock_conn.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": BOT_LOCK_ID}).scalar()
-        if got:
-            break
-        print({"msg": "advisory_lock_busy", "lock": "bot", "id": BOT_LOCK_ID})
-        time.sleep(20)  # retry μετά από 20s
+        try:
+            with engine.connect() as c:
+                got = c.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": BOT_LOCK_ID}).scalar()
+            if got:
+                _BOT_LOCK_HELD = True
+                print({"msg": "advisory_lock_acquired", "lock": "bot", "id": BOT_LOCK_ID})
+                break
+            print({"msg": "advisory_lock_busy", "lock": "bot", "id": BOT_LOCK_ID})
+        except Exception as e:
+            print({"msg": "advisory_lock_error", "lock": "bot", "error": str(e)})
+        await asyncio.sleep(20)
 
-    _BOT_LOCK_HELD = True
-    print({"msg": "advisory_lock_acquired", "lock": "bot", "id": BOT_LOCK_ID})
-
-    async def _runner():
+    try:
         delete_webhook_if_any()
 
         app = (
@@ -619,20 +620,13 @@ def run_bot():
             "trial_days": TRIAL_DAYS
         })
 
-        # χωρίς signal handlers (τρέχει σε thread)
         await app.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
             poll_interval=1.0,
             timeout=40,
-            stop_signals=None,
+            stop_signals=None,  # running inside uvicorn loop
         )
-
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(_runner())
-        print({"msg": "bot_polling_stopped_normally"})
     except Conflict as e:
         print({"msg": "bot_conflict_exit", "error": str(e)})
     except TgTimedOut as e:
@@ -641,20 +635,12 @@ def run_bot():
         print({"msg": "bot_generic_exit", "error": str(e)})
     finally:
         try:
-            if loop.is_running():
-                loop.call_soon_threadsafe(loop.stop)
-                time.sleep(0.05)
-            if not loop.is_closed():
-                loop.close()
-        except Exception:
-            pass
-        try:
-            lock_conn.close()
+            with engine.connect() as c:
+                c.execute(text("SELECT pg_advisory_unlock(:id)"), {"id": BOT_LOCK_ID})
         except Exception:
             pass
         _BOT_LOCK_HELD = False
-        _BOT_THREAD_ALIVE = False
-        print({"msg": "bot_thread_exit"})
+        print({"msg": "bot_task_exit"})
 
 # ====== Startup hooks ======
 def _start_all_once():
@@ -677,18 +663,18 @@ def _start_all_once():
     # Pump watcher
     start_pump_watcher()
 
-    # BOT σε ξεχωριστό thread με δικό του loop
-    threading.Thread(target=run_bot, daemon=True).start()
-
     print({"msg": "startup_threads_spawned"})
 
 @health_app.on_event("startup")
 async def on_fastapi_startup():
     _start_all_once()
+    # Ξεκίνα το bot μέσα στο ΚΥΡΙΟ event loop του Uvicorn
+    global _BOT_TASK
+    if RUN_BOT and (_BOT_TASK is None or _BOT_TASK.done()):
+        _BOT_TASK = asyncio.create_task(bot_polling_task())
 
 # ====== Entry point ======
 def main():
-    _start_all_once()
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run(health_app, host="0.0.0.0", port=port, log_level="info")
 
