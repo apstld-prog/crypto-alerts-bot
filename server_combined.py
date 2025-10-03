@@ -1,16 +1,12 @@
 # server_combined.py
-# Full single-file server that runs FastAPI + Telegram Bot (polling) safely inside Uvicorn's event loop.
-# - Safe PTB lifecycle (initialize/start/updater.start_polling) without closing the loop.
-# - 10-day trial window from first /start, admin override, and graceful DB fallbacks.
-# - Keeps previous commands available; calls external modules if present, otherwise uses safe stubs.
+# FastAPI + Telegram Bot (polling) σε ένα αρχείο, ασφαλές μέσα στο Uvicorn event loop.
+# Περιλαμβάνει: 10ήμερο trial, admin override, health endpoints, ασφαλή stubs αν λείπουν modules,
+# και alias health_app = app για συμβατότητα με παλιό Render start command.
 
 import os
-import sys
 import asyncio
-import threading
-import time
-from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Any
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
@@ -19,44 +15,33 @@ import httpx
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-# --- Telegram / PTB v20 ---
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import Conflict as TgConflict, TimedOut as TgTimedOut
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
-# ------------------ ENV / CONFIG ------------------
-
+# ---------- ENV ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    print({"msg": "missing_env", "var": "BOT_TOKEN"})
-    # Δεν τερματίζουμε, για να σηκωθεί τουλάχιστον το web health.
-
 RUN_BOT = os.getenv("RUN_BOT", "true").lower() not in ("0", "false", "no")
-FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "10"))  # δωρεάν alerts (legacy)
-TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "10"))              # 10ήμερο trial
+FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "10"))
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "10"))
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "5254014824")
 _ADMIN_IDS = {s.strip() for s in ADMIN_IDS_RAW.split(",") if s.strip()}
-
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-if not DATABASE_URL:
-    # Επιτρέπουμε να τρέξει (π.χ. τοπικά), αλλά θα έχουμε graceful fallbacks.
-    print({"msg": "missing_env", "var": "DATABASE_URL"})
-
-BOT_LOCK_ID = int(os.getenv("BOT_LOCK_ID", "921001"))  # advisory lock id για bot
-ALERTS_LOCK_ID = int(os.getenv("ALERTS_LOCK_ID", "911002"))  # για alerts loop
-
+BOT_LOCK_ID = int(os.getenv("BOT_LOCK_ID", "921001"))
+ALERTS_LOCK_ID = int(os.getenv("ALERTS_LOCK_ID", "911002"))
 PORT = int(os.getenv("PORT", "10000"))
 
-# ------------------ DB ENGINE ------------------
+if not BOT_TOKEN:
+    print({"msg": "missing_env", "var": "BOT_TOKEN"})
 
+# ---------- DB ----------
 engine: Optional[Engine] = None
 if DATABASE_URL:
     try:
@@ -64,9 +49,10 @@ if DATABASE_URL:
     except Exception as e:
         print({"msg": "db_engine_error", "error": str(e)})
         engine = None
+else:
+    print({"msg": "missing_env", "var": "DATABASE_URL"})
 
-# ------------------ OPTIONAL IMPORTS ------------------
-
+# ---------- Optional modules ----------
 def _opt_import(name: str):
     try:
         return __import__(name)
@@ -77,9 +63,10 @@ worker_logic = _opt_import("worker_logic")
 commands_extra = _opt_import("commands_extra")
 admin_commands = _opt_import("admin_commands")
 
-# ------------------ WEB APP ------------------
-
+# ---------- Web app ----------
 app = FastAPI()
+# Alias για παλιό Render start command που ζητά "health_app"
+health_app = app
 
 @app.get("/", response_class=PlainTextResponse)
 async def root():
@@ -97,13 +84,11 @@ async def botok():
 async def alertsok():
     return "OK"
 
-# ------------------ UTIL ------------------
-
+# ---------- Utils ----------
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 def delete_webhook_if_any():
-    """Ensure webhook is deleted before polling."""
     if not BOT_TOKEN:
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
@@ -114,7 +99,6 @@ def delete_webhook_if_any():
         print({"msg": "delete_webhook_error", "error": str(e)})
 
 def safe_execute(sql: str, params: dict = None, fetch: bool = False):
-    """Executes SQL with full safety; returns fetched rows or None."""
     if engine is None:
         return None
     try:
@@ -124,19 +108,13 @@ def safe_execute(sql: str, params: dict = None, fetch: bool = False):
                 return [dict(row._mapping) for row in res]
             return None
     except Exception as e:
-        # Δεν σπάμε λειτουργικότητα — γράφουμε log και συνεχίζουμε.
         print({"msg": "sql_error", "error": str(e), "sql": sql})
         return None
 
 def ensure_user_on_start(user_id: int, tg_username: Optional[str]) -> None:
-    """
-    Εξασφαλίζει user row & trial window (αν γίνεται). Αν schema δεν ταιριάζει, κάνει απλά log.
-    Αναμένεται πίνακας: users(id serial pk, telegram_id bigint unique, is_premium bool, trial_started_at timestamptz, trial_expires_at timestamptz, username text)
-    """
     if engine is None:
         return
     try:
-        # Δημιουργία/ενημέρωση.
         safe_execute(
             """
             INSERT INTO users (telegram_id, is_premium, trial_started_at, trial_expires_at, username)
@@ -152,14 +130,10 @@ def ensure_user_on_start(user_id: int, tg_username: Optional[str]) -> None:
         print({"msg": "ensure_user_error", "error": str(e)})
 
 def get_user_access(user_id: int) -> Dict[str, Any]:
-    """
-    Επιστρέφει {is_admin, is_premium, in_trial, trial_expires_at}.
-    Αν δεν υπάρχει DB/columns, safe defaults: admin? => από _ADMIN_IDS, trial=>True (για να μη μπλοκάρει), premium=>False.
-    """
     is_admin = str(user_id) in _ADMIN_IDS
     access = {
         "is_admin": is_admin,
-        "is_premium": is_admin,   # οι admins έχουν πλήρη πρόσβαση
+        "is_premium": is_admin,
         "in_trial": True,
         "trial_expires_at": None,
     }
@@ -192,34 +166,23 @@ def get_user_access(user_id: int) -> Dict[str, Any]:
         return access
 
 async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Global guard σε όλες τις εντολές (group=0) — επιτρέπει admin, premium ή trial 10 ημερών.
-    Αν κάτι λείπει από DB, δεν μπλοκάρει (μόνο log).
-    """
     if update.effective_user is None:
         return
     uid = update.effective_user.id
     if str(uid) in _ADMIN_IDS:
-        return  # admin full access
+        return
     acc = get_user_access(uid)
     if acc["is_premium"] or acc["in_trial"]:
         return
-    # Trial/Premium required
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Message Admin", url="https://t.me/CryptoAlerts77")],
-    ])
-    msg = (
-        "⚠️ Η δοκιμαστική περίοδος έληξε.\n"
-        "Στείλε μήνυμα στον Admin για να ενεργοποιηθεί πρόσβαση."
-    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Message Admin", url="https://t.me/CryptoAlerts77")]])
+    msg = "⚠️ Η δοκιμαστική περίοδος έληξε.\nΣτείλε μήνυμα στον Admin για να ενεργοποιηθεί πρόσβαση."
     try:
         await update.effective_chat.send_message(msg, reply_markup=kb)
     except Exception:
         pass
-    raise asyncio.CancelledError  # Κόβει το υπόλοιπο handler chain
+    raise asyncio.CancelledError
 
-# ------------------ COMMANDS (BASICS) ------------------
-
+# ---------- Commands ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user:
         ensure_user_on_start(update.effective_user.id, update.effective_user.username)
@@ -259,15 +222,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📚 *Βοήθεια*\n\n"
         "Τιμές & Alerts:\n"
         "• /price <SYMBOL> – τρέχουσα τιμή (π.χ. /price BTC)\n"
-        "• /setalert <SYMBOL> [>/<] <τιμή> – δημιουργία alert (π.χ. /setalert BTC > 70000)\n"
+        "• /setalert <SYMBOL> [>/<] <τιμή> – (π.χ. /setalert BTC > 70000)\n"
         "• /myalerts – λίστα alerts\n"
         "• /delalert <id> – διαγραφή alert\n"
-        "• /clearalerts – καθαρισμός όλων των alerts\n\n"
+        "• /clearalerts – καθαρισμός όλων\n\n"
         "Alts & Presales:\n"
-        "• /alts <SYMBOL> – σημείωμα/links για curated token\n"
-        "• /listalts – λίστα curated off-binance\n"
-        "• /listpresales – presales / fair launches\n\n"
-        "Λογαριασμός & Υποστήριξη:\n"
+        "• /alts <SYMBOL> – σημείωμα/links\n"
+        "• /listalts – curated off-binance\n"
+        "• /listpresales – presales\n\n"
+        "Λογαριασμός & Support:\n"
         "• /whoami – στοιχεία & trial\n"
         "• /support – επαφή με admin\n"
     )
@@ -293,21 +256,16 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Message Admin", url="https://t.me/CryptoAlerts77")]
-    ])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Message Admin", url="https://t.me/CryptoAlerts77")]])
     await update.message.reply_text("Χρειάζεσαι βοήθεια; Μίλα με τον Admin 👇", reply_markup=kb)
 
-# ------------------ LEGACY / CORE COMMANDS ------------------
-# Αν έχεις δικά σου implementations σε άλλα modules, μπορείς να αλλάξεις τα bodies.
-
+# --- Stubs / core commands (κρατάμε συμβατότητα) ---
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Αν έχεις worker_logic.resolve_symbol / fetch_price_binance, χρησιμοποίησέ τα
-    price_text = "Use: /price BTC"
     symbol = None
+    if context.args:
+        symbol = (context.args[0] or "").upper().strip()
+    price_text = "Use: /price BTC"
     try:
-        if context.args:
-            symbol = (context.args[0] or "").upper().strip()
         if symbol:
             p = None
             if worker_logic and hasattr(worker_logic, "fetch_price_binance"):
@@ -315,47 +273,40 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     p = worker_logic.fetch_price_binance(symbol)
                 except Exception as e:
                     print({"msg": "price_binance_error", "error": str(e)})
-            if p is None:
-                price_text = f"{symbol}: price temporarily unavailable"
-            else:
-                price_text = f"{symbol}: {p}"
+            price_text = f"{symbol}: {p}" if p is not None else f"{symbol}: price temporarily unavailable"
     except Exception as e:
         print({"msg": "cmd_price_error", "error": str(e)})
     await update.message.reply_text(price_text)
 
 async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("OK, send me in format: /setalert BTC > 70000 (demo stub).")
+    await update.message.reply_text("OK, send: /setalert BTC > 70000 (stub).")
 
 async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Your alerts (demo stub).")
+    await update.message.reply_text("Your alerts (stub).")
 
 async def cmd_delalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Deleted (demo stub).")
+    await update.message.reply_text("Deleted (stub).")
 
 async def cmd_clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("All alerts cleared (demo stub).")
+    await update.message.reply_text("All alerts cleared (stub).")
 
-# ------------------ ALTS / PRESALES ------------------
-
+# --- Alts / Presales ---
 async def cmd_alts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # δείξε σημείωμα/links για curated token (stub)
-    await update.message.reply_text("Alts note (demo stub).")
+    await update.message.reply_text("Alts note (stub).")
 
 async def cmd_listalts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Curated off-binance tokens (demo stub).")
+    await update.message.reply_text("Curated off-binance tokens (stub).")
 
 async def cmd_listpresales(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Presales list (demo stub).")
+    await update.message.reply_text("Presales list (stub).")
 
-# ------------------ ADMIN COMMANDS ------------------
-
+# --- Admin only ---
 def _is_admin(user_id: int) -> bool:
     return str(user_id) in _ADMIN_IDS
 
 async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not _is_admin(update.effective_user.id):
         return
-    # δείξε απλά πόσοι έχουν πατήσει /start
     cnt = 0
     if engine:
         rows = safe_execute("SELECT COUNT(*) AS c FROM users", fetch=True)
@@ -366,20 +317,14 @@ async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_extend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not _is_admin(update.effective_user.id):
         return
-    # /extend <telegram_id> <days>
     try:
-        tid = int(context.args[0])
-        days = int(context.args[1])
+        tid = int(context.args[0]); days = int(context.args[1])
     except Exception:
         await update.message.reply_text("Use: /extend <telegram_id> <days>")
         return
     if engine:
         safe_execute(
-            """
-            UPDATE users
-            SET trial_expires_at = COALESCE(trial_expires_at, NOW()) + INTERVAL :days
-            WHERE telegram_id = :tid
-            """,
+            "UPDATE users SET trial_expires_at = COALESCE(trial_expires_at, NOW()) + INTERVAL :days WHERE telegram_id = :tid",
             {"tid": tid, "days": f"'{days} days'"},
         )
     await update.message.reply_text(f"Extended {tid} by {days} days")
@@ -387,7 +332,6 @@ async def cmd_extend(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not _is_admin(update.effective_user.id):
         return
-    # /setpremium <telegram_id> <on|off>
     try:
         tid = int(context.args[0])
         flag = (context.args[1] or "").lower() in ("on", "true", "1", "yes")
@@ -395,32 +339,22 @@ async def cmd_setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use: /setpremium <telegram_id> <on|off>")
         return
     if engine:
-        safe_execute(
-            "UPDATE users SET is_premium = :f WHERE telegram_id = :tid",
-            {"tid": tid, "f": flag},
-        )
+        safe_execute("UPDATE users SET is_premium = :f WHERE telegram_id = :tid", {"tid": tid, "f": flag})
     await update.message.reply_text(f"Premium for {tid}: {flag}")
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not _is_admin(update.effective_user.id):
         return
-    # Ενδεικτικά stats
     lines = ["Stats:"]
     if engine:
-        rows = safe_execute("SELECT COUNT(*) AS c FROM users", fetch=True)
-        if rows:
-            lines.append(f"Total users: {rows[0].get('c')}")
-        rows = safe_execute(
-            "SELECT COUNT(*) AS c FROM users WHERE is_premium = TRUE", fetch=True
-        )
-        if rows:
-            lines.append(f"Premium users: {rows[0].get('c')}")
+        r1 = safe_execute("SELECT COUNT(*) AS c FROM users", fetch=True)
+        if r1: lines.append(f"Total users: {r1[0].get('c')}")
+        r2 = safe_execute("SELECT COUNT(*) AS c FROM users WHERE is_premium = TRUE", fetch=True)
+        if r2: lines.append(f"Premium users: {r2[0].get('c')}")
     await update.message.reply_text("\n".join(lines))
 
-# ------------------ OPTIONAL EXTERNAL HANDLERS ------------------
-
+# --- Optional external registrations ---
 def register_extra_handlers(app_obj: Application):
-    """If commands_extra module provides register_extra_handlers, call it. Else, do nothing."""
     if commands_extra and hasattr(commands_extra, "register_extra_handlers"):
         try:
             commands_extra.register_extra_handlers(app_obj)
@@ -428,34 +362,31 @@ def register_extra_handlers(app_obj: Application):
             print({"msg": "register_extra_handlers_error", "error": str(e)})
 
 def register_admin_handlers(app_obj: Application, admin_ids: set):
-    """If admin_commands module provides register_admin_handlers, call it. Else, do nothing."""
     if admin_commands and hasattr(admin_commands, "register_admin_handlers"):
         try:
             admin_commands.register_admin_handlers(app_obj, admin_ids)
         except Exception as e:
             print({"msg": "register_admin_handlers_error", "error": str(e)})
 
-# ------------------ BOT TASK (SAFE LIFECYCLE) ------------------
-
+# ---------- Bot tasks ----------
 _BOT_TASK: Optional[asyncio.Task] = None
 _ALERTS_TASK: Optional[asyncio.Task] = None
 _BOT_LOCK_HELD = False
 
 async def bot_polling_task():
-    """Run PTB polling safely inside Uvicorn's event loop (no loop close, no signals)."""
     global _BOT_LOCK_HELD
     if not RUN_BOT or not BOT_TOKEN:
         print({"msg": "bot_disabled_env"})
         return
 
-    # Advisory lock με retry
+    # advisory lock
     while True:
         try:
             if engine:
                 with engine.connect() as c:
                     got = c.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": BOT_LOCK_ID}).scalar()
             else:
-                got = True  # χωρίς DB δεν κάνουμε locking
+                got = True
             if got:
                 _BOT_LOCK_HELD = True
                 print({"msg": "advisory_lock_acquired", "lock": "bot", "id": BOT_LOCK_ID})
@@ -476,46 +407,40 @@ async def bot_polling_task():
             .build()
         )
 
-        # Guard group=0
+        # guard
         app_obj.add_handler(MessageHandler(filters.COMMAND, access_guard), group=0)
 
-        # Core
+        # core
         app_obj.add_handler(CommandHandler("start", cmd_start))
         app_obj.add_handler(CommandHandler("help", cmd_help))
         app_obj.add_handler(CommandHandler("whoami", cmd_whoami))
         app_obj.add_handler(CommandHandler("support", cmd_support))
 
-        # Admin
-        app_obj.add_handler(CommandHandler("listusers", cmd_listusers))
-        app_obj.add_handler(CommandHandler("extend", cmd_extend))
-        app_obj.add_handler(CommandHandler("setpremium", cmd_setpremium))
-        app_obj.add_handler(CommandHandler("stats", cmd_stats))
-
-        # Legacy
+        # legacy
         app_obj.add_handler(CommandHandler("price", cmd_price))
         app_obj.add_handler(CommandHandler("setalert", cmd_setalert))
         app_obj.add_handler(CommandHandler("myalerts", cmd_myalerts))
         app_obj.add_handler(CommandHandler("delalert", cmd_delalert))
         app_obj.add_handler(CommandHandler("clearalerts", cmd_clearalerts))
 
-        # Alts
+        # alts
         app_obj.add_handler(CommandHandler("alts", cmd_alts))
         app_obj.add_handler(CommandHandler("listalts", cmd_listalts))
         app_obj.add_handler(CommandHandler("listpresales", cmd_listpresales))
 
-        # External registrations if present
+        # admin
+        app_obj.add_handler(CommandHandler("listusers", cmd_listusers))
+        app_obj.add_handler(CommandHandler("extend", cmd_extend))
+        app_obj.add_handler(CommandHandler("setpremium", cmd_setpremium))
+        app_obj.add_handler(CommandHandler("stats", cmd_stats))
+
+        # external
         register_extra_handlers(app_obj)
         register_admin_handlers(app_obj, _ADMIN_IDS)
 
-        print({
-            "msg": "bot_starting",
-            "RUN_BOT": RUN_BOT,
-            "admin_ids": list(_ADMIN_IDS),
-            "free_alert_limit": FREE_ALERT_LIMIT,
-            "trial_days": TRIAL_DAYS
-        })
+        print({"msg": "bot_starting", "RUN_BOT": RUN_BOT, "admin_ids": list(_ADMIN_IDS),
+               "free_alert_limit": FREE_ALERT_LIMIT, "trial_days": TRIAL_DAYS})
 
-        # Manual lifecycle — χωρίς signals / loop close
         await app_obj.initialize()
         await app_obj.start()
         await app_obj.updater.start_polling(
@@ -549,10 +474,7 @@ async def bot_polling_task():
         _BOT_LOCK_HELD = False
         print({"msg": "bot_task_exit"})
 
-# ------------------ ALERTS LOOP TASK ------------------
-
 async def alerts_loop_task():
-    """Run alert cycle with advisory lock. Falls back to no-op if worker_logic missing."""
     interval = 60
     print({"msg": "alerts_loop_start", "interval": interval})
     while True:
@@ -565,18 +487,12 @@ async def alerts_loop_task():
             else:
                 lock_held = True
 
-            if not lock_held:
-                print({"msg": "advisory_lock_busy", "lock": "alerts", "id": ALERTS_LOCK_ID})
-                await asyncio.sleep(interval)
-                continue
-
             evaluated = triggered = errors = 0
             try:
                 if worker_logic and hasattr(worker_logic, "run_alert_cycle"):
                     worker_logic.run_alert_cycle()
                     evaluated = 1
                 else:
-                    # no-op
                     evaluated = 0
             except Exception as e:
                 errors += 1
@@ -593,25 +509,21 @@ async def alerts_loop_task():
                 pass
         await asyncio.sleep(interval)
 
-# ------------------ STARTUP / SHUTDOWN ------------------
-
+# ---------- FastAPI lifecycle ----------
 @app.on_event("startup")
 async def on_startup():
     print({"msg": "worker_extra_threads_started"})
     print({"msg": "startup_threads_spawned"})
-    # Spawn tasks
-    global _BOT_TASK, _ALERTS_TASK
     loop = asyncio.get_running_loop()
+    global _BOT_TASK, _ALERTS_TASK
     _ALERTS_TASK = loop.create_task(alerts_loop_task())
     _BOT_TASK = loop.create_task(bot_polling_task())
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    # Αφήνουμε τα tasks να τερματίσουν gracefully στο finally τους.
     pass
 
-# ------------------ UVICORN ENTRY ------------------
-
+# ---------- Uvicorn entry ----------
 def main():
     import uvicorn
     uvicorn.run("server_combined:app", host="0.0.0.0", port=PORT, reload=False, log_level="info")
