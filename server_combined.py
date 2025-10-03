@@ -1,12 +1,11 @@
 # server_combined.py
-# FastAPI + Telegram Bot (polling) σε ένα αρχείο, ασφαλές μέσα στο Uvicorn event loop.
-# Περιλαμβάνει: 10ήμερο trial, admin override, health endpoints, ασφαλή stubs αν λείπουν modules,
-# και alias health_app = app για συμβατότητα με παλιό Render start command.
+# FastAPI + Telegram Bot (polling) σε ένα αρχείο, με 10ήμερο trial,
+# admin tools και συμβατότητα με παλιές/νέες worker_logic υπογραφές.
 
 import os
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable, getfullargspec
 
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
@@ -72,17 +71,33 @@ health_app = app
 async def root():
     return "OK"
 
+@app.head("/", response_class=PlainTextResponse)
+async def root_head():
+    return PlainTextResponse(content="", status_code=200)
+
 @app.get("/health", response_class=PlainTextResponse)
 async def health():
     return "OK"
+
+@app.head("/health", response_class=PlainTextResponse)
+async def health_head():
+    return PlainTextResponse(content="", status_code=200)
 
 @app.get("/botok", response_class=PlainTextResponse)
 async def botok():
     return "OK"
 
+@app.head("/botok", response_class=PlainTextResponse)
+async def botok_head():
+    return PlainTextResponse(content="", status_code=200)
+
 @app.get("/alertsok", response_class=PlainTextResponse)
 async def alertsok():
     return "OK"
+
+@app.head("/alertsok", response_class=PlainTextResponse)
+async def alertsok_head():
+    return PlainTextResponse(content="", status_code=200)
 
 # ---------- Utils ----------
 def utcnow() -> datetime:
@@ -474,6 +489,39 @@ async def bot_polling_task():
         _BOT_LOCK_HELD = False
         print({"msg": "bot_task_exit"})
 
+def _call_run_alert_cycle():
+    """
+    Καλεί το worker_logic.run_alert_cycle με ή χωρίς session,
+    ανάλογα με την υπογραφή της τρέχουσας έκδοσης.
+    """
+    if not worker_logic or not hasattr(worker_logic, "run_alert_cycle"):
+        return False, None  # evaluated, error
+
+    func: Callable = worker_logic.run_alert_cycle
+    try:
+        spec = getfullargspec(func)
+        wants_session = len(spec.args or []) >= 1  # π.χ. def run_alert_cycle(session)
+    except Exception:
+        wants_session = False
+
+    if wants_session:
+        # Δημιουργούμε connection/session και το περνάμε
+        if engine is None:
+            return False, "no_engine"
+        try:
+            with engine.begin() as conn:
+                func(conn)
+            return True, None
+        except Exception as e:
+            return False, str(e)
+    else:
+        # Παλιά εκδοχή χωρίς όρισμα
+        try:
+            func()
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
 async def alerts_loop_task():
     interval = 60
     print({"msg": "alerts_loop_start", "interval": interval})
@@ -487,16 +535,18 @@ async def alerts_loop_task():
             else:
                 lock_held = True
 
-            evaluated = triggered = errors = 0
-            try:
-                if worker_logic and hasattr(worker_logic, "run_alert_cycle"):
-                    worker_logic.run_alert_cycle()
-                    evaluated = 1
-                else:
-                    evaluated = 0
-            except Exception as e:
-                errors += 1
-                print({"msg": "alerts_cycle_error", "error": str(e)})
+            evaluated = 0
+            triggered = 0
+            errors = 0
+
+            ok, err = _call_run_alert_cycle()
+            if ok:
+                evaluated = 1
+            else:
+                errors = 1
+                if err:
+                    print({"msg": "alerts_cycle_error", "error": err})
+
             print({"msg": "alert_cycle", "ts": str(utcnow()), "evaluated": evaluated, "triggered": triggered, "errors": errors})
         except Exception as e:
             print({"msg": "alerts_loop_error", "error": str(e)})
