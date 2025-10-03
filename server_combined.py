@@ -1,15 +1,16 @@
 # server_combined.py
-# FastAPI + Telegram Bot (polling) σε ένα αρχείο, με 10ήμερο trial,
-# admin tools και συμβατότητα με παλιές/νέες worker_logic υπογραφές.
+# FastAPI + Telegram Bot σε ένα service
+# Υποστηρίζει POLLING ή WEBHOOK (προτείνεται).
+# Trial 10 ημερών, admin cmds, συμβατό worker_logic (με/χωρίς session arg).
 
 import os
 import asyncio
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Callable
-from inspect import getfullargspec  # <-- FIX: από inspect, όχι typing
+from inspect import getfullargspec
 
-from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse, JSONResponse
 
 import httpx
 from sqlalchemy import create_engine, text
@@ -23,12 +24,21 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
+    AIORateLimiter,
+    defaults,
     filters,
 )
 
-# ---------- ENV ----------
+# ======================= ENV =======================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 RUN_BOT = os.getenv("RUN_BOT", "true").lower() not in ("0", "false", "no")
+
+# Webhook toggle
+USE_WEBHOOK = os.getenv("USE_WEBHOOK", "false").lower() in ("1", "true", "yes")
+# Πλήρες URL προς το endpoint που θα δέχεται τα updates
+# π.χ. https://crypto-alerts-bot-y4v9.onrender.com/telegram/<BOT_TOKEN>
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+
 FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "10"))
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "10"))
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "5254014824")
@@ -41,7 +51,7 @@ PORT = int(os.getenv("PORT", "10000"))
 if not BOT_TOKEN:
     print({"msg": "missing_env", "var": "BOT_TOKEN"})
 
-# ---------- DB ----------
+# ======================= DB =======================
 engine: Optional[Engine] = None
 if DATABASE_URL:
     try:
@@ -52,7 +62,7 @@ if DATABASE_URL:
 else:
     print({"msg": "missing_env", "var": "DATABASE_URL"})
 
-# ---------- Optional modules ----------
+# ================= Optional modules ================
 def _opt_import(name: str):
     try:
         return __import__(name)
@@ -63,10 +73,9 @@ worker_logic = _opt_import("worker_logic")
 commands_extra = _opt_import("commands_extra")
 admin_commands = _opt_import("admin_commands")
 
-# ---------- Web app ----------
+# =================== FastAPI =======================
 app = FastAPI()
-# Alias για παλιό Render start command που ζητά "health_app"
-health_app = app
+health_app = app  # alias για παλιά start commands
 
 @app.get("/", response_class=PlainTextResponse)
 async def root():
@@ -100,7 +109,26 @@ async def alertsok():
 async def alertsok_head():
     return PlainTextResponse(content="", status_code=200)
 
-# ---------- Utils ----------
+# Webhook εισόδου: /telegram/<BOT_TOKEN>
+@app.post("/telegram/{token}")
+async def telegram_webhook(token: str, request: Request):
+    if not USE_WEBHOOK:
+        return JSONResponse({"ok": False, "error": "webhook disabled"}, status_code=403)
+    if token != BOT_TOKEN:
+        return JSONResponse({"ok": False, "error": "bad token"}, status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    try:
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        print({"msg": "webhook_process_error", "error": str(e)})
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+# ===================== Utils ======================
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -113,6 +141,17 @@ def delete_webhook_if_any():
         print({"msg": "delete_webhook", "status": r.status_code, "body": r.text[:120]})
     except Exception as e:
         print({"msg": "delete_webhook_error", "error": str(e)})
+
+def set_webhook_if_needed():
+    """Κάνει set το webhook όταν USE_WEBHOOK=True."""
+    if not (USE_WEBHOOK and BOT_TOKEN and WEBHOOK_URL):
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
+    try:
+        r = httpx.post(url, data={"url": WEBHOOK_URL, "drop_pending_updates": True}, timeout=15)
+        print({"msg": "set_webhook", "status": r.status_code, "body": r.text[:160]})
+    except Exception as e:
+        print({"msg": "set_webhook_error", "error": str(e)})
 
 def safe_execute(sql: str, params: dict = None, fetch: bool = False):
     if engine is None:
@@ -198,7 +237,7 @@ async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     raise asyncio.CancelledError
 
-# ---------- Commands ----------
+# =================== Commands =====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user:
         ensure_user_on_start(update.effective_user.id, update.effective_user.username)
@@ -275,7 +314,7 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("Message Admin", url="https://t.me/CryptoAlerts77")]])
     await update.message.reply_text("Χρειάζεσαι βοήθεια; Μίλα με τον Admin 👇", reply_markup=kb)
 
-# --- Stubs / core commands (κρατάμε συμβατότητα) ---
+# --- Stubs/legacy (κρατάμε hooks ζωντανούς) ---
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = None
     if context.args:
@@ -384,129 +423,49 @@ def register_admin_handlers(app_obj: Application, admin_ids: set):
         except Exception as e:
             print({"msg": "register_admin_handlers_error", "error": str(e)})
 
-# ---------- Bot tasks ----------
-_BOT_TASK: Optional[asyncio.Task] = None
-_ALERTS_TASK: Optional[asyncio.Task] = None
-_BOT_LOCK_HELD = False
+# ================== Application ====================
+application: Application = Application.builder() \
+    .token(BOT_TOKEN) \
+    .rate_limiter(AIORateLimiter()) \
+    .build()
 
-async def bot_polling_task():
-    global _BOT_LOCK_HELD
-    if not RUN_BOT or not BOT_TOKEN:
-        print({"msg": "bot_disabled_env"})
-        return
+# Register handlers (μία φορά)
+application.add_handler(MessageHandler(filters.COMMAND, access_guard), group=0)
+application.add_handler(CommandHandler("start", cmd_start))
+application.add_handler(CommandHandler("help", cmd_help))
+application.add_handler(CommandHandler("whoami", cmd_whoami))
+application.add_handler(CommandHandler("support", cmd_support))
+# legacy
+application.add_handler(CommandHandler("price", cmd_price))
+application.add_handler(CommandHandler("setalert", cmd_setalert))
+application.add_handler(CommandHandler("myalerts", cmd_myalerts))
+application.add_handler(CommandHandler("delalert", cmd_delalert))
+application.add_handler(CommandHandler("clearalerts", cmd_clearalerts))
+# alts
+application.add_handler(CommandHandler("alts", cmd_alts))
+application.add_handler(CommandHandler("listalts", cmd_listalts))
+application.add_handler(CommandHandler("listpresales", cmd_listpresales))
+# admin
+application.add_handler(CommandHandler("listusers", cmd_listusers))
+application.add_handler(CommandHandler("extend", cmd_extend))
+application.add_handler(CommandHandler("setpremium", cmd_setpremium))
+application.add_handler(CommandHandler("stats", cmd_stats))
 
-    # advisory lock
-    while True:
-        try:
-            if engine:
-                with engine.connect() as c:
-                    got = c.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": BOT_LOCK_ID}).scalar()
-            else:
-                got = True
-            if got:
-                _BOT_LOCK_HELD = True
-                print({"msg": "advisory_lock_acquired", "lock": "bot", "id": BOT_LOCK_ID})
-                break
-            print({"msg": "advisory_lock_busy", "lock": "bot", "id": BOT_LOCK_ID})
-        except Exception as e:
-            print({"msg": "advisory_lock_error", "lock": "bot", "error": str(e)})
-        await asyncio.sleep(15)
+register_extra_handlers(application)
+register_admin_handlers(application, _ADMIN_IDS)
 
-    try:
-        delete_webhook_if_any()
-
-        app_obj = (
-            Application.builder()
-            .token(BOT_TOKEN)
-            .read_timeout(40)
-            .connect_timeout(15)
-            .build()
-        )
-
-        # guard
-        app_obj.add_handler(MessageHandler(filters.COMMAND, access_guard), group=0)
-
-        # core
-        app_obj.add_handler(CommandHandler("start", cmd_start))
-        app_obj.add_handler(CommandHandler("help", cmd_help))
-        app_obj.add_handler(CommandHandler("whoami", cmd_whoami))
-        app_obj.add_handler(CommandHandler("support", cmd_support))
-
-        # legacy
-        app_obj.add_handler(CommandHandler("price", cmd_price))
-        app_obj.add_handler(CommandHandler("setalert", cmd_setalert))
-        app_obj.add_handler(CommandHandler("myalerts", cmd_myalerts))
-        app_obj.add_handler(CommandHandler("delalert", cmd_delalert))
-        app_obj.add_handler(CommandHandler("clearalerts", cmd_clearalerts))
-
-        # alts
-        app_obj.add_handler(CommandHandler("alts", cmd_alts))
-        app_obj.add_handler(CommandHandler("listalts", cmd_listalts))
-        app_obj.add_handler(CommandHandler("listpresales", cmd_listpresales))
-
-        # admin
-        app_obj.add_handler(CommandHandler("listusers", cmd_listusers))
-        app_obj.add_handler(CommandHandler("extend", cmd_extend))
-        app_obj.add_handler(CommandHandler("setpremium", cmd_setpremium))
-        app_obj.add_handler(CommandHandler("stats", cmd_stats))
-
-        # external
-        register_extra_handlers(app_obj)
-        register_admin_handlers(app_obj, _ADMIN_IDS)
-
-        print({"msg": "bot_starting", "RUN_BOT": RUN_BOT, "admin_ids": list(_ADMIN_IDS),
-               "free_alert_limit": FREE_ALERT_LIMIT, "trial_days": TRIAL_DAYS})
-
-        await app_obj.initialize()
-        await app_obj.start()
-        await app_obj.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            poll_interval=1.0,
-            timeout=40,
-        )
-
-        try:
-            while True:
-                await asyncio.sleep(3600)
-        finally:
-            await app_obj.updater.stop()
-            await app_obj.stop()
-            await app_obj.shutdown()
-
-    except TgConflict as e:
-        print({"msg": "bot_conflict_exit", "error": str(e)})
-    except TgTimedOut as e:
-        print({"msg": "bot_timeout_exit", "error": str(e)})
-    except Exception as e:
-        print({"msg": "bot_generic_exit", "error": str(e)})
-    finally:
-        try:
-            if engine and _BOT_LOCK_HELD:
-                with engine.connect() as c:
-                    c.execute(text("SELECT pg_advisory_unlock(:id)"), {"id": BOT_LOCK_ID})
-        except Exception:
-            pass
-        _BOT_LOCK_HELD = False
-        print({"msg": "bot_task_exit"})
-
+# ============ Alerts loop & worker glue ============
 def _call_run_alert_cycle():
-    """
-    Καλεί το worker_logic.run_alert_cycle με ή χωρίς session,
-    ανάλογα με την υπογραφή της τρέχουσας έκδοσης.
-    """
     if not worker_logic or not hasattr(worker_logic, "run_alert_cycle"):
-        return False, None  # evaluated, error
-
+        return False, None
     func: Callable = worker_logic.run_alert_cycle
     try:
         spec = getfullargspec(func)
-        wants_session = len(spec.args or []) >= 1  # π.χ. def run_alert_cycle(session)
+        wants_session = len(spec.args or []) >= 1
     except Exception:
         wants_session = False
 
     if wants_session:
-        # Δημιουργούμε connection/session και το περνάμε
         if engine is None:
             return False, "no_engine"
         try:
@@ -516,7 +475,6 @@ def _call_run_alert_cycle():
         except Exception as e:
             return False, str(e)
     else:
-        # Παλιά εκδοχή χωρίς όρισμα
         try:
             func()
             return True, None
@@ -560,21 +518,83 @@ async def alerts_loop_task():
                 pass
         await asyncio.sleep(interval)
 
-# ---------- FastAPI lifecycle ----------
+# ============== FastAPI lifecycle ==================
 @app.on_event("startup")
 async def on_startup():
-    print({"msg": "worker_extra_threads_started"})
     print({"msg": "startup_threads_spawned"})
-    loop = asyncio.get_running_loop()
-    global _BOT_TASK, _ALERTS_TASK
-    _ALERTS_TASK = loop.create_task(alerts_loop_task())
-    _BOT_TASK = loop.create_task(bot_polling_task())
+    # Alerts loop
+    asyncio.create_task(alerts_loop_task())
+
+    if not RUN_BOT or not BOT_TOKEN:
+        print({"msg": "bot_disabled_env"})
+        return
+
+    # Advisory lock για bot
+    got = True
+    if engine:
+        try:
+            with engine.connect() as c:
+                got = c.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": BOT_LOCK_ID}).scalar()
+        except Exception as e:
+            print({"msg": "advisory_lock_error", "lock": "bot", "error": str(e)})
+            got = True
+    if not got:
+        print({"msg": "advisory_lock_busy", "lock": "bot", "id": BOT_LOCK_ID})
+        return
+    print({"msg": "advisory_lock_acquired", "lock": "bot", "id": BOT_LOCK_ID})
+
+    # Καθαρίζουμε webhook πριν αποφασίσουμε mode
+    delete_webhook_if_any()
+
+    print({"msg": "bot_starting", "RUN_BOT": RUN_BOT, "admin_ids": list(_ADMIN_IDS),
+           "free_alert_limit": FREE_ALERT_LIMIT, "trial_days": TRIAL_DAYS, "use_webhook": USE_WEBHOOK})
+
+    await application.initialize()
+    await application.start()
+
+    if USE_WEBHOOK and WEBHOOK_URL:
+        # Set webhook και τέρμα—δεν κάνουμε polling
+        set_webhook_if_needed()
+        print({"msg": "webhook_ready", "url": WEBHOOK_URL})
+    else:
+        # Long polling (ΠΡΟΣΟΧΗ: αν κάποιος άλλος κάνει polling θα δεις Conflict)
+        try:
+            await application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                poll_interval=1.0,
+                timeout=40,
+            )
+            print({"msg": "polling_started"})
+        except TgConflict as e:
+            print({"msg": "bot_conflict_exit", "error": str(e)})
+        except TgTimedOut as e:
+            print({"msg": "bot_timeout_exit", "error": str(e)})
+        except Exception as e:
+            print({"msg": "bot_generic_exit", "error": str(e)})
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    pass
+    try:
+        if application:
+            # Αν είμαστε σε polling, σταμάτα το updater
+            try:
+                if application.updater.running:
+                    await application.updater.stop()
+            except Exception:
+                pass
+            await application.stop()
+            await application.shutdown()
+    except Exception:
+        pass
+    try:
+        if engine:
+            with engine.connect() as c:
+                c.execute(text("SELECT pg_advisory_unlock(:id)"), {"id": BOT_LOCK_ID})
+    except Exception:
+        pass
 
-# ---------- Uvicorn entry ----------
+# ============== Uvicorn entry ======================
 def main():
     import uvicorn
     uvicorn.run("server_combined:app", host="0.0.0.0", port=PORT, reload=False, log_level="info")
