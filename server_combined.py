@@ -5,7 +5,8 @@
 import os
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, Callable, getfullargspec
+from typing import Optional, Dict, Any, Callable
+from inspect import getfullargspec  # <-- FIX: από inspect, όχι typing
 
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
