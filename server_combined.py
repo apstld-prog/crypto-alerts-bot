@@ -38,8 +38,9 @@ ADMIN_KEY = (os.getenv("ADMIN_KEY") or "").strip() or None
 
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
 
-PAYPAL_PLAN_ID = (os.getenv("PAYPAL_PLAN_ID") or "").strip() or None
-PAYPAL_SUBSCRIBE_URL = (os.getenv("PAYPAL_SUBSCRIBE_URL") or "").strip() or None
+# PayPal is disabled; keep vars for backward-compat but they are not used anymore
+PAYPAL_PLAN_ID = None
+PAYPAL_SUBSCRIBE_URL = None
 
 RUN_BOT = os.getenv("RUN_BOT", "1") == "1"
 RUN_ALERTS = os.getenv("RUN_ALERTS", "1") == "1"
@@ -50,6 +51,8 @@ ALERTS_LOCK_ID = int(os.getenv("ALERTS_LOCK_ID", "911002"))
 
 _BOT_HEART_INTERVAL = int(os.getenv("BOT_HEART_INTERVAL_SECONDS", "60"))
 _BOT_HEART_TTL = int(os.getenv("BOT_HEART_TTL_SECONDS", "180"))
+
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "10"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
@@ -82,6 +85,7 @@ def _refresh_binance_symbols(force: bool = False):
             _BINANCE_SYMBOLS = mapping
             _BINANCE_LAST_FETCH = now
             print({"msg": "binance_symbols_loaded", "count": len(mapping)})
+    except Exception as e:
         print({"msg": "binance_symbols_error", "error": str(e)})
 
 def resolve_symbol_auto(symbol: str | None) -> str | None:
@@ -108,9 +112,37 @@ def target_msg(update: Update):
     """Return a message target compatible with commands & callbacks."""
     return update.message or (update.callback_query.message if update.callback_query else None)
 
-def paypal_upgrade_url_for(tg_id: str | None) -> str | None:
-    return None
+# ██ NEW: TRIAL helpers (adaptive to your DB schema) █████████████████
 
+def _subscriptions_columns(session) -> set[str]:
+    cols = session.execute(text("""
+        SELECT column_name FROM information_schema.columns WHERE table_name='subscriptions'
+    """)).scalars().all()
+    return {c.lower() for c in cols}
+
+def _insert_trial_row(session, user_id: int, expiry_iso: str) -> None:
+    cols = _subscriptions_columns(session)
+    params = {"uid": user_id, "expiry": expiry_iso}
+    if "provider_status" in cols and "status_internal" in cols:
+        session.execute(text(
+            "INSERT INTO subscriptions (user_id, provider, provider_sub_id, provider_status, status_internal, created_at, updated_at) "
+            "VALUES (:uid, 'trial', :expiry, 'active', 'active', NOW(), NOW())"
+        ), params)
+    elif "provider_status" in cols:
+        session.execute(text(
+            "INSERT INTO subscriptions (user_id, provider, provider_sub_id, provider_status, created_at, updated_at) "
+            "VALUES (:uid, 'trial', :expiry, 'active', NOW(), NOW())"
+        ), params)
+    elif "status_internal" in cols:
+        session.execute(text(
+            "INSERT INTO subscriptions (user_id, provider, provider_sub_id, status_internal, created_at, updated_at) "
+            "VALUES (:uid, 'trial', :expiry, 'active', NOW(), NOW())"
+        ), params)
+    else:
+        session.execute(text(
+            "INSERT INTO subscriptions (user_id, provider, provider_sub_id, created_at, updated_at) "
+            "VALUES (:uid, 'trial', :expiry, NOW(), NOW())"
+        ), params)
 
 def _trial_status_line_for(tg_id: str | None) -> str:
     if not tg_id:
@@ -130,63 +162,39 @@ def _trial_status_line_for(tg_id: str | None) -> str:
             return "Trial: no active trial — contact admin"
         try:
             expiry = datetime.fromisoformat(row["provider_sub_id"])
-            now = datetime.now(timezone.utc)
+            now = datetime.utcnow()
             if expiry > now:
                 return f"Trial expires: {expiry.date().isoformat()}"
             return "Trial: expired — contact admin"
         except Exception:
             return "Trial: unknown — contact admin"
 
-async def _ensure_trial_row(user_id: int) -> str:
-    now = datetime.now(timezone.utc)
+async def _ensure_trial_row(user_id: int, trial_days: int = TRIAL_DAYS) -> str:
+    now = datetime.utcnow()
     with session_scope() as session:
         row = session.execute(text(
-            "SELECT provider_sub_id FROM subscriptions WHERE user_id = :uid AND provider = 'trial' "
+            "SELECT provider_sub_id FROM subscriptions WHERE user_id=:uid AND provider='trial' "
             "ORDER BY created_at DESC LIMIT 1"
         ), {"uid": user_id}).mappings().first()
-
         if row:
             expiry_iso = row.get("provider_sub_id")
             try:
                 expiry = datetime.fromisoformat(expiry_iso) if expiry_iso else None
             except Exception:
                 expiry = None
-
             if expiry and expiry > now:
                 days_left = (expiry - now).days
                 return f"\n\n✅ You already have an active free trial for {days_left} more day(s)."
-            else:
-                return "\n\n⚠️ Your previous free trial has expired. To get more days, please contact the admin."
-        else:
-            expiry = now + timedelta(days=int(os.getenv('TRIAL_DAYS','10')))
-            # adaptive insert, using existing helper if any not present; do raw insert with provider_status if exists:
-            cols = session.execute(text("""
-                SELECT column_name FROM information_schema.columns WHERE table_name='subscriptions'
-            """)).scalars().all()
-            cols_lower = {c.lower() for c in cols}
-            params = {"uid": user_id, "expiry": expiry.isoformat()}
-            if 'provider_status' in cols_lower and 'status_internal' in cols_lower:
-                session.execute(text(
-                    "INSERT INTO subscriptions (user_id, provider, provider_sub_id, provider_status, status_internal, created_at, updated_at) "
-                    "VALUES (:uid, 'trial', :expiry, 'active', 'active', NOW(), NOW())"
-                ), params)
-            elif 'provider_status' in cols_lower:
-                session.execute(text(
-                    "INSERT INTO subscriptions (user_id, provider, provider_sub_id, provider_status, created_at, updated_at) "
-                    "VALUES (:uid, 'trial', :expiry, 'active', NOW(), NOW())"
-                ), params)
-            elif 'status_internal' in cols_lower:
-                session.execute(text(
-                    "INSERT INTO subscriptions (user_id, provider, provider_sub_id, status_internal, created_at, updated_at) "
-                    "VALUES (:uid, 'trial', :expiry, 'active', NOW(), NOW())"
-                ), params)
-            else:
-                session.execute(text(
-                    "INSERT INTO subscriptions (user_id, provider, provider_sub_id, created_at, updated_at) "
-                    "VALUES (:uid, 'trial', :expiry, NOW(), NOW())"
-                ), params)
-            return f"\n\n🎁 You received a free {int(os.getenv('TRIAL_DAYS','10'))}-day trial with full access. It will expire on {expiry.date().isoformat()} (UTC)."
+            return "\n\n⚠️ Your previous free trial has expired. To get more days, please contact the admin."
+        expiry = now + timedelta(days=trial_days)
+        _insert_trial_row(session, user_id=user_id, expiry_iso=expiry.isoformat())
+        return f"\n\n🎁 You received a free {trial_days}-day trial with full access. It will expire on {expiry.date().isoformat()} (UTC)."
 
+# ██ END TRIAL helpers ███████████████████████████████████████████████
+
+def paypal_upgrade_url_for(tg_id: str | None) -> str | None:
+    # Billing disabled — keep signature to avoid breaking other code paths
+    return None
 
 def main_menu_keyboard(tg_id: str | None) -> InlineKeyboardMarkup:
     rows = [
@@ -194,14 +202,15 @@ def main_menu_keyboard(tg_id: str | None) -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔔 My Alerts", callback_data="go:myalerts")],
         [InlineKeyboardButton("⏱️ Set Alert Help", callback_data="go:setalerthelp"),
          InlineKeyboardButton("ℹ️ Help", callback_data="go:help")],
-        [InlineKeyboardButton("🆘 Support", callback_data="go:support")],
-        [InlineKeyboardButton(_trial_status_line_for(tg_id), callback_data="noop:trial")]
+        [InlineKeyboardButton("🆘 Support", callback_data="go:support")]
     ]
+    # add Trial status line
+    rows.append([InlineKeyboardButton(_trial_status_line_for(tg_id), callback_data="noop:trial")])
     return InlineKeyboardMarkup(rows)
 
 def upgrade_keyboard(tg_id: str | None):
-    u = paypal_upgrade_url_for(tg_id)
-    return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade with PayPal", url=u)]]) if u else None
+    # Billing disabled
+    return None
 
 def start_text() -> str:
     return (
@@ -213,8 +222,8 @@ def start_text() -> str:
         "• <code>/myalerts</code> — list your active alerts (with delete buttons)\n"
         "• <code>/help</code> — instructions\n"
         "• <code>/support &lt;message&gt;</code> — contact admin support\n\n"
-        "💎 <b>Premium</b>: unlimited alerts\n"
-        f"🆓 <b>Free</b>: up to <b>{FREE_ALERT_LIMIT}</b> alerts.\n\n"
+        f"🎁 <b>Trial</b>: {TRIAL_DAYS} days with full/unlimited access.\n"
+        "After trial expires, contact the admin to extend access.\n\n"
         "<b>Extra Features</b>\n"
         "• <code>/feargreed</code> • <code>/funding [SYMBOL]</code>\n"
         "• <code>/topgainers</code> • <code>/toplosers</code>\n"
@@ -269,7 +278,8 @@ def alertsok():
         "expected_interval_seconds": INTERVAL_SECONDS,
     }
 
-@health_app.api_route("/billing/paypal/start", methods=["GET","HEAD"])
+# PayPal route disabled (returns 410)
+@health_app.api_route("/billing/paypal/start", methods=["GET", "HEAD"])
 def paypal_start_disabled():
     return JSONResponse({"error": "billing disabled"}, status_code=410)
 
@@ -290,14 +300,12 @@ def bot_heartbeat_loop():
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-    # ensure user exists
-    with session_scope() as session:
-        user = session.execute(text("SELECT id FROM users WHERE telegram_id=:tg"), {"tg": tg_id}).mappings().first()
-        if not user:
-            session.execute(text("INSERT INTO users (telegram_id, is_premium, created_at, updated_at) VALUES (:tg, FALSE, NOW(), NOW())"), {"tg": tg_id})
-            user = session.execute(text("SELECT id FROM users WHERE telegram_id=:tg"), {"tg": tg_id}).mappings().first()
-        user_id = int(user["id"])
-    extra = await _ensure_trial_row(user_id)
+    # ensure user row & compute plan (keeps your existing logic)
+    plan = build_plan_info(tg_id, _ADMIN_IDS)
+
+    # create/extend trial
+    extra = await _ensure_trial_row(plan.user_id)
+
     await target_msg(update).reply_text(
         start_text() + extra,
         reply_markup=main_menu_keyboard(tg_id),
@@ -327,7 +335,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chunk in safe_chunks(help_html):
         await target_msg(update).reply_text(
             chunk,
-            reply_markup=upgrade_keyboard(tg_id),
+            reply_markup=upgrade_keyboard(tg_id),  # returns None → fine
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -402,10 +410,9 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {"uid": plan.user_id, "sym": pair, "rule": rule, "val": val, "cooldown": 900},
             ).first()
             user_seq = row.user_seq
-        extra = "" if plan.has_unlimited else (
-            f"  ({(remaining-1) if remaining else 0} free slots left)" if remaining else ""
-        )
+        extra = ""  # unlimited during trial/premium/admin
         await target_msg(update).reply_text(f"✅ Alert A{user_seq} set: {pair} {op} {val}{extra}")
+    except Exception as e:
         await target_msg(update).reply_text(f"❌ Could not create alert: {e}")
 
 def _alert_buttons(aid: int) -> InlineKeyboardMarkup:
@@ -479,6 +486,7 @@ async def cmd_alts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for title, url in info.get("links", []):
             lines.append(f"• <a href=\"{url}\">{title}</a>")
         await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
         await target_msg(update).reply_text(f"Error: {e}")
 
 async def cmd_listalts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -491,6 +499,7 @@ async def cmd_listalts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines += [f"• <code>{s}</code>" for s in syms]
         lines.append("\nTip: /alts &lt;SYMBOL&gt; for notes &amp; links.")
         await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
         await target_msg(update).reply_text(f"Error: {e}")
 
 async def cmd_listpresales(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -503,6 +512,7 @@ async def cmd_listpresales(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines += [f"• <code>{s}</code>" for s in syms]
         lines.append("\nTip: /alts &lt;SYMBOL&gt; for notes &amp; links. DYOR • High risk.")
         await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
         await target_msg(update).reply_text(f"Error: {e}")
 
 # ────────────────────── Callback buttons (inline) ───────────────────
@@ -600,7 +610,8 @@ def alerts_loop():
                 _ALERTS_LAST_RESULT = {"ts": ts, **counters}
                 _ALERTS_LAST_OK_AT = datetime.utcnow()
                 print({"msg": "alert_cycle", **_ALERTS_LAST_RESULT})
-                        print({"msg": "alert_cycle_error", "ts": ts, "error": str(e)})
+            except Exception as e:
+                print({"msg": "alert_cycle_error", "ts": ts, "error": str(e)})
             time.sleep(INTERVAL_SECONDS)
     finally:
         try:
@@ -612,6 +623,7 @@ def delete_webhook_if_any():
     try:
         r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=10)
         print({"msg": "delete_webhook", "status": r.status_code, "body": r.text[:160]})
+    except Exception as e:
         print({"msg": "delete_webhook_exception", "error": str(e)})
 
 # ─────────────────────────── Run bot (polling) ─────────────────────
@@ -674,7 +686,8 @@ def run_bot():
                 print({"msg": "bot_timeout_retry", "error": str(e), "sleep": backoff})
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
-                        print({"msg": "bot_generic_retry", "error": str(e), "sleep": 10})
+            except Exception as e:
+                print({"msg": "bot_generic_retry", "error": str(e), "sleep": 10})
                 time.sleep(10)
     finally:
         try:

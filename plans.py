@@ -1,7 +1,7 @@
-# plans.py - trial/premium/admin only, no free limit
+# plans.py
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Tuple
 from sqlalchemy import text
 from db import session_scope
@@ -21,14 +21,14 @@ def build_plan_info(telegram_id: str, admin_ids: set[str] | None = None) -> Plan
     with session_scope() as session:
         row = session.execute(text("SELECT id, is_premium FROM users WHERE telegram_id = :tg"), {"tg": telegram_id}).mappings().first()
         if not row:
-            return PlanInfo(user_id=0, telegram_id=telegram_id, is_admin=False, is_premium=False,
-                            has_unlimited=False, alerts_count=0, trial_expires_at=None)
+            session.execute(text("INSERT INTO users (telegram_id, is_premium, created_at, updated_at) VALUES (:tg, FALSE, NOW(), NOW())"), {"tg": telegram_id})
+            row = session.execute(text("SELECT id, is_premium FROM users WHERE telegram_id = :tg"), {"tg": telegram_id}).mappings().first()
         user_id = row["id"]
         is_premium = bool(row["is_premium"])
         alerts_count = int(session.execute(text("SELECT COUNT(*) FROM alerts WHERE user_id = :uid"), {"uid": user_id}).scalar() or 0)
 
         trial_row = session.execute(
-            text("SELECT provider_sub_id, created_at FROM subscriptions WHERE user_id = :uid AND provider = 'trial' ORDER BY created_at DESC LIMIT 1"),
+            text("SELECT provider_sub_id FROM subscriptions WHERE user_id = :uid AND provider = 'trial' ORDER BY created_at DESC LIMIT 1"),
             {"uid": user_id}
         ).mappings().first()
         trial_expires = None
@@ -39,7 +39,7 @@ def build_plan_info(telegram_id: str, admin_ids: set[str] | None = None) -> Plan
                 if psid:
                     dt = datetime.fromisoformat(psid)
                     trial_expires = dt.isoformat()
-                    if dt > datetime.now(timezone.utc):
+                    if dt > datetime.utcnow():
                         has_unlimited = True
             except Exception:
                 trial_expires = None
@@ -53,9 +53,10 @@ def build_plan_info(telegram_id: str, admin_ids: set[str] | None = None) -> Plan
                         alerts_count=alerts_count, trial_expires_at=trial_expires)
 
 def can_create_alert(plan: PlanInfo) -> Tuple[bool, str, int | None]:
+    # Unlimited during active trial/premium/admin
     if plan.has_unlimited:
         return True, "", None
-    return False, ("Access is restricted. Your free trial has ended. Contact admin to extend access."), 0
+    return False, "Access restricted. Your trial expired. Contact admin to extend access.", 0
 
 def plan_status_line(plan: PlanInfo) -> str:
     if plan.has_unlimited:
