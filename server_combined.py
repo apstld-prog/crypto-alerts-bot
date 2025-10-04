@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Set
 
 import uvicorn
 from fastapi import FastAPI
@@ -14,20 +14,15 @@ from sqlalchemy import text
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-from db import session_scope, init_db, User  # models & DB session
+from db import session_scope, init_db
 from commands_admin import register_admin_handlers  # alias kept for compatibility
 
 # -------------------- ENV --------------------
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 ADMIN_KEY = (os.getenv("ADMIN_KEY") or "").strip() or None
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "10"))
-WORKER_INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))  # placeholder
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
@@ -50,13 +45,12 @@ def botok():
 
 @app.get("/alertsok", response_class=PlainTextResponse)
 def alertsok():
-    # placeholder; extend with your own checks/metrics
     return "ok"
 
 # -------------------- Telegram Bot (PTB v20+) --------------------
 tg_app: Optional[Application] = None
 
-def _admin_ids() -> set[str]:
+def _admin_ids() -> Set[str]:
     if not ADMIN_KEY:
         return set()
     return {p.strip() for p in ADMIN_KEY.split(",") if p.strip()}
@@ -114,6 +108,55 @@ def start_text() -> str:
         "After trial expires, contact the admin to extend access.\n"
     )
 
+# ---------- DB helpers: adaptive INSERT for different schemas ----------
+def _subscriptions_columns(session) -> Set[str]:
+    cols = session.execute(text("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name='subscriptions'
+    """)).scalars().all()
+    return {c.lower() for c in cols}
+
+def _insert_trial_row(session, user_id: int, expiry_iso: str) -> None:
+    """
+    Insert into subscriptions using the columns that actually exist.
+    Handles schemas with/without provider_status, status_internal, created_at/updated_at defaults, etc.
+    """
+    cols = _subscriptions_columns(session)
+    # Base fields that we always try to set
+    values = {
+        "user_id": user_id,
+        "provider": "trial",
+        "provider_sub_id": expiry_iso,
+    }
+
+    # If schema has these columns and they are NOT NULL, set safe values
+    if "provider_status" in cols:
+        values["provider_status"] = "active"
+    if "status_internal" in cols:
+        values["status_internal"] = "active"
+
+    # Prefer using NOW() for created_at/updated_at if columns exist
+    field_names = ["user_id", "provider", "provider_sub_id"]
+    field_params = [":user_id", ":provider", ":provider_sub_id"]
+
+    if "provider_status" in cols:
+        field_names.append("provider_status")
+        field_params.append(":provider_status")
+    if "status_internal" in cols:
+        field_names.append("status_internal")
+        field_params.append(":status_internal")
+    if "created_at" in cols:
+        field_names.append("created_at")
+        field_params.append("NOW()")
+    if "updated_at" in cols:
+        field_names.append("updated_at")
+        field_params.append("NOW()")
+
+    sql = f"INSERT INTO subscriptions ({', '.join(field_names)}) VALUES ({', '.join(field_params)})"
+    session.execute(text(sql), values)
+
+# -------------------- Trial logic --------------------
 async def _ensure_trial_row(user_id: int) -> str:
     """
     Creates a trial if none exists; if exists, informs remaining/expired.
@@ -140,10 +183,8 @@ async def _ensure_trial_row(user_id: int) -> str:
                 return "\n\n⚠️ Your previous free trial has expired. To get more days, please contact the admin."
         else:
             expiry = now + timedelta(days=TRIAL_DAYS)
-            session.execute(text(
-                "INSERT INTO subscriptions (user_id, provider, provider_sub_id, status_internal, created_at, updated_at) "
-                "VALUES (:uid, 'trial', :expiry, 'active', NOW(), NOW())"
-            ), {"uid": user_id, "expiry": expiry.isoformat()})
+            # adaptive insert for your schema:
+            _insert_trial_row(session, user_id=user_id, expiry_iso=expiry.isoformat())
             return f"\n\n🎁 You received a free {TRIAL_DAYS}-day trial with full access. It will expire on {expiry.date().isoformat()} (UTC)."
 
 # -------------------- Command Handlers --------------------
@@ -194,8 +235,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_startup():
     """
     Start Telegram Application inside uvicorn loop WITHOUT closing the loop.
-    We use initialize/start + start_polling in a task (instead of run_polling) to avoid
-    'Cannot close a running event loop' with uvloop.
+    We use initialize/start + start_polling in a task (instead of run_polling).
     """
     global tg_app
     init_db()
@@ -212,14 +252,12 @@ async def on_startup():
     # start polling safely inside uvicorn loop
     await tg_app.initialize()
     await tg_app.start()
-    # PTB v20+ keeps an Updater accessible; start its polling in background
     asyncio.create_task(tg_app.updater.start_polling())
 
 @app.on_event("shutdown")
 async def on_shutdown():
     global tg_app
     if tg_app:
-        # stop polling & cleanly shutdown PTB Application
         await tg_app.updater.stop()
         await tg_app.stop()
         await tg_app.shutdown()
@@ -227,6 +265,4 @@ async def on_shutdown():
 
 # -------------------- Local dev entry --------------------
 if __name__ == "__main__":
-    # Local run example:
-    # uvicorn server_combined:app --host 0.0.0.0 --port 10000
     uvicorn.run("server_combined:app", host="0.0.0.0", port=10000, reload=False)
