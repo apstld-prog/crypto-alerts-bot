@@ -38,7 +38,7 @@ ADMIN_KEY = (os.getenv("ADMIN_KEY") or "").strip() or None
 
 INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
 
-# PayPal is disabled; keep vars for backward-compat but they are not used anymore
+# PayPal disabled
 PAYPAL_PLAN_ID = None
 PAYPAL_SUBSCRIBE_URL = None
 
@@ -112,7 +112,7 @@ def target_msg(update: Update):
     """Return a message target compatible with commands & callbacks."""
     return update.message or (update.callback_query.message if update.callback_query else None)
 
-# ██ NEW: TRIAL helpers (adaptive to your DB schema) █████████████████
+# ██ TRIAL helpers (adaptive to schema) ██████████████████████████████
 
 def _subscriptions_columns(session) -> set[str]:
     cols = session.execute(text("""
@@ -122,27 +122,27 @@ def _subscriptions_columns(session) -> set[str]:
 
 def _insert_trial_row(session, user_id: int, expiry_iso: str) -> None:
     cols = _subscriptions_columns(session)
-    params = {"uid": user_id, "expiry": expiry_iso}
+    p = {"uid": user_id, "expiry": expiry_iso}
     if "provider_status" in cols and "status_internal" in cols:
         session.execute(text(
             "INSERT INTO subscriptions (user_id, provider, provider_sub_id, provider_status, status_internal, created_at, updated_at) "
             "VALUES (:uid, 'trial', :expiry, 'active', 'active', NOW(), NOW())"
-        ), params)
+        ), p)
     elif "provider_status" in cols:
         session.execute(text(
             "INSERT INTO subscriptions (user_id, provider, provider_sub_id, provider_status, created_at, updated_at) "
             "VALUES (:uid, 'trial', :expiry, 'active', NOW(), NOW())"
-        ), params)
+        ), p)
     elif "status_internal" in cols:
         session.execute(text(
             "INSERT INTO subscriptions (user_id, provider, provider_sub_id, status_internal, created_at, updated_at) "
             "VALUES (:uid, 'trial', :expiry, 'active', NOW(), NOW())"
-        ), params)
+        ), p)
     else:
         session.execute(text(
             "INSERT INTO subscriptions (user_id, provider, provider_sub_id, created_at, updated_at) "
             "VALUES (:uid, 'trial', :expiry, NOW(), NOW())"
-        ), params)
+        ), p)
 
 def _trial_status_line_for(tg_id: str | None) -> str:
     if not tg_id:
@@ -190,7 +190,7 @@ async def _ensure_trial_row(user_id: int, trial_days: int = TRIAL_DAYS) -> str:
         _insert_trial_row(session, user_id=user_id, expiry_iso=expiry.isoformat())
         return f"\n\n🎁 You received a free {trial_days}-day trial with full access. It will expire on {expiry.date().isoformat()} (UTC)."
 
-# ██ END TRIAL helpers ███████████████████████████████████████████████
+# ──────────────────────── UI helpers (no PayPal) ────────────────────
 
 def paypal_upgrade_url_for(tg_id: str | None) -> str | None:
     # Billing disabled — keep signature to avoid breaking other code paths
@@ -202,10 +202,11 @@ def main_menu_keyboard(tg_id: str | None) -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔔 My Alerts", callback_data="go:myalerts")],
         [InlineKeyboardButton("⏱️ Set Alert Help", callback_data="go:setalerthelp"),
          InlineKeyboardButton("ℹ️ Help", callback_data="go:help")],
-        [InlineKeyboardButton("🆘 Support", callback_data="go:support")]
+        [InlineKeyboardButton("🆘 Support", callback_data="go:support")],
     ]
-    # add Trial status line
+    # Trial status + request days
     rows.append([InlineKeyboardButton(_trial_status_line_for(tg_id), callback_data="noop:trial")])
+    rows.append([InlineKeyboardButton("📩 Request more days", callback_data="req:days")])
     return InlineKeyboardMarkup(rows)
 
 def upgrade_keyboard(tg_id: str | None):
@@ -470,51 +471,6 @@ async def cmd_clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.commit()
     await target_msg(update).reply_text("All your alerts were deleted.")
 
-# ─────────────────────────── Alts / Presales ───────────────────────
-
-async def cmd_alts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not context.args:
-            await target_msg(update).reply_text("Usage: /alts &lt;SYMBOL&gt;", parse_mode=ParseMode.HTML)
-            return
-        sym = (context.args[0] or "").upper().strip()
-        info = get_off_binance_info(sym)
-        if not info:
-            await target_msg(update).reply_text("No curated info for that symbol.")
-            return
-        lines = [f"ℹ️ <b>{info.get('name', sym)}</b>\n{info.get('note','')}".strip()]
-        for title, url in info.get("links", []):
-            lines.append(f"• <a href=\"{url}\">{title}</a>")
-        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await target_msg(update).reply_text(f"Error: {e}")
-
-async def cmd_listalts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        syms = list_off_binance()
-        if not syms:
-            await target_msg(update).reply_text("No curated tokens configured yet.")
-            return
-        lines = ["🌱 <b>Curated Off-Binance & Community</b>"]
-        lines += [f"• <code>{s}</code>" for s in syms]
-        lines.append("\nTip: /alts &lt;SYMBOL&gt; for notes &amp; links.")
-        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await target_msg(update).reply_text(f"Error: {e}")
-
-async def cmd_listpresales(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        syms = list_presales()
-        if not syms:
-            await target_msg(update).reply_text("No presales listed yet.")
-            return
-        lines = ["🟠 <b>Curated Presales</b>"]
-        lines += [f"• <code>{s}</code>" for s in syms]
-        lines.append("\nTip: /alts &lt;SYMBOL&gt; for notes &amp; links. DYOR • High risk.")
-        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await target_msg(update).reply_text(f"Error: {e}")
-
 # ────────────────────── Callback buttons (inline) ───────────────────
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -524,6 +480,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(query.from_user.id)
     plan = build_plan_info(tg_id, _ADMIN_IDS)
 
+    # Menu navigation
     if data == "go:help":
         await cmd_help(update, context); return
     if data == "go:myalerts":
@@ -541,6 +498,76 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Send /support <message>", reply_markup=upgrade_keyboard(tg_id))
         return
 
+    # Request extra days → notify admins with approve/decline buttons
+    if data == "req:days":
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve 7d", callback_data=f"admin:grant:{tg_id}:7"),
+                InlineKeyboardButton("✅ Approve 15d", callback_data=f"admin:grant:{tg_id}:15"),
+                InlineKeyboardButton("✅ Approve 30d", callback_data=f"admin:grant:{tg_id}:30"),
+            ],
+            [InlineKeyboardButton("❌ Decline", callback_data=f"admin:decline:{tg_id}")]
+        ])
+        for aid in _ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(aid),
+                    text=f"📩 <b>Request for extra trial days</b>\nFrom user: <code>{tg_id}</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb
+                )
+            except Exception:
+                pass
+        await query.message.reply_text("✅ Sent request to admin. You’ll be notified here.")
+        return
+
+    # Admin approval / decline via callbacks
+    if data.startswith("admin:"):
+        parts = data.split(":")
+        action = parts[1]
+        target_tg = parts[2] if len(parts) > 2 else None
+        if str(query.from_user.id) not in _ADMIN_IDS:
+            await query.answer("Admin only"); return
+        if action == "grant":
+            days = int(parts[3]) if len(parts) > 3 else 7
+            # Insert trial
+            with session_scope() as s:
+                u = s.execute(text("SELECT id FROM users WHERE telegram_id=:tg"), {"tg": target_tg}).mappings().first()
+                if u:
+                    uid = int(u["id"])
+                    now = datetime.utcnow()
+                    t = s.execute(text(
+                        "SELECT provider_sub_id FROM subscriptions WHERE user_id=:uid AND provider='trial' ORDER BY created_at DESC LIMIT 1"
+                    ), {"uid": uid}).mappings().first()
+                    base = now
+                    if t and t.get("provider_sub_id"):
+                        try:
+                            ex = datetime.fromisoformat(t.get("provider_sub_id"))
+                            if ex > now: base = ex
+                        except Exception:
+                            pass
+                    new_expiry = base + timedelta(days=days)
+                    _insert_trial_row(s, user_id=uid, expiry_iso=new_expiry.isoformat())
+                else:
+                    new_expiry = None
+            await query.edit_message_text(f"✅ Approved {days}d for {target_tg}.")
+            try:
+                await context.bot.send_message(
+                    chat_id=int(target_tg),
+                    text=f"🎉 Admin approved extra {days} day(s). Enjoy!\nNew expiry (UTC): {new_expiry.date().isoformat() if new_expiry else 'updated'}"
+                )
+            except Exception:
+                pass
+            return
+        if action == "decline":
+            await query.edit_message_text(f"❌ Declined request for {target_tg}.")
+            try:
+                await context.bot.send_message(chat_id=int(target_tg), text="😕 Admin declined your request for extra days.")
+            except Exception:
+                pass
+            return
+
+    # Alert deletion ACKs
     if data.startswith("del:"):
         try:
             aid = int(data.split(":", 1)[1])
@@ -666,7 +693,7 @@ def run_bot():
         # Extras (funding/topgainers/chart/news/dca/pumplive etc.)
         register_extra_handlers(app)
 
-        # Admin module
+        # Admin module (has all admin commands)
         register_admin_handlers(app, _ADMIN_IDS)
 
         # Callback queries (inline buttons)

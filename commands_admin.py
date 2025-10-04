@@ -1,9 +1,11 @@
 # commands_admin.py
 from __future__ import annotations
 import os
-from typing import Set
+import time
+from typing import Set, Iterable
 from datetime import datetime, timedelta
 
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -11,6 +13,7 @@ from sqlalchemy import text
 
 from db import session_scope
 
+# Helpers
 def _admin_ids_from_env() -> Set[str]:
     return {s.strip() for s in (os.getenv("ADMIN_TELEGRAM_IDS") or "").split(",") if s.strip()}
 
@@ -21,10 +24,138 @@ async def _admin_only(update: Update, admin_ids: Set[str]) -> bool:
         return False
     return True
 
-# ====== Existing admin handlers of yours can remain here ======
-# (Δεν τα αλλάζω — συνέχισε να τα έχεις όπως ήταν.)
+# ============== Core admin utilities ==============
 
-# ====== Trial management ======
+async def adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_ids: Set[str]):
+    if not await _admin_only(update, admin_ids): return
+    with session_scope() as s:
+        users = s.execute(text("SELECT COUNT(*) FROM users")).scalar() or 0
+        premium = s.execute(text("SELECT COUNT(*) FROM users WHERE is_premium=TRUE")).scalar() or 0
+        alerts = s.execute(text("SELECT COUNT(*) FROM alerts")).scalar() or 0
+    await (update.message or update.effective_message).reply_text(
+        f"👥 Users: {users}\n💎 Premium: {premium}\n🔔 Alerts: {alerts}"
+    )
+
+async def adminalerts(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_ids: Set[str]):
+    if not await _admin_only(update, admin_ids): return
+    with session_scope() as s:
+        total = s.execute(text("SELECT COUNT(*) FROM alerts")).scalar() or 0
+        top = s.execute(text("""
+            SELECT u.telegram_id, COUNT(*) AS c
+            FROM alerts a JOIN users u ON u.id=a.user_id
+            GROUP BY u.telegram_id ORDER BY c DESC LIMIT 10
+        """)).mappings().all()
+    lines = [f"🔔 Total alerts: {total}", "🏆 Top users:"]
+    lines += [f"• {r['telegram_id']}: {r['c']}" for r in top] or ["(none)"]
+    await (update.message or update.effective_message).reply_text("\n".join(lines))
+
+async def adminusers(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_ids: Set[str]):
+    if not await _admin_only(update, admin_ids): return
+    with session_scope() as s:
+        rows = s.execute(text("""
+            SELECT telegram_id, is_premium,
+                   (SELECT COUNT(*) FROM alerts a WHERE a.user_id=u.id) AS alerts
+            FROM users u ORDER BY u.id DESC LIMIT 50
+        """)).mappings().all()
+    lines = ["<b>Recent users</b>"]
+    for r in rows:
+        lines.append(f"{r['telegram_id']} — premium:{bool(r['is_premium'])} — alerts:{r['alerts']}")
+    await (update.message or update.effective_message).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+async def adminwho(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_ids: Set[str]):
+    if not await _admin_only(update, admin_ids): return
+    args = context.args or []
+    if not args:
+        await (update.message or update.effective_message).reply_text("Usage: /adminwho <telegram_id>")
+        return
+    tgid = args[0]
+    with session_scope() as s:
+        u = s.execute(text("SELECT id, is_premium FROM users WHERE telegram_id=:tg"), {"tg": tgid}).mappings().first()
+        if not u:
+            await (update.message or update.effective_message).reply_text("User not found"); return
+        uid = u["id"]; premium = bool(u["is_premium"])
+        alerts = s.execute(text("SELECT COUNT(*) FROM alerts WHERE user_id=:uid"), {"uid": uid}).scalar() or 0
+        trial = s.execute(text("""
+            SELECT provider_sub_id FROM subscriptions WHERE user_id=:uid AND provider='trial'
+            ORDER BY created_at DESC LIMIT 1
+        """), {"uid": uid}).mappings().first()
+    trial_exp = trial['provider_sub_id'] if trial else None
+    await (update.message or update.effective_message).reply_text(
+        f"User {tgid}\nPremium:{premium}\nAlerts:{alerts}\nTrial expires:{trial_exp}"
+    )
+
+async def adminplans(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_ids: Set[str]):
+    if not await _admin_only(update, admin_ids): return
+    with session_scope() as s:
+        total = s.execute(text("SELECT COUNT(*) FROM users")).scalar() or 0
+        premium = s.execute(text("SELECT COUNT(*) FROM users WHERE is_premium=TRUE")).scalar() or 0
+        active_trials = s.execute(text("""
+            SELECT COUNT(*) FROM subscriptions s
+            WHERE s.provider='trial' AND s.provider_sub_id::timestamp > NOW()
+        """)).scalar() or 0
+    await (update.message or update.effective_message).reply_text(
+        f"Plans\nTotal users:{total}\nPremium:{premium}\nActive trials:{active_trials}"
+    )
+
+async def adminbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_ids: Set[str]):
+    if not await _admin_only(update, admin_ids): return
+    msg = " ".join(context.args or [])
+    if not msg:
+        await (update.message or update.effective_message).reply_text("Usage: /adminbroadcast <message>")
+        return
+    sent = 0
+    with session_scope() as s:
+        ids = [r[0] for r in s.execute(text("SELECT telegram_id FROM users")).all()]
+    for tgid in ids:
+        try:
+            await context.bot.send_message(chat_id=int(tgid), text=msg)
+            sent += 1
+            time.sleep(0.04)  # throttle
+        except Exception:
+            pass
+    await (update.message or update.effective_message).reply_text(f"Broadcast sent to {sent}/{len(ids)} users.")
+
+async def adminexec(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_ids: Set[str]):
+    if not await _admin_only(update, admin_ids): return
+    sql = " ".join(context.args or [])
+    if not sql or not sql.strip().lower().startswith("select"):
+        await (update.message or update.effective_message).reply_text("Read-only. Usage: /adminexec <SELECT …>")
+        return
+    try:
+        with session_scope() as s:
+            rows = s.execute(text(sql)).mappings().all()
+        if not rows:
+            await (update.message or update.effective_message).reply_text("(no rows)")
+            return
+        # simple pretty
+        keys = rows[0].keys()
+        lines = [" | ".join(keys)]
+        for r in rows[:50]:
+            lines.append(" | ".join(str(r[k]) for k in keys))
+        await (update.message or update.effective_message).reply_text("\n".join(lines))
+    except Exception as e:
+        await (update.message or update.effective_message).reply_text(f"Error: {e}")
+
+async def adminhealth(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_ids: Set[str]):
+    if not await _admin_only(update, admin_ids): return
+    base = os.getenv("WEB_URL") or ""
+    try:
+        b = requests.get(f"{base}/botok", timeout=5).json()
+        a = requests.get(f"{base}/alertsok", timeout=5).json()
+        await (update.message or update.effective_message).reply_text(
+            f"botok: {b}\nalertsok: {a}"
+        )
+    except Exception as e:
+        await (update.message or update.effective_message).reply_text(f"Error: {e}")
+
+async def admintoken(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_ids: Set[str]):
+    if not await _admin_only(update, admin_ids): return
+    tok = os.getenv("BOT_TOKEN") or ""
+    masked = tok[:6] + "…" + tok[-4:] if len(tok) > 10 else "set"
+    await (update.message or update.effective_message).reply_text(f"BOT_TOKEN: {masked}")
+
+# ====== Trial helpers (grant/info/list) ======
+
 def _subscriptions_columns(session) -> set[str]:
     cols = session.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='subscriptions'")).scalars().all()
     return {c.lower() for c in cols}
@@ -63,13 +194,12 @@ async def grantdays(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_id
     try:
         days = int(args[1])
     except Exception:
-        await (update.message or update.effective_message).reply_text("Days must be an integer.")
+        await (update.message or update.effective_message).reply_text("Days must be integer.")
         return
     with session_scope() as s:
         u = s.execute(text("SELECT id FROM users WHERE telegram_id=:tg"), {"tg": target_tg}).mappings().first()
         if not u:
-            await (update.message or update.effective_message).reply_text("User not found.")
-            return
+            await (update.message or update.effective_message).reply_text("User not found."); return
         uid = int(u["id"])
         now = datetime.utcnow()
         t = s.execute(text(
@@ -84,14 +214,12 @@ async def grantdays(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_id
                 pass
         new_expiry = base + timedelta(days=days)
         _insert_trial_row(s, user_id=uid, expiry_iso=new_expiry.isoformat())
-    await (update.message or update.effective_message).reply_text(
-        f"Granted {days} day(s) to {target_tg} — expires {new_expiry.isoformat()} (UTC)."
-    )
+    await (update.message or update.effective_message).reply_text(f"Granted {days}d to {target_tg}. New expiry: {new_expiry.isoformat()}")
 
 async def trialinfo(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_ids: Set[str]):
     if not await _admin_only(update, admin_ids): return
     args = context.args or []
-    if len(args) < 1:
+    if not args:
         await (update.message or update.effective_message).reply_text("Usage: /trialinfo <telegram_id>")
         return
     target_tg = args[0]
@@ -100,10 +228,10 @@ async def trialinfo(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_id
             "SELECT provider_sub_id, created_at FROM subscriptions WHERE provider='trial' AND user_id=(SELECT id FROM users WHERE telegram_id=:tg) ORDER BY created_at DESC LIMIT 1"
         ), {"tg": target_tg}).mappings().first()
     if not row:
-        await (update.message or update.effective_message).reply_text("No trial found for that user.")
+        await (update.message or update.effective_message).reply_text("No trial found.")
     else:
         await (update.message or update.effective_message).reply_text(
-            f"User {target_tg} — trial expires: {row['provider_sub_id']} — created: {row['created_at']}"
+            f"User {target_tg} — expires: {row['provider_sub_id']} — created: {row['created_at']}"
         )
 
 async def listtrials(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_ids: Set[str]):
@@ -117,8 +245,21 @@ async def listtrials(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_i
         lines.append(f"{r['telegram_id']} — expires: {r['provider_sub_id']} — created: {r['created_at']}")
     await (update.message or update.effective_message).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
+# ============== Registration ==============
+
 def register_admin_handlers(app: Application, admin_ids: Set[str]):
-    # κράτα όλα τα παλιά admin handlers σου εδώ... και πρόσθεσε:
+    app.add_handler(CommandHandler("pumplive", lambda u, c: c.application.create_task(c.bot.send_message(u.effective_chat.id, "Use /pumplive via extra handlers if implemented."))))  # placeholder hook; kept compatibility
+    app.add_handler(CommandHandler("adminstats", lambda u, c: adminstats(u, c, admin_ids)))
+    app.add_handler(CommandHandler("adminalerts", lambda u, c: adminalerts(u, c, admin_ids)))
+    app.add_handler(CommandHandler("adminusers", lambda u, c: adminusers(u, c, admin_ids)))
+    app.add_handler(CommandHandler("adminwho", lambda u, c: adminwho(u, c, admin_ids)))
+    app.add_handler(CommandHandler("adminplans", lambda u, c: adminplans(u, c, admin_ids)))
+    app.add_handler(CommandHandler("adminbroadcast", lambda u, c: adminbroadcast(u, c, admin_ids)))
+    app.add_handler(CommandHandler("adminexec", lambda u, c: adminexec(u, c, admin_ids)))
+    app.add_handler(CommandHandler("adminhealth", lambda u, c: adminhealth(u, c, admin_ids)))
+    app.add_handler(CommandHandler("admintoken", lambda u, c: admintoken(u, c, admin_ids)))
+
+    # Trial management
     app.add_handler(CommandHandler("grantdays", lambda u, c: grantdays(u, c, admin_ids)))
     app.add_handler(CommandHandler("trialinfo", lambda u, c: trialinfo(u, c, admin_ids)))
     app.add_handler(CommandHandler("listtrials", lambda u, c: listtrials(u, c, admin_ids)))
