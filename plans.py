@@ -1,13 +1,10 @@
-# plans.py
+# plans.py - trial/premium/admin only, no free limit
 from __future__ import annotations
-import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Tuple
 from sqlalchemy import text
 from db import session_scope
-
-FREE_ALERT_LIMIT = int(os.getenv("FREE_ALERT_LIMIT", "10"))
 
 @dataclass
 class PlanInfo:
@@ -16,84 +13,53 @@ class PlanInfo:
     is_admin: bool
     is_premium: bool
     has_unlimited: bool
-    free_limit: int
     alerts_count: int
+    trial_expires_at: str | None
 
-def _ensure_user(tg_id: str) -> int:
-    with session_scope() as s:
-        row = s.execute(text("SELECT id FROM users WHERE telegram_id = :tg"),
-                        {"tg": tg_id}).first()
-        if row:
-            return int(row.id)
-        row = s.execute(text("""
-            INSERT INTO users (telegram_id, is_premium)
-            VALUES (:tg, FALSE)
-            RETURNING id
-        """), {"tg": tg_id}).first()
-        return int(row.id)
+def build_plan_info(telegram_id: str, admin_ids: set[str] | None = None) -> PlanInfo:
+    admin_ids = admin_ids or set()
+    with session_scope() as session:
+        row = session.execute(text("SELECT id, is_premium FROM users WHERE telegram_id = :tg"), {"tg": telegram_id}).mappings().first()
+        if not row:
+            return PlanInfo(user_id=0, telegram_id=telegram_id, is_admin=False, is_premium=False,
+                            has_unlimited=False, alerts_count=0, trial_expires_at=None)
+        user_id = row["id"]
+        is_premium = bool(row["is_premium"])
+        alerts_count = int(session.execute(text("SELECT COUNT(*) FROM alerts WHERE user_id = :uid"), {"uid": user_id}).scalar() or 0)
 
-def _is_premium_user(uid: int) -> bool:
-    now = datetime.now(timezone.utc)
-    with session_scope() as s:
-        # primary flag on users table
-        up = s.execute(text("SELECT is_premium FROM users WHERE id=:uid"),
-                       {"uid": uid}).scalar()
-        if bool(up):
-            return True
-        # check subscriptions table if υπάρχει
-        try:
-            row = s.execute(text("""
-                SELECT 1
-                FROM subscriptions
-                WHERE user_id=:uid AND (
-                    status_internal='ACTIVE'
-                    OR (status_internal='CANCEL_AT_PERIOD_END'
-                        AND (keeps_access_until IS NULL OR keeps_access_until > :now))
-                )
-                LIMIT 1
-            """), {"uid": uid, "now": now}).first()
-            return bool(row)
-        except Exception:
-            # table might not exist yet
-            return False
+        trial_row = session.execute(
+            text("SELECT provider_sub_id, created_at FROM subscriptions WHERE user_id = :uid AND provider = 'trial' ORDER BY created_at DESC LIMIT 1"),
+            {"uid": user_id}
+        ).mappings().first()
+        trial_expires = None
+        has_unlimited = is_premium
+        if trial_row:
+            psid = trial_row.get("provider_sub_id")
+            try:
+                if psid:
+                    dt = datetime.fromisoformat(psid)
+                    trial_expires = dt.isoformat()
+                    if dt > datetime.now(timezone.utc):
+                        has_unlimited = True
+            except Exception:
+                trial_expires = None
 
-def _alerts_count(uid: int) -> int:
-    with session_scope() as s:
-        try:
-            return int(s.execute(text("SELECT COUNT(*) FROM alerts WHERE user_id=:uid"),
-                                 {"uid": uid}).scalar() or 0)
-        except Exception:
-            return 0
+        is_admin = telegram_id in admin_ids
+        if is_admin:
+            has_unlimited = True
 
-def build_plan_info(tg_id: str, admin_ids: set[str]) -> PlanInfo:
-    uid = _ensure_user(tg_id)
-    is_admin = tg_id in admin_ids
-    is_premium = _is_premium_user(uid)
-    alerts_cnt = _alerts_count(uid)
-    has_unlimited = is_admin or is_premium
-    return PlanInfo(
-        user_id=uid,
-        telegram_id=tg_id,
-        is_admin=is_admin,
-        is_premium=is_premium,
-        has_unlimited=has_unlimited,
-        free_limit=FREE_ALERT_LIMIT,
-        alerts_count=alerts_cnt,
-    )
+        return PlanInfo(user_id=user_id, telegram_id=telegram_id, is_admin=is_admin,
+                        is_premium=is_premium, has_unlimited=has_unlimited,
+                        alerts_count=alerts_count, trial_expires_at=trial_expires)
 
 def can_create_alert(plan: PlanInfo) -> Tuple[bool, str, int | None]:
     if plan.has_unlimited:
         return True, "", None
-    remaining = max(0, plan.free_limit - plan.alerts_count)
-    if remaining <= 0:
-        return False, (f"Free plan limit reached ({plan.free_limit}). "
-                       f"Upgrade for unlimited alerts."), 0
-    return True, "", remaining
+    return False, ("Access is restricted. Your free trial has ended. Contact admin to extend access."), 0
 
 def plan_status_line(plan: PlanInfo) -> str:
     if plan.has_unlimited:
-        return "Plan: Premium — unlimited alerts."
-    used = plan.alerts_count
-    limit = plan.free_limit
-    left = max(0, limit - used)
-    return f"Plan: Free — {used}/{limit} used ({left} left)."
+        if plan.trial_expires_at:
+            return f"Plan: Trial/Premium — unlimited access until {plan.trial_expires_at} (UTC)."
+        return "Plan: Premium/Admin — unlimited access."
+    return "Plan: No access (trial expired). Contact admin."
