@@ -162,9 +162,11 @@ def _trial_status_line_for(tg_id: str | None) -> str:
             return "Trial: no active trial — contact admin"
         try:
             expiry = datetime.fromisoformat(row["provider_sub_id"])
+            # normalize to naive UTC for comparison
+            expiry_naive = expiry.replace(tzinfo=None)
             now = datetime.utcnow()
-            if expiry > now:
-                return f"Trial expires: {expiry.date().isoformat()}"
+            if expiry_naive > now:
+                return f"Trial expires: {expiry_naive.date().isoformat()}"
             return "Trial: expired — contact admin"
         except Exception:
             return "Trial: unknown — contact admin"
@@ -182,9 +184,11 @@ async def _ensure_trial_row(user_id: int, trial_days: int = TRIAL_DAYS) -> str:
                 expiry = datetime.fromisoformat(expiry_iso) if expiry_iso else None
             except Exception:
                 expiry = None
-            if expiry and expiry > now:
-                days_left = (expiry - now).days
-                return f"\n\n✅ You already have an active free trial for {days_left} more day(s)."
+            if expiry:
+                expiry_naive = expiry.replace(tzinfo=None)
+                if expiry_naive > now:
+                    days_left = (expiry_naive - now).days
+                    return f"\n\n✅ You already have an active free trial for {days_left} more day(s)."
             return "\n\n⚠️ Your previous free trial has expired. To get more days, please contact the admin."
         expiry = now + timedelta(days=trial_days)
         _insert_trial_row(session, user_id=user_id, expiry_iso=expiry.isoformat())
@@ -407,7 +411,7 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         TRUE)
                 RETURNING id, user_seq
                 """
-                ),
+                    ),
                 {"uid": plan.user_id, "sym": pair, "rule": rule, "val": val, "cooldown": 900},
             ).first()
             user_seq = row.user_seq
@@ -470,6 +474,51 @@ async def cmd_clearalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.execute(text("DELETE FROM alerts WHERE user_id=:uid"), {"uid": plan.user_id})
         session.commit()
     await target_msg(update).reply_text("All your alerts were deleted.")
+
+# ─────────────────────────── Alts / Presales ───────────────────────
+
+async def cmd_alts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not context.args:
+            await target_msg(update).reply_text("Usage: /alts <SYMBOL>", parse_mode=ParseMode.HTML)
+            return
+        sym = (context.args[0] or "").upper().strip()
+        info = get_off_binance_info(sym)
+        if not info:
+            await target_msg(update).reply_text("No curated info for that symbol.")
+            return
+        lines = [f"ℹ️ <b>{info.get('name', sym)}</b>\n{info.get('note','')}".strip()]
+        for title, url in info.get("links", []):
+            lines.append(f"• <a href=\"{url}\">{title}</a>")
+        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await target_msg(update).reply_text(f"Error: {e}")
+
+async def cmd_listalts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        syms = list_off_binance()
+        if not syms:
+            await target_msg(update).reply_text("No curated tokens configured yet.")
+            return
+        lines = ["🌱 <b>Curated Off-Binance & Community</b>"]
+        lines += [f"• <code>{s}</code>" for s in syms]
+        lines.append("\nTip: /alts <SYMBOL> for notes & links.")
+        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await target_msg(update).reply_text(f"Error: {e}")
+
+async def cmd_listpresales(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        syms = list_presales()
+        if not syms:
+            await target_msg(update).reply_text("No presales listed yet.")
+            return
+        lines = ["🟠 <b>Curated Presales</b>"]
+        lines += [f"• <code>{s}</code>" for s in syms]
+        lines.append("\nTip: /alts <SYMBOL> for notes & links. DYOR • High risk.")
+        await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await target_msg(update).reply_text(f"Error: {e}")
 
 # ────────────────────── Callback buttons (inline) ───────────────────
 
@@ -543,6 +592,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if t and t.get("provider_sub_id"):
                         try:
                             ex = datetime.fromisoformat(t.get("provider_sub_id"))
+                            ex = ex.replace(tzinfo=None)
                             if ex > now: base = ex
                         except Exception:
                             pass
@@ -693,7 +743,7 @@ def run_bot():
         # Extras (funding/topgainers/chart/news/dca/pumplive etc.)
         register_extra_handlers(app)
 
-        # Admin module (has all admin commands)
+        # Admin module
         register_admin_handlers(app, _ADMIN_IDS)
 
         # Callback queries (inline buttons)
