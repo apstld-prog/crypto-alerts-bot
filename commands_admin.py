@@ -127,7 +127,6 @@ async def adminexec(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_id
         if not rows:
             await (update.message or update.effective_message).reply_text("(no rows)")
             return
-        # simple pretty
         keys = rows[0].keys()
         lines = [" | ".join(keys)]
         for r in rows[:50]:
@@ -209,6 +208,7 @@ async def grantdays(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_id
         if t and t.get("provider_sub_id"):
             try:
                 ex = datetime.fromisoformat(t.get("provider_sub_id"))
+                ex = ex.replace(tzinfo=None)
                 if ex > now: base = ex
             except Exception:
                 pass
@@ -248,7 +248,8 @@ async def listtrials(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_i
 # ============== Registration ==============
 
 def register_admin_handlers(app: Application, admin_ids: Set[str]):
-    app.add_handler(CommandHandler("pumplive", lambda u, c: c.application.create_task(c.bot.send_message(u.effective_chat.id, "Use /pumplive via extra handlers if implemented."))))  # placeholder hook; kept compatibility
+    # pumplive is handled in commands_extra; keep placeholder to avoid missing command complaints if needed
+    app.add_handler(CommandHandler("pumplive", lambda u, c: c.application.create_task(c.bot.send_message(u.effective_chat.id, "Use /pumplive via extra handlers if implemented."))))
     app.add_handler(CommandHandler("adminstats", lambda u, c: adminstats(u, c, admin_ids)))
     app.add_handler(CommandHandler("adminalerts", lambda u, c: adminalerts(u, c, admin_ids)))
     app.add_handler(CommandHandler("adminusers", lambda u, c: adminusers(u, c, admin_ids)))
