@@ -82,7 +82,6 @@ def _refresh_binance_symbols(force: bool = False):
             _BINANCE_SYMBOLS = mapping
             _BINANCE_LAST_FETCH = now
             print({"msg": "binance_symbols_loaded", "count": len(mapping)})
-    except Exception as e:
         print({"msg": "binance_symbols_error", "error": str(e)})
 
 def resolve_symbol_auto(symbol: str | None) -> str | None:
@@ -270,11 +269,9 @@ def alertsok():
         "expected_interval_seconds": INTERVAL_SECONDS,
     }
 
-@health_app.get("/billing/paypal/start")
+@health_app.api_route("/billing/paypal/start", methods=["GET","HEAD"])
 def paypal_start_disabled():
     return JSONResponse({"error": "billing disabled"}, status_code=410)
-    except Exception as e:
-        return PlainTextResponse(f"Redirect error: {e}", status_code=500)
 
 def bot_heartbeat_loop():
     global _BOT_HEART_BEAT_AT, _BOT_HEART_STATUS
@@ -409,7 +406,6 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  ({(remaining-1) if remaining else 0} free slots left)" if remaining else ""
         )
         await target_msg(update).reply_text(f"✅ Alert A{user_seq} set: {pair} {op} {val}{extra}")
-    except Exception as e:
         await target_msg(update).reply_text(f"❌ Could not create alert: {e}")
 
 def _alert_buttons(aid: int) -> InlineKeyboardMarkup:
@@ -483,7 +479,6 @@ async def cmd_alts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for title, url in info.get("links", []):
             lines.append(f"• <a href=\"{url}\">{title}</a>")
         await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-    except Exception as e:
         await target_msg(update).reply_text(f"Error: {e}")
 
 async def cmd_listalts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -496,7 +491,6 @@ async def cmd_listalts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines += [f"• <code>{s}</code>" for s in syms]
         lines.append("\nTip: /alts &lt;SYMBOL&gt; for notes &amp; links.")
         await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-    except Exception as e:
         await target_msg(update).reply_text(f"Error: {e}")
 
 async def cmd_listpresales(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -509,7 +503,6 @@ async def cmd_listpresales(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines += [f"• <code>{s}</code>" for s in syms]
         lines.append("\nTip: /alts &lt;SYMBOL&gt; for notes &amp; links. DYOR • High risk.")
         await target_msg(update).reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-    except Exception as e:
         await target_msg(update).reply_text(f"Error: {e}")
 
 # ────────────────────── Callback buttons (inline) ───────────────────
@@ -607,8 +600,7 @@ def alerts_loop():
                 _ALERTS_LAST_RESULT = {"ts": ts, **counters}
                 _ALERTS_LAST_OK_AT = datetime.utcnow()
                 print({"msg": "alert_cycle", **_ALERTS_LAST_RESULT})
-            except Exception as e:
-                print({"msg": "alert_cycle_error", "ts": ts, "error": str(e)})
+                        print({"msg": "alert_cycle_error", "ts": ts, "error": str(e)})
             time.sleep(INTERVAL_SECONDS)
     finally:
         try:
@@ -620,7 +612,6 @@ def delete_webhook_if_any():
     try:
         r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=10)
         print({"msg": "delete_webhook", "status": r.status_code, "body": r.text[:160]})
-    except Exception as e:
         print({"msg": "delete_webhook_exception", "error": str(e)})
 
 # ─────────────────────────── Run bot (polling) ─────────────────────
@@ -683,8 +674,7 @@ def run_bot():
                 print({"msg": "bot_timeout_retry", "error": str(e), "sleep": backoff})
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
-            except Exception as e:
-                print({"msg": "bot_generic_retry", "error": str(e), "sleep": 10})
+                        print({"msg": "bot_generic_retry", "error": str(e), "sleep": 10})
                 time.sleep(10)
     finally:
         try:
