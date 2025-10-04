@@ -20,20 +20,20 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from db import session_scope, init_db, User  # Alert/Subscription tables exist in your project
+from db import session_scope, init_db, User  # models & DB session
 from commands_admin import register_admin_handlers  # alias kept for compatibility
 
 # -------------------- ENV --------------------
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 ADMIN_KEY = (os.getenv("ADMIN_KEY") or "").strip() or None
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "10"))
-WORKER_INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))  # if you need background loops later
+WORKER_INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))  # placeholder
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
 
 # -------------------- FastAPI app --------------------
-app = FastAPI(title="Crypto Alerts Server")
+app = FastAPI(title="Crypto Alerts Server (Combined)")
 
 @app.get("/", response_class=JSONResponse)
 def root():
@@ -50,7 +50,7 @@ def botok():
 
 @app.get("/alertsok", response_class=PlainTextResponse)
 def alertsok():
-    # simple placeholder; extend with your own alert loop checks
+    # placeholder; extend with your own checks/metrics
     return "ok"
 
 # -------------------- Telegram Bot (PTB v20+) --------------------
@@ -110,13 +110,13 @@ def start_text() -> str:
         "• <code>/myalerts</code> — list your active alerts (with delete buttons)\n"
         "• <code>/help</code> — instructions\n"
         "• <code>/support &lt;message&gt;</code> — contact admin support\n\n"
-        "🎁 <b>Trial</b>: 10 days with full/unlimited access.\n"
+        f"🎁 <b>Trial</b>: {TRIAL_DAYS} days with full/unlimited access.\n"
         "After trial expires, contact the admin to extend access.\n"
     )
 
 async def _ensure_trial_row(user_id: int) -> str:
     """
-    Creates a 10-day trial if none exists or informs if trial already existed/expired.
+    Creates a trial if none exists; if exists, informs remaining/expired.
     Returns a message line to append to /start response.
     """
     now = datetime.now(timezone.utc)
@@ -155,9 +155,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with session_scope() as session:
         user = session.execute(text("SELECT id FROM users WHERE telegram_id=:tg"), {"tg": tg_id}).mappings().first()
         if not user:
-            session.execute(text("INSERT INTO users (telegram_id, is_premium, created_at, updated_at) "
-                                 "VALUES (:tg, FALSE, NOW(), NOW())"), {"tg": tg_id})
-            # fetch id
+            session.execute(text(
+                "INSERT INTO users (telegram_id, is_premium, created_at, updated_at) "
+                "VALUES (:tg, FALSE, NOW(), NOW())"
+            ), {"tg": tg_id})
             user = session.execute(text("SELECT id FROM users WHERE telegram_id=:tg"), {"tg": tg_id}).mappings().first()
         user_id = int(user["id"])
 
@@ -170,7 +171,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await (update.message or update.effective_message).reply_text(
-        start_text(), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard(str(update.effective_user.id))
+        start_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(str(update.effective_user.id))
     )
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -186,32 +189,44 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await (update.message or update.effective_message).reply_text(msg, parse_mode=ParseMode.HTML)
 
-# -------------------- Lifecycle (start PTB inside FastAPI) --------------------
+# -------------------- Lifecycle (start PTB safely inside FastAPI) --------------------
 @app.on_event("startup")
 async def on_startup():
+    """
+    Start Telegram Application inside uvicorn loop WITHOUT closing the loop.
+    We use initialize/start + start_polling in a task (instead of run_polling) to avoid
+    'Cannot close a running event loop' with uvloop.
+    """
     global tg_app
     init_db()
 
     tg_app = Application.builder().token(BOT_TOKEN).build()
 
-    # register commands
+    # register bot commands
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("help", cmd_help))
     tg_app.add_handler(CommandHandler("stats", cmd_stats))
-    # admin
+    # admin commands
     register_admin_handlers(tg_app)
 
-    # run bot in background task
-    asyncio.create_task(tg_app.run_polling(allowed_updates=Update.ALL_TYPES))
+    # start polling safely inside uvicorn loop
+    await tg_app.initialize()
+    await tg_app.start()
+    # PTB v20+ keeps an Updater accessible; start its polling in background
+    asyncio.create_task(tg_app.updater.start_polling())
 
 @app.on_event("shutdown")
 async def on_shutdown():
     global tg_app
-    if tg_app and tg_app.running:
+    if tg_app:
+        # stop polling & cleanly shutdown PTB Application
+        await tg_app.updater.stop()
         await tg_app.stop()
+        await tg_app.shutdown()
     tg_app = None
 
 # -------------------- Local dev entry --------------------
 if __name__ == "__main__":
-    # Local run: uvicorn server_combined:app --host 0.0.0.0 --port 10000
+    # Local run example:
+    # uvicorn server_combined:app --host 0.0.0.0 --port 10000
     uvicorn.run("server_combined:app", host="0.0.0.0", port=10000, reload=False)
